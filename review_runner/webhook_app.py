@@ -78,7 +78,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
 
-    event_type = request.headers.get("X-GitHub-Eevnt", "")
+    event_type = request.headers.get("X-GitHub-Event", "")
     delivery_id = request.headers.get("X-GitHub-Delivery")
 
     if event_type == "ping":
