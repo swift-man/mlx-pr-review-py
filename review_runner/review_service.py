@@ -254,37 +254,42 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
         "repository": repository,
         "pull_request": pull_number,
         "instructions": {
-            "task": (
-                "Review this PR diff and report concrete, actionable issues. "
-                "모든 출력 필드(summary, positives, concerns, comments[].body)는 반드시 한국어로만 작성하세요."
-            ),
+            "task": "이 PR diff를 리뷰하고, 실제로 수정이 필요한 문제를 구체적으로 알려주세요.",
+            "language_rules": [
+                "summary, positives, concerns, comments의 모든 문장은 반드시 한국어로 작성하세요.",
+                "톤은 전문적이고 간결하게 유지하세요.",
+                "칭찬은 positives에만 작성하고, 라인 코멘트에는 작성하지 마세요.",
+            ],
             "line_comment_rules": [
-                "Only report problems that are actually visible in the diff.",
-                "Only use RIGHT-side line numbers listed in each file's valid_comment_lines.",
-                "Prefer correctness, security, reliability, and significant maintainability issues.",
-                "Every line comment body must be written in Korean.",
-                "Do not add style-only or praise-only line comments.",
+                "라인 코멘트는 실제 diff에서 보이는 문제만 지적하세요.",
+                "반드시 각 파일의 valid_comment_lines 안에 있는 RIGHT-side line 번호만 사용하세요.",
+                "정확성, 보안, 안정성, 신뢰성, 성능, 중요한 유지보수성 문제를 우선하세요.",
+                "스타일-only 코멘트나 칭찬-only 코멘트는 금지합니다.",
+                "각 코멘트에는 왜 문제인지와 어떻게 고치면 좋은지를 한국어로 짧고 분명하게 적으세요.",
             ],
             "summary_rules": [
-                "Keep the summary concise and grounded in the diff.",
-                "Write summary, positives, and concerns in Korean.",
-                "Always provide 1-3 positives grounded in the diff.",
-                "If there are no actionable issues, keep concerns empty and briefly mention strengths in the summary.",
+                "summary는 전체 변경을 한두 문장으로 요약하세요.",
+                "positives에는 좋은 점을 1~3개 정도 작성하세요.",
+                "concerns에는 개선이 필요한 점을 0~3개 정도 작성하세요.",
+                "문제가 없더라도 positives는 반드시 1개 이상 작성하세요.",
+                "라인 코멘트와 summary/concerns 내용은 diff에 근거해야 합니다.",
             ],
             "response_schema": {
-                "summary": "short overall review summary in Korean",
-                "event": "COMMENT or REQUEST_CHANGES",
+                "summary": "짧은 전체 리뷰 요약 (한국어)",
+                "event": "COMMENT 또는 REQUEST_CHANGES",
                 "positives": [
-                    "1-3 concrete strengths grounded in the diff, written in Korean",
+                    "이 변경의 좋은 점 1 (한국어)",
+                    "이 변경의 좋은 점 2 (한국어)",
                 ],
                 "concerns": [
-                    "0-3 concise improvement points grounded in the diff, written in Korean; empty list if none",
+                    "개선이 필요한 점 1 (한국어)",
+                    "개선이 필요한 점 2 (한국어)",
                 ],
                 "comments": [
                     {
                         "path": "relative/file.py",
                         "line": 12,
-                        "body": "Korean explanation of why this is a problem and what to change",
+                        "body": "왜 문제인지와 어떻게 수정하면 좋은지 설명하는 한국어 코멘트",
                     }
                 ],
             },
