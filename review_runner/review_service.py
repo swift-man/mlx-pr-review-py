@@ -709,6 +709,14 @@ def build_review_payload(
     }
 
 
+def should_retry_review_as_comment(error: RuntimeError, payload: dict[str, Any]) -> bool:
+    if payload.get("event") != "REQUEST_CHANGES":
+        return False
+
+    message = normalize_text(str(error)).lower()
+    return "request changes on your own pull request" in message
+
+
 def review_pull_request(
     repository: str,
     pull_number: int,
@@ -753,15 +761,34 @@ def review_pull_request(
     if dry_run:
         return result
 
-    response = github.post_review(pull_number, payload)
+    posted_event = event
+    fallback_note = ""
+    try:
+        response = github.post_review(pull_number, payload)
+    except RuntimeError as exc:
+        if not should_retry_review_as_comment(exc, payload):
+            raise
+
+        retry_payload = dict(payload)
+        retry_payload["event"] = "COMMENT"
+        response = github.post_review(pull_number, retry_payload)
+        payload = retry_payload
+        posted_event = "COMMENT"
+        result["requested_event"] = event
+        result["event"] = posted_event
+        result["payload"] = payload
+        fallback_note = "Requested changes is not allowed on your own pull request, so the review was posted as COMMENT instead."
+
     message_lines = [
         "Posted review successfully.",
         f"Review ID: {response.get('id')}",
-        f"Event: {event}",
+        f"Event: {posted_event}",
         f"Comments: {len(comments)}",
         "",
         payload["body"],
     ]
+    if fallback_note:
+        message_lines[1:1] = [fallback_note]
     if comments:
         message_lines.extend(
             [
