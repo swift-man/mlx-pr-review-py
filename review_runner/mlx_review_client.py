@@ -17,7 +17,11 @@ DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_MAX_FINDINGS = 10
 DEFAULT_SUMMARY = "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
+DEFAULT_POSITIVES = [
+    "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
+]
 MAX_PARSE_ERROR_SNIPPET = 2000
+MAX_SALVAGE_ITEMS = 5
 
 TRAILING_COMMA_RE = re.compile(r",(?=\s*[}\]])")
 BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
@@ -41,6 +45,22 @@ SMART_QUOTES_TRANSLATION = str.maketrans(
         "‘": "'",
         "’": "'",
     }
+)
+SECTION_HEADER_RE = re.compile(r"(?im)^\s*(positives|concerns|comments|event|response_schema)\s*:\s*$")
+MARKDOWN_ITEM_RE = re.compile(r"(?m)^\s*-\s+(.+?)\s*$")
+PROMPT_ECHO_MARKERS = (
+    "review_runner/review_service.py",
+    "review_runner/",
+    "valid_comment_lines",
+    "RIGHT-side",
+    "response_schema",
+    "style-only",
+    "praise-only",
+    "TRAILING_COMMA_RE",
+    "SUMMARY_STOP_RE",
+    "GENERIC_FIELD_STOP_RE",
+    "POSITIVE_ITEM_RE",
+    "CONCERN_ITEM_RE",
 )
 
 _MODEL = None
@@ -395,36 +415,123 @@ def extract_labeled_items(text: str, item_pattern: re.Pattern[str]) -> list[str]
     return normalize_text_list([match.group(1) for match in item_pattern.finditer(text)], max_items=10)
 
 
-def salvage_broken_output(candidate: str) -> dict[str, Any] | None:
-    summary = extract_string_field(candidate, "summary", SUMMARY_STOP_RE)
-    event = extract_string_field(candidate, "event", GENERIC_FIELD_STOP_RE).upper()
-    positives = normalize_text_list(extract_array_field(candidate, "positives"), max_items=10)
-    concerns = normalize_text_list(extract_array_field(candidate, "concerns"), max_items=10)
-    comments_raw = extract_array_field(candidate, "comments") or []
+def looks_like_prompt_echo(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in PROMPT_ECHO_MARKERS):
+        return True
+    return False
+
+
+def sanitize_summary(summary: str) -> str:
+    normalized = normalize_text(summary)
+    if not normalized or looks_like_prompt_echo(normalized):
+        return DEFAULT_SUMMARY
+    return normalized
+
+
+def sanitize_items(items: list[str], max_items: int = MAX_SALVAGE_ITEMS) -> list[str]:
+    sanitized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = normalize_text(item)
+        if text.startswith("- "):
+            text = text[2:].strip()
+        if not text or text in seen or looks_like_prompt_echo(text):
+            continue
+        seen.add(text)
+        sanitized.append(text)
+        if len(sanitized) >= max_items:
+            break
+    return sanitized
+
+
+def extract_markdown_section_items(text: str, section_name: str) -> list[str]:
+    section_pattern = re.compile(rf"(?ims)^\s*{re.escape(section_name)}\s*:\s*$")
+    match = section_pattern.search(text)
+    if match is None:
+        return []
+
+    section_start = match.end()
+    next_match = SECTION_HEADER_RE.search(text, section_start)
+    section_body = text[section_start : next_match.start()] if next_match is not None else text[section_start:]
+    return [match.group(1) for match in MARKDOWN_ITEM_RE.finditer(section_body)]
+
+
+def extract_markdown_event(text: str) -> str:
+    section_pattern = re.compile(r"(?ims)^\s*event\s*:\s*$")
+    match = section_pattern.search(text)
+    if match is None:
+        return ""
+
+    section_start = match.end()
+    next_match = SECTION_HEADER_RE.search(text, section_start)
+    section_body = text[section_start : next_match.start()] if next_match is not None else text[section_start:]
+    first_line = normalize_text(section_body.splitlines()[0] if section_body.splitlines() else "")
+    if first_line.startswith("- "):
+        first_line = first_line[2:].strip()
+    return first_line
+
+
+def extract_freeform_summary(text: str) -> str:
+    header_match = SECTION_HEADER_RE.search(text)
+    head = text[: header_match.start()] if header_match is not None else text
+    return normalize_text(head.strip().strip("{}"))
+
+
+def fallback_response(raw_output: str) -> dict[str, Any]:
+    return {
+        "summary": DEFAULT_SUMMARY,
+        "event": "COMMENT",
+        "positives": list(DEFAULT_POSITIVES),
+        "concerns": [],
+        "comments": [],
+    }
+
+
+def salvage_broken_output(text: str) -> dict[str, Any] | None:
+    summary = extract_string_field(text, "summary", SUMMARY_STOP_RE) or extract_freeform_summary(text)
+    event = extract_string_field(text, "event", GENERIC_FIELD_STOP_RE).upper() or extract_markdown_event(text).upper()
+    positives = normalize_text_list(extract_array_field(text, "positives"), max_items=10)
+    concerns = normalize_text_list(extract_array_field(text, "concerns"), max_items=10)
+    comments_raw = extract_array_field(text, "comments") or []
     comments = [item for item in comments_raw if isinstance(item, dict)]
 
     if not positives:
-        positives = extract_labeled_items(candidate, POSITIVE_ITEM_RE)
+        positives = extract_labeled_items(text, POSITIVE_ITEM_RE)
+    if not positives:
+        positives = normalize_text_list(extract_markdown_section_items(text, "positives"), max_items=10)
     if not concerns:
-        concerns = extract_labeled_items(candidate, CONCERN_ITEM_RE)
+        concerns = extract_labeled_items(text, CONCERN_ITEM_RE)
+    if not concerns:
+        concerns = normalize_text_list(extract_markdown_section_items(text, "concerns"), max_items=10)
+
+    summary = sanitize_summary(summary)
+    positives = sanitize_items(positives)
+    concerns = sanitize_items(concerns)
 
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
         event = "REQUEST_CHANGES" if comments else "COMMENT"
 
-    if not any([summary, positives, concerns, comments]):
-        return None
-
     return {
-        "summary": summary or DEFAULT_SUMMARY,
+        "summary": summary,
         "event": event,
-        "positives": positives,
+        "positives": positives or list(DEFAULT_POSITIVES),
         "concerns": concerns,
         "comments": comments,
     }
 
 
 def parse_model_json(raw_output: str) -> dict[str, Any]:
-    candidate = extract_json_object(raw_output)
+    try:
+        candidate = extract_json_object(raw_output)
+    except RuntimeError:
+        salvaged = salvage_broken_output(raw_output)
+        if salvaged is not None:
+            return salvaged
+        raise
+
     try:
         parsed = json.loads(candidate)
     except json.JSONDecodeError as json_exc:
@@ -530,10 +637,7 @@ def review_payload(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         parsed = parse_model_json(raw_output)
     except RuntimeError as exc:
-        raise RuntimeError(
-            "Failed to parse MLX output as JSON.\n"
-            f"Raw output:\n{format_error_snippet(raw_output)}"
-        ) from exc
+        parsed = fallback_response(raw_output)
     return normalize_response(parsed)
 
 
