@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
+import re
 import sys
 import threading
 from typing import Any
@@ -15,6 +17,19 @@ DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_MAX_FINDINGS = 10
 DEFAULT_SUMMARY = "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
+MAX_PARSE_ERROR_SNIPPET = 2000
+
+TRAILING_COMMA_RE = re.compile(r",(?=\s*[}\]])")
+BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(COMMENT|REQUEST_CHANGES)(\s*[,}])')
+SMART_QUOTES_TRANSLATION = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+)
 
 _MODEL = None
 _TOKENIZER = None
@@ -116,6 +131,8 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "Return exactly one JSON object and nothing else. "
                 "Never wrap the answer in markdown fences. "
                 "Report only high-confidence issues that are directly visible in the diff. "
+                "Use strict JSON syntax with double-quoted keys and string values. "
+                "Do not use trailing commas, single quotes, comments, or unquoted enum values. "
                 "All output must be written in Korean. This is mandatory. "
                 "Write summary, positives, concerns, and every line comment body in Korean only. "
                 "Do not use English sentences in JSON values unless a file path, symbol, or API name requires it. "
@@ -219,21 +236,21 @@ def extract_json_object(text: str) -> str:
         raise RuntimeError(f"Model output did not contain a JSON object:\n{candidate}")
 
     depth = 0
-    in_string = False
+    string_delimiter: str | None = None
     escape = False
     for index in range(start, len(candidate)):
         char = candidate[index]
-        if in_string:
+        if string_delimiter is not None:
             if escape:
                 escape = False
             elif char == "\\":
                 escape = True
-            elif char == '"':
-                in_string = False
+            elif char == string_delimiter:
+                string_delimiter = None
             continue
 
-        if char == '"':
-            in_string = True
+        if char in {'"', "'"}:
+            string_delimiter = char
         elif char == "{":
             depth += 1
         elif char == "}":
@@ -242,6 +259,55 @@ def extract_json_object(text: str) -> str:
                 return candidate[start : index + 1]
 
     raise RuntimeError(f"Could not extract a complete JSON object from model output:\n{candidate}")
+
+
+def format_error_snippet(text: str, limit: int = MAX_PARSE_ERROR_SNIPPET) -> str:
+    snippet = text.strip()
+    if len(snippet) <= limit:
+        return snippet
+    return f"{snippet[:limit].rstrip()}\n... [truncated]"
+
+
+def repair_json_candidate(candidate: str) -> str:
+    repaired = candidate.translate(SMART_QUOTES_TRANSLATION)
+    repaired = TRAILING_COMMA_RE.sub("", repaired)
+    repaired = BARE_KEY_RE.sub(r'\1"\2"\3', repaired)
+    repaired = UNQUOTED_EVENT_RE.sub(r'\1"\2"\3', repaired)
+    return repaired
+
+
+def parse_model_json(raw_output: str) -> dict[str, Any]:
+    candidate = extract_json_object(raw_output)
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as json_exc:
+        repaired = repair_json_candidate(candidate)
+        if repaired != candidate:
+            try:
+                parsed = json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(parsed, dict):
+                    return parsed
+
+        for fallback_candidate in (candidate, repaired):
+            try:
+                parsed = ast.literal_eval(fallback_candidate)
+            except (SyntaxError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+        raise RuntimeError(
+            "Model returned invalid JSON-like output.\n"
+            f"Extracted candidate:\n{format_error_snippet(candidate)}"
+        ) from json_exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Model returned a non-object JSON value: {parsed!r}")
+
+    return parsed
 
 
 def normalize_comment(raw_comment: dict[str, Any]) -> dict[str, Any] | None:
@@ -310,9 +376,13 @@ def review_payload(payload: dict[str, Any]) -> dict[str, Any]:
     messages = build_messages(payload)
     prompt = render_prompt(tokenizer, messages)
     raw_output = run_generation(prompt)
-    parsed = json.loads(extract_json_object(raw_output))
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"Model returned a non-object JSON value: {parsed!r}")
+    try:
+        parsed = parse_model_json(raw_output)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Failed to parse MLX output as JSON.\n"
+            f"Raw output:\n{format_error_snippet(raw_output)}"
+        ) from exc
     return normalize_response(parsed)
 
 
