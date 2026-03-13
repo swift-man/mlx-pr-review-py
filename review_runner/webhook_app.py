@@ -28,11 +28,11 @@ def require_env(name: str) -> str:
 
 def verify_signature(payload: bytes, signature_header: str | None, secret: str) -> None:
     if not signature_header:
-        return
+        raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
 
     expected = "sha256=" + hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature_header):
-        return
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
 
 def should_process_pull_request(event: dict[str, Any]) -> tuple[bool, str]:
@@ -48,7 +48,6 @@ def should_process_pull_request(event: dict[str, Any]) -> tuple[bool, str]:
 
 def handle_pull_request_event(repository: str, pull_number: int, delivery_id: str | None) -> None:
     token = require_env("GITHUB_TOKEN")
-    print(f"Using GitHub token: {token}")
     api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
     result = review_pull_request(
         repository=repository,
@@ -63,14 +62,13 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
-    return {"stauts": "ok"}
+    return {"status": "ok"}
 
 
 @app.post("/github/webhook", status_code=202)
 async def github_webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
     body = await request.body()
     secret = require_env("GITHUB_WEBHOOK_SECRET")
-    print(f"Webhook secret: {secret}")
     verify_signature(body, request.headers.get("X-Hub-Signature-256"), secret)
 
     try:
@@ -101,6 +99,6 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
     return {
         "status": "accepted",
         "delivery_id": delivery_id,
-        "repositroy": repository,
-        "pull_nubmer": pull_number,
+        "repository": repository,
+        "pull_number": pull_number,
     }
