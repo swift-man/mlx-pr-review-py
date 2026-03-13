@@ -77,7 +77,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `GITHUB_TOKEN=...`
 - `GITHUB_WEBHOOK_SECRET=...`
 - `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client`
-- `MLX_MODEL=mlx-community/Llama-3.2-3B-Instruct-4bit`
+- `MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit`
 - `GITHUB_API_URL=https://api.github.com` (옵션)
 - `MLX_MAX_TOKENS=1200` (옵션)
 - `MLX_MAX_FINDINGS=10` (옵션)
@@ -93,7 +93,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 
 ```bash
 export LOCAL_REVIEW_HOME=/Users/runner/pr-review
-export MLX_MODEL=mlx-community/Llama-3.2-3B-Instruct-4bit
+export MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 zsh /Users/runner/pr-review/scripts/warm_mlx_model.sh
 ```
 
@@ -110,7 +110,7 @@ export PORT=8000
 export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Llama-3.2-3B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
 export DRY_RUN=1
@@ -163,7 +163,7 @@ export PORT=8000
 export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Llama-3.2-3B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
 export DRY_RUN=1
@@ -325,7 +325,7 @@ export GITHUB_TOKEN=ghp_xxx
 export GITHUB_REPOSITORY=OWNER/REPO
 export GITHUB_EVENT_PATH=/path/to/event.json
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Llama-3.2-3B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 export DRY_RUN=1
 export PYTHONPATH=/Users/runner/pr-review
 /Users/runner/pr-review/venv/bin/python -m review_runner.review_pr
