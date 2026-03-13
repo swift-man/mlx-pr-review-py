@@ -391,20 +391,33 @@ def build_review_payload(
 ) -> dict[str, Any]:
     positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
     concern_items = concerns or [DEFAULT_NO_CONCERNS_TEXT]
-    body = "\n".join(
+    body_lines = [
+        normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY,
+        "",
+        "### 좋은 점",
+    ]
+    body_lines.extend(f"- {item}" for item in positive_items)
+    body_lines.extend(
         [
-            normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY,
-            "",
-            "### 좋은 점",
-            *(f"- {item}" for item in positive_items),
             "",
             "### 개선이 필요한 점",
-            *(f"- {item}" for item in concern_items),
+        ]
+    )
+    body_lines.extend(f"- {item}" for item in concern_items)
+    body_lines.extend(
+        [
+            "",
+            "### 라인 단위 코멘트",
         ]
     )
 
+    if comments:
+        body_lines.append(f"- 자동 리뷰에서 {len(comments)}개의 라인 단위 개선 사항을 남겼습니다.")
+    else:
+        body_lines.append("- 라인 단위로 남길 개선 사항은 발견되지 않았습니다.")
+
     return {
-        "body": body,
+        "body": "\n".join(body_lines),
         "event": event,
         "comments": [
             {
