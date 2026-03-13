@@ -340,7 +340,8 @@ def run_mlx(prompt: str) -> dict[str, Any]:
 
 
 def validate_mlx_output(
-    result: dict[str, Any], files: list[PullRequestFile]
+    result: dict[str, Any],
+    files: list[PullRequestFile],
 ) -> tuple[list[ReviewComment], str, str, list[str], list[str]]:
     file_index = {f.filename: f for f in files}
     comments: list[ReviewComment] = []
@@ -359,20 +360,24 @@ def validate_mlx_output(
         comments.append(ReviewComment(path=path, line=line, body=body))
 
     summary = normalize_text(result.get("summary")) or "자동 리뷰를 완료했습니다."
-    positives = normalize_text_list(result.get("positives"))
-    concerns = normalize_text_list(result.get("concerns"))
+    positives = normalize_text_list(result.get("positives"), max_items=5)
+    concerns = normalize_text_list(result.get("concerns"), max_items=5)
 
-    event = (result.get("event") or "").strip().upper()
+    event = normalize_text(result.get("event")).upper()
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
-        event = "REQUEST_CHANGES" if comments else "COMMENT"
+        event = "REQUEST_CHANGES" if (comments or concerns) else "COMMENT"
 
-    if not comments:
+    if not comments and not concerns:
         summary = format_no_findings_summary(summary)
+        if not positives:
+            positives = list(DEFAULT_FALLBACK_POSITIVES)
         event = "COMMENT"
-    if not positives:
-        positives = list(DEFAULT_FALLBACK_POSITIVES)
-    if comments and not concerns:
-        concerns = summarize_comment_bodies(comments)
+    else:
+        if not positives:
+            positives = ["핵심 변경 의도가 diff 안에서 비교적 명확하게 드러납니다."]
+        if not concerns:
+            concerns = summarize_comment_bodies(comments)
+        event = "REQUEST_CHANGES"
 
     return comments, summary, event, positives, concerns
 
