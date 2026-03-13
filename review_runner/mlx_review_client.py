@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
+import re
 import sys
 import threading
 from typing import Any
@@ -15,6 +17,51 @@ DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_MAX_FINDINGS = 10
 DEFAULT_SUMMARY = "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
+DEFAULT_POSITIVES = [
+    "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
+]
+MAX_PARSE_ERROR_SNIPPET = 2000
+MAX_SALVAGE_ITEMS = 5
+
+TRAILING_COMMA_RE = re.compile(r",(?=\s*[}\]])")
+BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(COMMENT|REQUEST_CHANGES)(\s*[,}])')
+SUMMARY_STOP_RE = re.compile(
+    r'(?i)(?:\bpositive(?:s)?\d*\s*:|["\']?positives["\']?\s*:|\bconcern(?:s)?\d*\s*:|["\']?concerns["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:)'
+)
+GENERIC_FIELD_STOP_RE = re.compile(
+    r'(?i)(?:["\']?summary["\']?\s*:|["\']?event["\']?\s*:|["\']?positives["\']?\s*:|["\']?concerns["\']?\s*:|["\']?comments["\']?\s*:|\bpositive(?:s)?\d*\s*:|\bconcern(?:s)?\d*\s*:)'
+)
+POSITIVE_ITEM_RE = re.compile(
+    r'(?is)\bpositive(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+)
+CONCERN_ITEM_RE = re.compile(
+    r'(?is)\bconcern(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+)
+SMART_QUOTES_TRANSLATION = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+)
+SECTION_HEADER_RE = re.compile(r"(?im)^\s*(positives|concerns|comments|event|response_schema)\s*:\s*$")
+MARKDOWN_ITEM_RE = re.compile(r"(?m)^\s*-\s+(.+?)\s*$")
+PROMPT_ECHO_MARKERS = (
+    "review_runner/review_service.py",
+    "review_runner/",
+    "valid_comment_lines",
+    "RIGHT-side",
+    "response_schema",
+    "style-only",
+    "praise-only",
+    "TRAILING_COMMA_RE",
+    "SUMMARY_STOP_RE",
+    "GENERIC_FIELD_STOP_RE",
+    "POSITIVE_ITEM_RE",
+    "CONCERN_ITEM_RE",
+)
 
 _MODEL = None
 _TOKENIZER = None
@@ -116,8 +163,13 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "Return exactly one JSON object and nothing else. "
                 "Never wrap the answer in markdown fences. "
                 "Report only high-confidence issues that are directly visible in the diff. "
+                "Use strict JSON syntax with double-quoted keys and string values. "
+                "Do not use trailing commas, single quotes, comments, or unquoted enum values. "
                 "All output must be written in Korean. This is mandatory. "
                 "Write summary, positives, concerns, and every line comment body in Korean only. "
+                "Use only these top-level keys: summary, event, positives, concerns, comments. "
+                "positives and concerns must be JSON arrays, never inline labels such as positive1: or concerns1:. "
+                "Do not put positives, concerns, or comments inside the summary string. "
                 "Do not use English sentences in JSON values unless a file path, symbol, or API name requires it. "
                 f"Return at most {max_findings} findings. "
                 "Do not write praise-only line comments. "
@@ -219,21 +271,21 @@ def extract_json_object(text: str) -> str:
         raise RuntimeError(f"Model output did not contain a JSON object:\n{candidate}")
 
     depth = 0
-    in_string = False
+    string_delimiter: str | None = None
     escape = False
     for index in range(start, len(candidate)):
         char = candidate[index]
-        if in_string:
+        if string_delimiter is not None:
             if escape:
                 escape = False
             elif char == "\\":
                 escape = True
-            elif char == '"':
-                in_string = False
+            elif char == string_delimiter:
+                string_delimiter = None
             continue
 
-        if char == '"':
-            in_string = True
+        if char in {'"', "'"}:
+            string_delimiter = char
         elif char == "{":
             depth += 1
         elif char == "}":
@@ -242,6 +294,278 @@ def extract_json_object(text: str) -> str:
                 return candidate[start : index + 1]
 
     raise RuntimeError(f"Could not extract a complete JSON object from model output:\n{candidate}")
+
+
+def format_error_snippet(text: str, limit: int = MAX_PARSE_ERROR_SNIPPET) -> str:
+    snippet = text.strip()
+    if len(snippet) <= limit:
+        return snippet
+    return f"{snippet[:limit].rstrip()}\n... [truncated]"
+
+
+def repair_json_candidate(candidate: str) -> str:
+    repaired = candidate.translate(SMART_QUOTES_TRANSLATION)
+    repaired = TRAILING_COMMA_RE.sub("", repaired)
+    repaired = BARE_KEY_RE.sub(r'\1"\2"\3', repaired)
+    repaired = UNQUOTED_EVENT_RE.sub(r'\1"\2"\3', repaired)
+    return repaired
+
+
+def find_key_value_start(text: str, key: str) -> int:
+    pattern = re.compile(rf'(?i)["\']?{re.escape(key)}["\']?\s*:')
+    match = pattern.search(text)
+    if match is None:
+        return -1
+    return match.end()
+
+
+def scan_balanced_segment(text: str, start: int, open_char: str, close_char: str) -> str | None:
+    if start < 0 or start >= len(text) or text[start] != open_char:
+        return None
+
+    depth = 0
+    string_delimiter: str | None = None
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if string_delimiter is not None:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == string_delimiter:
+                string_delimiter = None
+            continue
+
+        if char in {'"', "'"}:
+            string_delimiter = char
+        elif char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    return None
+
+
+def parse_json_fragment(fragment: str) -> Any:
+    for candidate in (fragment, repair_json_candidate(fragment)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        try:
+            return ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            pass
+
+    return None
+
+
+def extract_array_field(text: str, key: str) -> list[Any] | None:
+    value_start = find_key_value_start(text, key)
+    if value_start < 0:
+        return None
+
+    while value_start < len(text) and text[value_start].isspace():
+        value_start += 1
+
+    if value_start >= len(text):
+        return None
+
+    if text[value_start] != "[":
+        array_start = text.find("[", value_start)
+        if array_start < 0:
+            return None
+        value_start = array_start
+
+    fragment = scan_balanced_segment(text, value_start, "[", "]")
+    if fragment is None:
+        return None
+
+    parsed = parse_json_fragment(fragment)
+    if isinstance(parsed, list):
+        return parsed
+    return None
+
+
+def extract_string_field(text: str, key: str, stop_pattern: re.Pattern[str]) -> str:
+    value_start = find_key_value_start(text, key)
+    if value_start < 0:
+        return ""
+
+    while value_start < len(text) and text[value_start].isspace():
+        value_start += 1
+
+    if value_start >= len(text):
+        return ""
+
+    remainder = text[value_start:]
+    if remainder.startswith(('"', "'")):
+        remainder = remainder[1:]
+
+    stop_match = stop_pattern.search(remainder)
+    field_text = remainder[: stop_match.start()] if stop_match is not None else remainder
+    return normalize_text(field_text.strip().strip('"\',]}'))
+
+
+def extract_labeled_items(text: str, item_pattern: re.Pattern[str]) -> list[str]:
+    return normalize_text_list([match.group(1) for match in item_pattern.finditer(text)], max_items=10)
+
+
+def looks_like_prompt_echo(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in PROMPT_ECHO_MARKERS):
+        return True
+    return False
+
+
+def sanitize_summary(summary: str) -> str:
+    normalized = normalize_text(summary)
+    if not normalized or looks_like_prompt_echo(normalized):
+        return DEFAULT_SUMMARY
+    return normalized
+
+
+def sanitize_items(items: list[str], max_items: int = MAX_SALVAGE_ITEMS) -> list[str]:
+    sanitized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = normalize_text(item)
+        if text.startswith("- "):
+            text = text[2:].strip()
+        if not text or text in seen or looks_like_prompt_echo(text):
+            continue
+        seen.add(text)
+        sanitized.append(text)
+        if len(sanitized) >= max_items:
+            break
+    return sanitized
+
+
+def extract_markdown_section_items(text: str, section_name: str) -> list[str]:
+    section_pattern = re.compile(rf"(?ims)^\s*{re.escape(section_name)}\s*:\s*$")
+    match = section_pattern.search(text)
+    if match is None:
+        return []
+
+    section_start = match.end()
+    next_match = SECTION_HEADER_RE.search(text, section_start)
+    section_body = text[section_start : next_match.start()] if next_match is not None else text[section_start:]
+    return [match.group(1) for match in MARKDOWN_ITEM_RE.finditer(section_body)]
+
+
+def extract_markdown_event(text: str) -> str:
+    section_pattern = re.compile(r"(?ims)^\s*event\s*:\s*$")
+    match = section_pattern.search(text)
+    if match is None:
+        return ""
+
+    section_start = match.end()
+    next_match = SECTION_HEADER_RE.search(text, section_start)
+    section_body = text[section_start : next_match.start()] if next_match is not None else text[section_start:]
+    first_line = normalize_text(section_body.splitlines()[0] if section_body.splitlines() else "")
+    if first_line.startswith("- "):
+        first_line = first_line[2:].strip()
+    return first_line
+
+
+def extract_freeform_summary(text: str) -> str:
+    header_match = SECTION_HEADER_RE.search(text)
+    head = text[: header_match.start()] if header_match is not None else text
+    return normalize_text(head.strip().strip("{}"))
+
+
+def fallback_response(raw_output: str) -> dict[str, Any]:
+    return {
+        "summary": DEFAULT_SUMMARY,
+        "event": "COMMENT",
+        "positives": list(DEFAULT_POSITIVES),
+        "concerns": [],
+        "comments": [],
+    }
+
+
+def salvage_broken_output(text: str) -> dict[str, Any] | None:
+    summary = extract_string_field(text, "summary", SUMMARY_STOP_RE) or extract_freeform_summary(text)
+    event = extract_string_field(text, "event", GENERIC_FIELD_STOP_RE).upper() or extract_markdown_event(text).upper()
+    positives = normalize_text_list(extract_array_field(text, "positives"), max_items=10)
+    concerns = normalize_text_list(extract_array_field(text, "concerns"), max_items=10)
+    comments_raw = extract_array_field(text, "comments") or []
+    comments = [item for item in comments_raw if isinstance(item, dict)]
+
+    if not positives:
+        positives = extract_labeled_items(text, POSITIVE_ITEM_RE)
+    if not positives:
+        positives = normalize_text_list(extract_markdown_section_items(text, "positives"), max_items=10)
+    if not concerns:
+        concerns = extract_labeled_items(text, CONCERN_ITEM_RE)
+    if not concerns:
+        concerns = normalize_text_list(extract_markdown_section_items(text, "concerns"), max_items=10)
+
+    summary = sanitize_summary(summary)
+    positives = sanitize_items(positives)
+    concerns = sanitize_items(concerns)
+
+    if event not in {"COMMENT", "REQUEST_CHANGES"}:
+        event = "REQUEST_CHANGES" if comments else "COMMENT"
+
+    return {
+        "summary": summary,
+        "event": event,
+        "positives": positives or list(DEFAULT_POSITIVES),
+        "concerns": concerns,
+        "comments": comments,
+    }
+
+
+def parse_model_json(raw_output: str) -> dict[str, Any]:
+    try:
+        candidate = extract_json_object(raw_output)
+    except RuntimeError:
+        salvaged = salvage_broken_output(raw_output)
+        if salvaged is not None:
+            return salvaged
+        raise
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as json_exc:
+        repaired = repair_json_candidate(candidate)
+        if repaired != candidate:
+            try:
+                parsed = json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(parsed, dict):
+                    return parsed
+
+        for fallback_candidate in (candidate, repaired):
+            try:
+                parsed = ast.literal_eval(fallback_candidate)
+            except (SyntaxError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+
+        salvaged = salvage_broken_output(candidate)
+        if salvaged is not None:
+            return salvaged
+
+        raise RuntimeError(
+            "Model returned invalid JSON-like output.\n"
+            f"Extracted candidate:\n{format_error_snippet(candidate)}"
+        ) from json_exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Model returned a non-object JSON value: {parsed!r}")
+
+    return parsed
 
 
 def normalize_comment(raw_comment: dict[str, Any]) -> dict[str, Any] | None:
@@ -310,9 +634,10 @@ def review_payload(payload: dict[str, Any]) -> dict[str, Any]:
     messages = build_messages(payload)
     prompt = render_prompt(tokenizer, messages)
     raw_output = run_generation(prompt)
-    parsed = json.loads(extract_json_object(raw_output))
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"Model returned a non-object JSON value: {parsed!r}")
+    try:
+        parsed = parse_model_json(raw_output)
+    except RuntimeError as exc:
+        parsed = fallback_response(raw_output)
     return normalize_response(parsed)
 
 
