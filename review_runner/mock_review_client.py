@@ -32,6 +32,12 @@ def build_response(payload: dict[str, Any]) -> dict[str, Any]:
             "테스트용 자동 리뷰입니다. PR 본문 코멘트와 라인별 코멘트가 모두 정상적으로 등록되는지 확인합니다."
         ),
         "event": "REQUEST_CHANGES",
+        "positives": [
+            "응답 스키마와 GitHub 리뷰 등록 경로를 한 번에 검증할 수 있도록 테스트 흐름이 단순하게 구성되어 있습니다.",
+        ],
+        "concerns": [
+            "아래 라인 코멘트가 실제 PR diff에 정상적으로 표시되는지 함께 확인해 주세요.",
+        ],
         "comments": [
             {
                 "path": path,

@@ -14,6 +14,7 @@ from typing import Any
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_MAX_FINDINGS = 10
+DEFAULT_SUMMARY = "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
 
 _MODEL = None
 _TOKENIZER = None
@@ -51,6 +52,35 @@ def get_model_name() -> str:
     return os.environ.get("MLX_MODEL", DEFAULT_MODEL)
 
 
+def normalize_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
+def normalize_text_list(value: Any, max_items: int = 5) -> list[str]:
+    if isinstance(value, list):
+        candidates = value
+    elif isinstance(value, str):
+        candidates = [value]
+    else:
+        candidates = []
+
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+
+    for item in candidates:
+        text = normalize_text(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized_items.append(text)
+        if len(normalized_items) >= max_items:
+            break
+
+    return normalized_items
+
+
 def load_runtime() -> tuple[Any, Any]:
     try:
         from mlx_lm import load
@@ -86,17 +116,20 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "Return exactly one JSON object and nothing else. "
                 "Never wrap the answer in markdown fences. "
                 "Report only high-confidence issues that are directly visible in the diff. "
-                "Write the summary and every line comment body in Korean. "
+                "All output must be written in Korean. This is mandatory. "
+                "Write summary, positives, concerns, and every line comment body in Korean only. "
+                "Do not use English sentences in JSON values unless a file path, symbol, or API name requires it. "
                 f"Return at most {max_findings} findings. "
                 "Do not write praise-only line comments. "
-                'If there are no actionable issues, return {"summary":"...","event":"COMMENT","comments":[]} '
-                "and use the summary to briefly mention what looks strong about the diff in Korean."
+                'If there are no actionable issues, return {"summary":"...","event":"COMMENT","positives":["..."],"concerns":[],"comments":[]} '
+                "and use summary plus positives to briefly mention what looks strong about the diff in Korean."
             ),
         },
         {
             "role": "user",
             "content": (
-                "Review this pull request diff payload and respond using the response_schema inside it.\n"
+                "Review this pull request diff payload and respond using the response_schema inside it. "
+                "모든 출력은 반드시 한국어로 작성하세요.\n"
                 f"{compact_payload}"
             ),
         },
@@ -213,7 +246,7 @@ def extract_json_object(text: str) -> str:
 
 def normalize_comment(raw_comment: dict[str, Any]) -> dict[str, Any] | None:
     path = str(raw_comment.get("path") or "").strip()
-    body = str(raw_comment.get("body") or "").strip()
+    body = normalize_text(raw_comment.get("body"))
     line = raw_comment.get("line")
     try:
         line_number = int(line)
@@ -249,9 +282,12 @@ def normalize_response(raw_response: dict[str, Any]) -> dict[str, Any]:
         if len(comments) >= max_findings:
             break
 
-    summary = str(raw_response.get("summary") or "").strip()
+    summary = normalize_text(raw_response.get("summary"))
     if not summary:
-        summary = "지적할 만한 문제는 보이지 않습니다. 변경 사항이 전반적으로 깔끔하게 정리되어 있습니다."
+        summary = DEFAULT_SUMMARY
+
+    positives = normalize_text_list(raw_response.get("positives"))
+    concerns = normalize_text_list(raw_response.get("concerns"))
 
     event = str(raw_response.get("event") or "").strip().upper()
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
@@ -262,6 +298,8 @@ def normalize_response(raw_response: dict[str, Any]) -> dict[str, Any]:
     return {
         "summary": summary,
         "event": event,
+        "positives": positives,
+        "concerns": concerns,
         "comments": comments,
     }
 

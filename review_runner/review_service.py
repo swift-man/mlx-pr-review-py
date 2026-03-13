@@ -22,8 +22,41 @@ DEFAULT_API_URL = "https://api.github.com"
 DEFAULT_MLX_REVIEW_CMD = "python3 -m review_runner.mlx_review_client"
 DEFAULT_CA_BUNDLE_ENV = "GITHUB_CA_BUNDLE"
 DEFAULT_NO_FINDINGS_SUMMARY = (
-    "지적할 만한 문제는 보이지 않습니다. 변경 사항이 집중되어 있고 흐름도 자연스럽습니다."
+    "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
 )
+DEFAULT_FALLBACK_POSITIVES = [
+    "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
+]
+DEFAULT_NO_CONCERNS_TEXT = "이번 diff 기준으로 별도 개선 필요 사항은 발견되지 않았습니다."
+
+
+def normalize_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
+def normalize_text_list(value: Any, max_items: int = 5) -> list[str]:
+    if isinstance(value, list):
+        candidates = value
+    elif isinstance(value, str):
+        candidates = [value]
+    else:
+        candidates = []
+
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+
+    for item in candidates:
+        text = normalize_text(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized_items.append(text)
+        if len(normalized_items) >= max_items:
+            break
+
+    return normalized_items
 
 
 def build_ssl_context() -> ssl.SSLContext:
@@ -179,23 +212,39 @@ def build_pr_files(raw_files: list[dict[str, Any]]) -> list[PullRequestFile]:
     return files
 
 
+def summarize_comment_bodies(comments: list[ReviewComment], max_items: int = 3) -> list[str]:
+    summaries: list[str] = []
+    seen: set[str] = set()
+
+    for comment in comments:
+        first_line = comment.body.strip().splitlines()[0] if comment.body.strip() else ""
+        text = normalize_text(first_line)
+        if not text:
+            continue
+        if len(text) > 120:
+            text = f"{text[:117].rstrip()}..."
+        if text in seen:
+            continue
+        seen.add(text)
+        summaries.append(text)
+        if len(summaries) >= max_items:
+            break
+
+    return summaries
+
+
 def format_no_findings_summary(summary: str) -> str:
-    normalized = " ".join(summary.split())
+    normalized = normalize_text(summary)
     if not normalized or normalized in {
         "Automated review completed.",
         "Automated MLX review completed.",
         "No actionable issues found.",
-        "지적할 만한 문제는 보이지 않습니다.",
         "자동 리뷰를 완료했습니다.",
+        "자동 MLX 리뷰를 완료했습니다.",
+        "검토할 만한 문제를 찾지 못했습니다.",
+        "지적할 만한 문제는 보이지 않습니다.",
     }:
         return DEFAULT_NO_FINDINGS_SUMMARY
-
-    lower = normalized.lower()
-    if "no actionable issues" in lower and not any(
-        token in lower
-        for token in {"focused", "clear", "solid", "well", "clean", "cohesive", "readable", "straightforward"}
-    ):
-        return f"{normalized} The change is focused and straightforward to follow."
 
     return normalized
 
@@ -205,22 +254,32 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
         "repository": repository,
         "pull_request": pull_number,
         "instructions": {
-            "task": "Review this PR diff and report concrete, actionable issues in Korean.",
+            "task": (
+                "Review this PR diff and report concrete, actionable issues. "
+                "모든 출력 필드(summary, positives, concerns, comments[].body)는 반드시 한국어로만 작성하세요."
+            ),
             "line_comment_rules": [
                 "Only report problems that are actually visible in the diff.",
                 "Only use RIGHT-side line numbers listed in each file's valid_comment_lines.",
                 "Prefer correctness, security, reliability, and significant maintainability issues.",
-                "Write every line comment body in Korean.",
+                "Every line comment body must be written in Korean.",
                 "Do not add style-only or praise-only line comments.",
             ],
             "summary_rules": [
                 "Keep the summary concise and grounded in the diff.",
-                "Write the summary in Korean.",
-                "If there are no actionable issues, briefly mention one or two strengths of the change in the summary.",
+                "Write summary, positives, and concerns in Korean.",
+                "Always provide 1-3 positives grounded in the diff.",
+                "If there are no actionable issues, keep concerns empty and briefly mention strengths in the summary.",
             ],
             "response_schema": {
-                "summary": "short overall review summary in Korean; if there are no issues, include brief positive feedback",
+                "summary": "short overall review summary in Korean",
                 "event": "COMMENT or REQUEST_CHANGES",
+                "positives": [
+                    "1-3 concrete strengths grounded in the diff, written in Korean",
+                ],
+                "concerns": [
+                    "0-3 concise improvement points grounded in the diff, written in Korean; empty list if none",
+                ],
                 "comments": [
                     {
                         "path": "relative/file.py",
@@ -271,14 +330,16 @@ def run_mlx(prompt: str) -> dict[str, Any]:
         raise RuntimeError(f"MLX command returned invalid JSON:\n{stdout}") from exc
 
 
-def validate_mlx_output(result: dict[str, Any], files: list[PullRequestFile]) -> tuple[list[ReviewComment], str, str]:
+def validate_mlx_output(
+    result: dict[str, Any], files: list[PullRequestFile]
+) -> tuple[list[ReviewComment], str, str, list[str], list[str]]:
     file_index = {f.filename: f for f in files}
     comments: list[ReviewComment] = []
 
     for raw in result.get("comments", []):
         path = raw.get("path")
         line = raw.get("line")
-        body = (raw.get("body") or "").strip()
+        body = normalize_text(raw.get("body"))
         if not path or not isinstance(line, int) or not body:
             continue
 
@@ -288,7 +349,9 @@ def validate_mlx_output(result: dict[str, Any], files: list[PullRequestFile]) ->
 
         comments.append(ReviewComment(path=path, line=line, body=body))
 
-    summary = (result.get("summary") or "").strip() or "자동 리뷰를 완료했습니다."
+    summary = normalize_text(result.get("summary")) or "자동 리뷰를 완료했습니다."
+    positives = normalize_text_list(result.get("positives"))
+    concerns = normalize_text_list(result.get("concerns"))
 
     event = (result.get("event") or "").strip().upper()
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
@@ -297,16 +360,34 @@ def validate_mlx_output(result: dict[str, Any], files: list[PullRequestFile]) ->
     if not comments:
         summary = format_no_findings_summary(summary)
         event = "COMMENT"
+    if not positives:
+        positives = list(DEFAULT_FALLBACK_POSITIVES)
+    if comments and not concerns:
+        concerns = summarize_comment_bodies(comments)
 
-    return comments, summary, event
+    return comments, summary, event, positives, concerns
 
 
-def build_review_payload(summary: str, event: str, comments: list[ReviewComment]) -> dict[str, Any]:
-    body = summary
-    if comments:
-        body = f"{summary}\n\n자동 리뷰가 {len(comments)}개의 확인 포인트를 남겼습니다."
-    else:
-        body = f"{summary}\n\n검토한 diff에서 라인 단위 지적 사항은 발견되지 않았습니다."
+def build_review_payload(
+    summary: str,
+    event: str,
+    comments: list[ReviewComment],
+    positives: list[str],
+    concerns: list[str],
+) -> dict[str, Any]:
+    positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
+    concern_items = concerns or [DEFAULT_NO_CONCERNS_TEXT]
+    body = "\n".join(
+        [
+            normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY,
+            "",
+            "### 좋은 점",
+            *(f"- {item}" for item in positive_items),
+            "",
+            "### 개선이 필요한 점",
+            *(f"- {item}" for item in concern_items),
+        ]
+    )
 
     return {
         "body": body,
@@ -349,8 +430,8 @@ def review_pull_request(
             fh.write(prompt)
 
     mlx_result = run_mlx(prompt)
-    comments, summary, event = validate_mlx_output(mlx_result, pr_files)
-    payload = build_review_payload(summary, event, comments)
+    comments, summary, event, positives, concerns = validate_mlx_output(mlx_result, pr_files)
+    payload = build_review_payload(summary, event, comments, positives, concerns)
 
     result = {
         "status": "completed",
