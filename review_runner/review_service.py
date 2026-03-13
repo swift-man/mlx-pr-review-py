@@ -260,6 +260,12 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
                 "톤은 전문적이고 간결하게 유지하세요.",
                 "칭찬은 positives에만 작성하고, 라인 코멘트에는 작성하지 마세요.",
             ],
+            "json_rules": [
+                "최상위 키는 summary, event, positives, concerns, comments만 사용하세요.",
+                "positives와 concerns는 반드시 JSON 배열로 반환하세요.",
+                "summary 문자열 안에 positive1:, concerns1:, comments: 같은 라벨을 섞어 쓰지 마세요.",
+                "event 값은 COMMENT 또는 REQUEST_CHANGES 중 하나만 사용하세요.",
+            ],
             "line_comment_rules": [
                 "라인 코멘트는 실제 diff에서 보이는 문제만 지적하세요.",
                 "반드시 각 파일의 valid_comment_lines 안에 있는 RIGHT-side line 번호만 사용하세요.",
@@ -278,12 +284,10 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
                 "summary": "짧은 전체 리뷰 요약 (한국어)",
                 "event": "COMMENT 또는 REQUEST_CHANGES",
                 "positives": [
-                    "이 변경의 좋은 점 1 (한국어)",
-                    "이 변경의 좋은 점 2 (한국어)",
+                    "좋은 점 한 항목 (한국어 문자열)",
                 ],
                 "concerns": [
-                    "개선이 필요한 점 1 (한국어)",
-                    "개선이 필요한 점 2 (한국어)",
+                    "개선이 필요한 점 한 항목 (한국어 문자열)",
                 ],
                 "comments": [
                     {

@@ -22,6 +22,18 @@ MAX_PARSE_ERROR_SNIPPET = 2000
 TRAILING_COMMA_RE = re.compile(r",(?=\s*[}\]])")
 BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
 UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(COMMENT|REQUEST_CHANGES)(\s*[,}])')
+SUMMARY_STOP_RE = re.compile(
+    r'(?i)(?:\bpositive(?:s)?\d*\s*:|["\']?positives["\']?\s*:|\bconcern(?:s)?\d*\s*:|["\']?concerns["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:)'
+)
+GENERIC_FIELD_STOP_RE = re.compile(
+    r'(?i)(?:["\']?summary["\']?\s*:|["\']?event["\']?\s*:|["\']?positives["\']?\s*:|["\']?concerns["\']?\s*:|["\']?comments["\']?\s*:|\bpositive(?:s)?\d*\s*:|\bconcern(?:s)?\d*\s*:)'
+)
+POSITIVE_ITEM_RE = re.compile(
+    r'(?is)\bpositive(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+)
+CONCERN_ITEM_RE = re.compile(
+    r'(?is)\bconcern(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+)
 SMART_QUOTES_TRANSLATION = str.maketrans(
     {
         "“": '"',
@@ -135,6 +147,9 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "Do not use trailing commas, single quotes, comments, or unquoted enum values. "
                 "All output must be written in Korean. This is mandatory. "
                 "Write summary, positives, concerns, and every line comment body in Korean only. "
+                "Use only these top-level keys: summary, event, positives, concerns, comments. "
+                "positives and concerns must be JSON arrays, never inline labels such as positive1: or concerns1:. "
+                "Do not put positives, concerns, or comments inside the summary string. "
                 "Do not use English sentences in JSON values unless a file path, symbol, or API name requires it. "
                 f"Return at most {max_findings} findings. "
                 "Do not write praise-only line comments. "
@@ -276,6 +291,138 @@ def repair_json_candidate(candidate: str) -> str:
     return repaired
 
 
+def find_key_value_start(text: str, key: str) -> int:
+    pattern = re.compile(rf'(?i)["\']?{re.escape(key)}["\']?\s*:')
+    match = pattern.search(text)
+    if match is None:
+        return -1
+    return match.end()
+
+
+def scan_balanced_segment(text: str, start: int, open_char: str, close_char: str) -> str | None:
+    if start < 0 or start >= len(text) or text[start] != open_char:
+        return None
+
+    depth = 0
+    string_delimiter: str | None = None
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if string_delimiter is not None:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == string_delimiter:
+                string_delimiter = None
+            continue
+
+        if char in {'"', "'"}:
+            string_delimiter = char
+        elif char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    return None
+
+
+def parse_json_fragment(fragment: str) -> Any:
+    for candidate in (fragment, repair_json_candidate(fragment)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        try:
+            return ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            pass
+
+    return None
+
+
+def extract_array_field(text: str, key: str) -> list[Any] | None:
+    value_start = find_key_value_start(text, key)
+    if value_start < 0:
+        return None
+
+    while value_start < len(text) and text[value_start].isspace():
+        value_start += 1
+
+    if value_start >= len(text):
+        return None
+
+    if text[value_start] != "[":
+        array_start = text.find("[", value_start)
+        if array_start < 0:
+            return None
+        value_start = array_start
+
+    fragment = scan_balanced_segment(text, value_start, "[", "]")
+    if fragment is None:
+        return None
+
+    parsed = parse_json_fragment(fragment)
+    if isinstance(parsed, list):
+        return parsed
+    return None
+
+
+def extract_string_field(text: str, key: str, stop_pattern: re.Pattern[str]) -> str:
+    value_start = find_key_value_start(text, key)
+    if value_start < 0:
+        return ""
+
+    while value_start < len(text) and text[value_start].isspace():
+        value_start += 1
+
+    if value_start >= len(text):
+        return ""
+
+    remainder = text[value_start:]
+    if remainder.startswith(('"', "'")):
+        remainder = remainder[1:]
+
+    stop_match = stop_pattern.search(remainder)
+    field_text = remainder[: stop_match.start()] if stop_match is not None else remainder
+    return normalize_text(field_text.strip().strip('"\',]}'))
+
+
+def extract_labeled_items(text: str, item_pattern: re.Pattern[str]) -> list[str]:
+    return normalize_text_list([match.group(1) for match in item_pattern.finditer(text)], max_items=10)
+
+
+def salvage_broken_output(candidate: str) -> dict[str, Any] | None:
+    summary = extract_string_field(candidate, "summary", SUMMARY_STOP_RE)
+    event = extract_string_field(candidate, "event", GENERIC_FIELD_STOP_RE).upper()
+    positives = normalize_text_list(extract_array_field(candidate, "positives"), max_items=10)
+    concerns = normalize_text_list(extract_array_field(candidate, "concerns"), max_items=10)
+    comments_raw = extract_array_field(candidate, "comments") or []
+    comments = [item for item in comments_raw if isinstance(item, dict)]
+
+    if not positives:
+        positives = extract_labeled_items(candidate, POSITIVE_ITEM_RE)
+    if not concerns:
+        concerns = extract_labeled_items(candidate, CONCERN_ITEM_RE)
+
+    if event not in {"COMMENT", "REQUEST_CHANGES"}:
+        event = "REQUEST_CHANGES" if comments else "COMMENT"
+
+    if not any([summary, positives, concerns, comments]):
+        return None
+
+    return {
+        "summary": summary or DEFAULT_SUMMARY,
+        "event": event,
+        "positives": positives,
+        "concerns": concerns,
+        "comments": comments,
+    }
+
+
 def parse_model_json(raw_output: str) -> dict[str, Any]:
     candidate = extract_json_object(raw_output)
     try:
@@ -298,6 +445,10 @@ def parse_model_json(raw_output: str) -> dict[str, Any]:
                 continue
             if isinstance(parsed, dict):
                 return parsed
+
+        salvaged = salvage_broken_output(candidate)
+        if salvaged is not None:
+            return salvaged
 
         raise RuntimeError(
             "Model returned invalid JSON-like output.\n"
