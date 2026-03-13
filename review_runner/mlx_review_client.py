@@ -174,6 +174,11 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "positives and concerns must be JSON arrays, never inline labels such as positive1: or concerns1:. "
                 "Do not put positives, concerns, or comments inside the summary string. "
                 "Do not use English sentences in JSON values unless a file path, symbol, or API name requires it. "
+                "Before deciding there are no issues, explicitly check whether the diff disables validation, bypasses authentication, skips a security check, logs a token/secret, or turns an error path into a success path. "
+                "Also check for typos in public response keys, payload fields, and GitHub header names because those break integrations even when the code still looks simple. "
+                "If any of those patterns appear in added lines, you must add at least one concern and one line comment, and set event to REQUEST_CHANGES. "
+                "Do not answer with generic praise such as 'PR diff가 잘 작성되었습니다' or '잘 정리되어 있습니다' unless it is tied to a specific strength visible in the diff. "
+                "Do not say there are no improvements needed when the diff removes a guard, returns early from a validation branch, or prints a secret value. "
                 f"Return at most {max_findings} findings. "
                 "Do not write praise-only line comments. "
                 'Follow this shape exactly: {"summary":"한국어 요약","event":"COMMENT","positives":["한국어 장점"],"concerns":["한국어 개선점"],"comments":[{"path":"file.py","line":12,"body":"한국어 라인 코멘트"}]}. '
@@ -188,6 +193,9 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "반드시 JSON 객체 하나만 반환하세요. "
                 "summary, positives, concerns, comments[].body 의 모든 자연어 문장은 한국어로만 작성하세요. "
                 "event 값만 COMMENT 또는 REQUEST_CHANGES 를 사용할 수 있습니다. "
+                "추가된 코드에서 검증 우회, 인증/서명 체크 제거, 민감정보 로그 출력, 예외 대신 성공 반환이 보이면 반드시 지적하세요. "
+                "특히 signature 검증을 건너뛰는 return, token/secret 출력은 높은 우선순위 이슈로 취급하세요. "
+                "공개 응답 키 이름이나 GitHub 헤더 이름의 오타처럼 기본 계약을 깨는 변경도 반드시 지적하세요. "
                 "영문 diff 메타데이터를 그대로 복사하지 말고, 한국어 리뷰 문장으로 정리하세요.\n"
                 f"{compact_payload}"
             ),
