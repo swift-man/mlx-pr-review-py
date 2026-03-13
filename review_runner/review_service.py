@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import ssl
 import subprocess
 import textwrap
 import urllib.error
@@ -14,9 +15,20 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+import certifi
+
 
 DEFAULT_API_URL = "https://api.github.com"
 DEFAULT_MLX_REVIEW_CMD = "python3 -m review_runner.mlx_review_client"
+DEFAULT_CA_BUNDLE_ENV = "GITHUB_CA_BUNDLE"
+DEFAULT_NO_FINDINGS_SUMMARY = (
+    "지적할 만한 문제는 보이지 않습니다. 변경 사항이 집중되어 있고 흐름도 자연스럽습니다."
+)
+
+
+def build_ssl_context() -> ssl.SSLContext:
+    cafile = os.environ.get(DEFAULT_CA_BUNDLE_ENV) or os.environ.get("SSL_CERT_FILE") or certifi.where()
+    return ssl.create_default_context(cafile=cafile)
 
 
 @dataclass
@@ -42,6 +54,7 @@ class GitHubApi:
         self.token = token
         self.repository = repository
         self.api_url = api_url.rstrip("/")
+        self.ssl_context = build_ssl_context()
 
     def request_json(
         self,
@@ -71,7 +84,7 @@ class GitHubApi:
             },
         )
         try:
-            with urllib.request.urlopen(request) as response:
+            with urllib.request.urlopen(request, context=self.ssl_context) as response:
                 raw = response.read().decode("utf-8")
                 if not raw:
                     return None
@@ -79,6 +92,15 @@ class GitHubApi:
         except urllib.error.HTTPError as exc:
             message = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"GitHub API {method} {url} failed: {exc.code} {message}") from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLError):
+                ca_bundle = os.environ.get(DEFAULT_CA_BUNDLE_ENV) or os.environ.get("SSL_CERT_FILE") or certifi.where()
+                raise RuntimeError(
+                    "GitHub API TLS verification failed. "
+                    "Set SSL_CERT_FILE or GITHUB_CA_BUNDLE if you need a custom CA bundle. "
+                    f"Current CA bundle: {ca_bundle}"
+                ) from exc
+            raise
 
     def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
         files: list[dict[str, Any]] = []
@@ -157,26 +179,53 @@ def build_pr_files(raw_files: list[dict[str, Any]]) -> list[PullRequestFile]:
     return files
 
 
+def format_no_findings_summary(summary: str) -> str:
+    normalized = " ".join(summary.split())
+    if not normalized or normalized in {
+        "Automated review completed.",
+        "Automated MLX review completed.",
+        "No actionable issues found.",
+        "지적할 만한 문제는 보이지 않습니다.",
+        "자동 리뷰를 완료했습니다.",
+    }:
+        return DEFAULT_NO_FINDINGS_SUMMARY
+
+    lower = normalized.lower()
+    if "no actionable issues" in lower and not any(
+        token in lower
+        for token in {"focused", "clear", "solid", "well", "clean", "cohesive", "readable", "straightforward"}
+    ):
+        return f"{normalized} The change is focused and straightforward to follow."
+
+    return normalized
+
+
 def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile]) -> str:
     prompt_payload = {
         "repository": repository,
         "pull_request": pull_number,
         "instructions": {
-            "task": "Review this PR diff and report concrete, actionable issues.",
+            "task": "Review this PR diff and report concrete, actionable issues in Korean.",
             "line_comment_rules": [
                 "Only report problems that are actually visible in the diff.",
                 "Only use RIGHT-side line numbers listed in each file's valid_comment_lines.",
                 "Prefer correctness, security, reliability, and significant maintainability issues.",
-                "Do not suggest style-only comments or praise.",
+                "Write every line comment body in Korean.",
+                "Do not add style-only or praise-only line comments.",
+            ],
+            "summary_rules": [
+                "Keep the summary concise and grounded in the diff.",
+                "Write the summary in Korean.",
+                "If there are no actionable issues, briefly mention one or two strengths of the change in the summary.",
             ],
             "response_schema": {
-                "summary": "short overall review summary",
+                "summary": "short overall review summary in Korean; if there are no issues, include brief positive feedback",
                 "event": "COMMENT or REQUEST_CHANGES",
                 "comments": [
                     {
                         "path": "relative/file.py",
                         "line": 12,
-                        "body": "why this is a problem and what to change",
+                        "body": "Korean explanation of why this is a problem and what to change",
                     }
                 ],
             },
@@ -239,13 +288,14 @@ def validate_mlx_output(result: dict[str, Any], files: list[PullRequestFile]) ->
 
         comments.append(ReviewComment(path=path, line=line, body=body))
 
-    summary = (result.get("summary") or "").strip() or "Automated review completed."
+    summary = (result.get("summary") or "").strip() or "자동 리뷰를 완료했습니다."
 
     event = (result.get("event") or "").strip().upper()
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
         event = "REQUEST_CHANGES" if comments else "COMMENT"
 
     if not comments:
+        summary = format_no_findings_summary(summary)
         event = "COMMENT"
 
     return comments, summary, event
@@ -254,9 +304,9 @@ def validate_mlx_output(result: dict[str, Any], files: list[PullRequestFile]) ->
 def build_review_payload(summary: str, event: str, comments: list[ReviewComment]) -> dict[str, Any]:
     body = summary
     if comments:
-        body = f"{summary}\n\nAutomated review found {len(comments)} actionable issue(s)."
+        body = f"{summary}\n\n자동 리뷰가 {len(comments)}개의 확인 포인트를 남겼습니다."
     else:
-        body = f"{summary}\n\nNo line-specific findings were produced."
+        body = f"{summary}\n\n검토한 diff에서 라인 단위 지적 사항은 발견되지 않았습니다."
 
     return {
         "body": body,

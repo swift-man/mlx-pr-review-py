@@ -86,8 +86,11 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "Return exactly one JSON object and nothing else. "
                 "Never wrap the answer in markdown fences. "
                 "Report only high-confidence issues that are directly visible in the diff. "
+                "Write the summary and every line comment body in Korean. "
                 f"Return at most {max_findings} findings. "
-                'If there are no actionable issues, return {"summary":"...","event":"COMMENT","comments":[]}.'
+                "Do not write praise-only line comments. "
+                'If there are no actionable issues, return {"summary":"...","event":"COMMENT","comments":[]} '
+                "and use the summary to briefly mention what looks strong about the diff in Korean."
             ),
         },
         {
@@ -248,7 +251,7 @@ def normalize_response(raw_response: dict[str, Any]) -> dict[str, Any]:
 
     summary = str(raw_response.get("summary") or "").strip()
     if not summary:
-        summary = "Automated MLX review completed."
+        summary = "지적할 만한 문제는 보이지 않습니다. 변경 사항이 전반적으로 깔끔하게 정리되어 있습니다."
 
     event = str(raw_response.get("event") or "").strip().upper()
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
