@@ -1,3 +1,4 @@
 fastapi
 uvicorn
 mlx-lm
+certifi

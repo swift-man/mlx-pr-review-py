@@ -15,6 +15,7 @@ mkdir -p "$TARGET_ROOT/deploy"
 cp "$SOURCE_ROOT/review_runner/"*.py "$TARGET_ROOT/review_runner/"
 cp "$SOURCE_ROOT/review_runner/requirements.txt" "$TARGET_ROOT/review_runner/"
 cp "$SOURCE_ROOT/scripts/run_webhook_server.sh" "$TARGET_ROOT/scripts/"
+cp "$SOURCE_ROOT/scripts/send_test_webhook.sh" "$TARGET_ROOT/scripts/"
 cp "$SOURCE_ROOT/scripts/warm_mlx_model.sh" "$TARGET_ROOT/scripts/"
 cp "$SOURCE_ROOT/deploy/nginx-pr-review.conf" "$TARGET_ROOT/deploy/"
 
@@ -48,4 +49,7 @@ Warm the MLX model cache with:
 
 Start the webhook server with:
   LOCAL_REVIEW_HOME=$TARGET_ROOT zsh $TARGET_ROOT/scripts/run_webhook_server.sh
+
+Send a signed webhook test with:
+  GITHUB_WEBHOOK_SECRET=... GITHUB_REPOSITORY=OWNER/REPO PULL_NUMBER=123 zsh $TARGET_ROOT/scripts/send_test_webhook.sh
 EOF
