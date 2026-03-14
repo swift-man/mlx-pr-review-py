@@ -9,6 +9,7 @@ import re
 import shlex
 import ssl
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -21,7 +22,6 @@ import jwt
 
 
 DEFAULT_API_URL = "https://api.github.com"
-DEFAULT_MLX_REVIEW_CMD = "python3 -m review_runner.mlx_review_client"
 DEFAULT_CA_BUNDLE_ENV = "GITHUB_CA_BUNDLE"
 DEFAULT_NO_FINDINGS_SUMMARY = (
     "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
@@ -71,6 +71,11 @@ PROMPT_ECHO_MARKERS = (
 def log_progress(prefix: str, message: str) -> None:
     """웹훅 처리 중간 단계를 한 줄 로그로 남긴다."""
     print(f"{prefix}{message}", flush=True)
+
+
+def default_mlx_review_command() -> list[str]:
+    """별도 설정이 없으면 현재 서버와 같은 Python 인터프리터로 MLX 클라이언트를 실행한다."""
+    return [sys.executable, "-m", "review_runner.mlx_review_client"]
 
 
 def normalize_text(value: Any) -> str:
@@ -803,8 +808,8 @@ def write_prompt_debug_file(prompt: str) -> None:
 
 def run_mlx(prompt: str) -> dict[str, Any]:
     """설정된 MLX 리뷰 커맨드를 실행하고 JSON 결과를 돌려준다."""
-    raw_command = os.environ.get("MLX_REVIEW_CMD", DEFAULT_MLX_REVIEW_CMD)
-    command = shlex.split(raw_command)
+    raw_command = os.environ.get("MLX_REVIEW_CMD")
+    command = shlex.split(raw_command) if raw_command else default_mlx_review_command()
     completed = subprocess.run(
         command,
         input=prompt,
