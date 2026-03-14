@@ -9,6 +9,7 @@ import re
 import shlex
 import ssl
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -21,7 +22,6 @@ import jwt
 
 
 DEFAULT_API_URL = "https://api.github.com"
-DEFAULT_MLX_REVIEW_CMD = "python3 -m review_runner.mlx_review_client"
 DEFAULT_CA_BUNDLE_ENV = "GITHUB_CA_BUNDLE"
 DEFAULT_NO_FINDINGS_SUMMARY = (
     "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
@@ -69,7 +69,13 @@ PROMPT_ECHO_MARKERS = (
 
 
 def log_progress(prefix: str, message: str) -> None:
+    """웹훅 처리 중간 단계를 한 줄 로그로 남긴다."""
     print(f"{prefix}{message}", flush=True)
+
+
+def default_mlx_review_command() -> list[str]:
+    """별도 설정이 없으면 현재 서버와 같은 Python 인터프리터로 MLX 클라이언트를 실행한다."""
+    return [sys.executable, "-m", "review_runner.mlx_review_client"]
 
 
 def normalize_text(value: Any) -> str:
@@ -169,6 +175,7 @@ def looks_like_praise_only_comment(text: str) -> bool:
 
 
 def build_ssl_context() -> ssl.SSLContext:
+    """GitHub API 호출에 사용할 CA 번들을 환경변수와 certifi에서 순서대로 찾는다."""
     cafile = os.environ.get(DEFAULT_CA_BUNDLE_ENV) or os.environ.get("SSL_CERT_FILE") or certifi.where()
     return ssl.create_default_context(cafile=cafile)
 
@@ -180,6 +187,7 @@ def request_json_url(
     body: dict[str, Any] | None = None,
     ssl_context: ssl.SSLContext | None = None,
 ) -> Any:
+    """공통 GitHub API JSON 호출 래퍼다."""
     payload = None
     if body is not None:
         payload = json.dumps(body).encode("utf-8")
@@ -211,6 +219,7 @@ def request_json_url(
 
 
 def build_github_headers(token: str, *, content_type: bool = True) -> dict[str, str]:
+    """GitHub REST API 기본 헤더를 만든다."""
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -223,6 +232,7 @@ def build_github_headers(token: str, *, content_type: bool = True) -> dict[str, 
 
 
 def load_github_app_private_key() -> str:
+    """GitHub App private key를 문자열 또는 파일 경로에서 읽어온다."""
     inline_key = os.environ.get("GITHUB_APP_PRIVATE_KEY")
     if inline_key:
         return inline_key.replace("\\n", "\n")
@@ -236,6 +246,7 @@ def load_github_app_private_key() -> str:
 
 
 def build_github_app_jwt(app_id: str, private_key: str) -> str:
+    """짧은 TTL의 GitHub App JWT를 만든다."""
     now = int(time.time())
     payload = {
         "iat": now - 60,
@@ -254,6 +265,7 @@ class ResolvedGitHubToken:
 
 
 def resolve_github_app_installation_id(app_jwt: str, repository: str, api_url: str, ssl_context: ssl.SSLContext) -> int:
+    """저장소 기준으로 GitHub App installation ID를 조회한다."""
     installation = request_json_url(
         "GET",
         f"{api_url.rstrip('/')}/repos/{repository}/installation",
@@ -266,36 +278,68 @@ def resolve_github_app_installation_id(app_jwt: str, repository: str, api_url: s
         raise RuntimeError(f"Could not resolve GitHub App installation ID for repository {repository}") from exc
 
 
+def parse_installation_id(
+    raw_installation_id: str | None,
+    *,
+    app_jwt: str,
+    repository: str | None,
+    api_url: str,
+    ssl_context: ssl.SSLContext,
+) -> int:
+    """환경변수 또는 저장소 조회 결과를 이용해 installation ID를 결정한다."""
+    if raw_installation_id:
+        try:
+            return int(raw_installation_id)
+        except ValueError as exc:
+            raise RuntimeError("GITHUB_APP_INSTALLATION_ID must be an integer") from exc
+
+    if not repository:
+        raise RuntimeError("GITHUB_APP_INSTALLATION_ID is required when the repository is not available for installation lookup")
+
+    return resolve_github_app_installation_id(app_jwt, repository, api_url, ssl_context)
+
+
+def request_installation_token(
+    app_jwt: str,
+    installation_id: int,
+    *,
+    api_url: str,
+    ssl_context: ssl.SSLContext,
+) -> str:
+    """설치된 GitHub App을 대신할 installation token을 발급받는다."""
+    response = request_json_url(
+        "POST",
+        f"{api_url.rstrip('/')}/app/installations/{installation_id}/access_tokens",
+        headers=build_github_headers(app_jwt),
+        body={},
+        ssl_context=ssl_context,
+    )
+    token = str(response.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("GitHub App installation token response did not include a token")
+    return token
+
+
 def resolve_github_token(repository: str | None = None, api_url: str = DEFAULT_API_URL) -> ResolvedGitHubToken:
+    """GitHub App이 설정돼 있으면 App 인증을, 아니면 PAT를 우선 사용한다."""
     app_id = os.environ.get("GITHUB_APP_ID")
     if app_id:
         private_key = load_github_app_private_key()
         ssl_context = build_ssl_context()
         app_jwt = build_github_app_jwt(app_id, private_key)
-
-        raw_installation_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
-        if raw_installation_id:
-            try:
-                installation_id = int(raw_installation_id)
-            except ValueError as exc:
-                raise RuntimeError("GITHUB_APP_INSTALLATION_ID must be an integer") from exc
-        else:
-            if not repository:
-                raise RuntimeError(
-                    "GITHUB_APP_INSTALLATION_ID is required when the repository is not available for installation lookup"
-                )
-            installation_id = resolve_github_app_installation_id(app_jwt, repository, api_url, ssl_context)
-
-        response = request_json_url(
-            "POST",
-            f"{api_url.rstrip('/')}/app/installations/{installation_id}/access_tokens",
-            headers=build_github_headers(app_jwt),
-            body={},
+        installation_id = parse_installation_id(
+            os.environ.get("GITHUB_APP_INSTALLATION_ID"),
+            app_jwt=app_jwt,
+            repository=repository,
+            api_url=api_url,
             ssl_context=ssl_context,
         )
-        token = str(response.get("token") or "").strip()
-        if not token:
-            raise RuntimeError("GitHub App installation token response did not include a token")
+        token = request_installation_token(
+            app_jwt,
+            installation_id,
+            api_url=api_url,
+            ssl_context=ssl_context,
+        )
         return ResolvedGitHubToken(
             token=token,
             source="github_app_installation",
@@ -329,7 +373,20 @@ class PullRequestFile:
     right_side_lines: set[int]
 
 
+@dataclass
+class ValidatedReview:
+    """모델 출력과 규칙 기반 검사를 합쳐서 정규화한 리뷰 결과다."""
+
+    comments: list[ReviewComment]
+    summary: str
+    event: str
+    positives: list[str]
+    concerns: list[str]
+
+
 class GitHubApi:
+    """PR 파일 조회와 리뷰 등록에 필요한 GitHub API 접근을 모은다."""
+
     def __init__(self, token: str, repository: str, api_url: str = DEFAULT_API_URL) -> None:
         self.token = token
         self.repository = repository
@@ -380,6 +437,7 @@ class GitHubApi:
 
 
 def parse_right_side_lines(patch: str) -> set[int]:
+    """GitHub unified diff에서 리뷰 가능한 RIGHT-side 줄 번호를 추린다."""
     lines: set[int] = set()
     current_new_line = None
 
@@ -413,6 +471,7 @@ def parse_right_side_lines(patch: str) -> set[int]:
 
 
 def build_pr_files(raw_files: list[dict[str, Any]]) -> list[PullRequestFile]:
+    """GitHub PR 파일 응답을 내부 리뷰 구조로 변환한다."""
     files: list[PullRequestFile] = []
     for raw in raw_files:
         patch = raw.get("patch") or ""
@@ -469,6 +528,7 @@ def merge_distinct_items(primary: list[str], secondary: list[str], max_items: in
 
 
 def iter_patch_lines(patch: str) -> list[tuple[str, int, str]]:
+    """패치를 줄 단위로 펼쳐서 종류, 새 파일 줄 번호, 본문을 함께 넘긴다."""
     rows: list[tuple[str, int, str]] = []
     current_new_line: int | None = None
 
@@ -590,16 +650,23 @@ def detect_contract_typos(pr_file: PullRequestFile) -> list[ReviewComment]:
 
 
 def detect_rule_based_comments(files: list[PullRequestFile]) -> list[ReviewComment]:
+    """모델이 놓치기 쉬운 보안/계약 위반 패턴을 규칙 기반으로 보강한다."""
     comments: list[ReviewComment] = []
     seen: set[tuple[str, int, str]] = set()
+    detectors = (
+        detect_signature_bypass,
+        detect_secret_logging,
+        detect_contract_typos,
+    )
 
     for pr_file in files:
-        for comment in detect_signature_bypass(pr_file) + detect_secret_logging(pr_file) + detect_contract_typos(pr_file):
-            key = (comment.path, comment.line, comment.body)
-            if key in seen:
-                continue
-            seen.add(key)
-            comments.append(comment)
+        for detector in detectors:
+            for comment in detector(pr_file):
+                key = (comment.path, comment.line, comment.body)
+                if key in seen:
+                    continue
+                seen.add(key)
+                comments.append(comment)
 
     return comments
 
@@ -667,6 +734,7 @@ def sanitize_summary(summary: Any, has_findings: bool) -> str:
 
 
 def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile]) -> str:
+    """모델이 바로 읽을 수 있는 JSON 프롬프트를 조립한다."""
     prompt_payload = {
         "repository": repository,
         "pull_request": pull_number,
@@ -731,9 +799,17 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
     return json.dumps(prompt_payload, ensure_ascii=False, indent=2)
 
 
+def write_prompt_debug_file(prompt: str) -> None:
+    """문제 재현이 필요할 때 마지막 프롬프트를 파일로 남긴다."""
+    debug_path = os.environ.get("PROMPT_DEBUG_PATH", "/tmp/mlx_pr_review_prompt.json")
+    with open(debug_path, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+
+
 def run_mlx(prompt: str) -> dict[str, Any]:
-    raw_command = os.environ.get("MLX_REVIEW_CMD", DEFAULT_MLX_REVIEW_CMD)
-    command = shlex.split(raw_command)
+    """설정된 MLX 리뷰 커맨드를 실행하고 JSON 결과를 돌려준다."""
+    raw_command = os.environ.get("MLX_REVIEW_CMD")
+    command = shlex.split(raw_command) if raw_command else default_mlx_review_command()
     completed = subprocess.run(
         command,
         input=prompt,
@@ -757,10 +833,11 @@ def run_mlx(prompt: str) -> dict[str, Any]:
         raise RuntimeError(f"MLX command returned invalid JSON:\n{stdout}") from exc
 
 
-def validate_mlx_output(
+def collect_validated_comments(
     result: dict[str, Any],
     files: list[PullRequestFile],
-) -> tuple[list[ReviewComment], str, str, list[str], list[str]]:
+) -> list[ReviewComment]:
+    """모델 코멘트와 규칙 기반 코멘트를 합치고 중복을 제거한다."""
     file_index = {f.filename: f for f in files}
     comments: list[ReviewComment] = []
     seen_comment_keys: set[tuple[str, int, str]] = set()
@@ -789,28 +866,50 @@ def validate_mlx_output(
         seen_comment_keys.add(key)
         comments.append(comment)
 
+    return comments
+
+
+def decide_review_event(raw_event: Any, *, has_findings: bool) -> str:
+    """모델 event가 어색해도 최종 리뷰 이벤트를 일관되게 정한다."""
+    event = normalize_text(raw_event).upper()
+    if event not in {"COMMENT", "REQUEST_CHANGES"}:
+        return "REQUEST_CHANGES" if has_findings else "COMMENT"
+    if has_findings:
+        return "REQUEST_CHANGES"
+    return "COMMENT"
+
+
+def validate_mlx_output(
+    result: dict[str, Any],
+    files: list[PullRequestFile],
+) -> ValidatedReview:
+    """모델 출력을 실제 리뷰 payload로 쓰기 전에 안전하게 정리한다."""
+    comments = collect_validated_comments(result, files)
+
     summary = normalize_text(result.get("summary")) or "자동 리뷰를 완료했습니다."
     positives = sanitize_positive_items(normalize_text_list(result.get("positives"), max_items=10))
     concerns = sanitize_text_items(normalize_text_list(result.get("concerns"), max_items=10))
     comment_summaries = summarize_comment_bodies(comments, max_items=3)
     concerns = merge_distinct_items(concerns, comment_summaries, max_items=3)
+    has_findings = bool(comments or concerns)
+    event = decide_review_event(result.get("event"), has_findings=has_findings)
 
-    event = normalize_text(result.get("event")).upper()
-    if event not in {"COMMENT", "REQUEST_CHANGES"}:
-        event = "REQUEST_CHANGES" if (comments or concerns) else "COMMENT"
-
-    if not comments and not concerns:
+    if not has_findings:
         summary = sanitize_summary(summary, has_findings=False)
         if not positives:
             positives = list(DEFAULT_FALLBACK_POSITIVES)
-        event = "COMMENT"
     else:
         summary = sanitize_summary(summary, has_findings=True)
         if not positives:
             positives = ["핵심 변경 의도가 diff 안에서 비교적 명확하게 드러납니다."]
-        event = "REQUEST_CHANGES"
 
-    return comments, summary, event, positives, concerns
+    return ValidatedReview(
+        comments=comments,
+        summary=summary,
+        event=event,
+        positives=positives,
+        concerns=concerns,
+    )
 
 
 def build_review_payload(
@@ -820,6 +919,7 @@ def build_review_payload(
     positives: list[str],
     concerns: list[str],
 ) -> dict[str, Any]:
+    """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다."""
     positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
     concern_items = concerns or [DEFAULT_NO_CONCERNS_TEXT]
     body_lines = [
@@ -863,11 +963,64 @@ def build_review_payload(
 
 
 def should_retry_review_as_comment(error: RuntimeError, payload: dict[str, Any]) -> bool:
+    """자기 PR에 REQUEST_CHANGES를 달 수 없는 경우만 안전하게 재시도한다."""
     if payload.get("event") != "REQUEST_CHANGES":
         return False
 
     message = normalize_text(str(error)).lower()
     return "request changes on your own pull request" in message
+
+
+def build_review_result(
+    repository: str,
+    pull_number: int,
+    validated_review: ValidatedReview,
+    payload: dict[str, Any],
+    auth_source: str | None,
+) -> dict[str, Any]:
+    """로그와 후속 처리에서 재사용할 리뷰 결과 요약을 만든다."""
+    return {
+        "status": "completed",
+        "repository": repository,
+        "pull_number": pull_number,
+        "summary": validated_review.summary,
+        "event": validated_review.event,
+        "comment_count": len(validated_review.comments),
+        "positive_count": len(validated_review.positives),
+        "concern_count": len(validated_review.concerns),
+        "payload": payload,
+        "auth_source": auth_source or "personal_access_token",
+    }
+
+
+def build_review_message(
+    *,
+    posted_event: str,
+    comments: list[ReviewComment],
+    payload: dict[str, Any],
+    response: Any,
+    fallback_note: str,
+) -> str:
+    """최종 콘솔 로그와 반환 메시지에 공통으로 쓰는 본문을 만든다."""
+    message_lines = [
+        "Posted review successfully.",
+        f"Review ID: {response.get('id')}",
+        f"Event: {posted_event}",
+        f"Comments: {len(comments)}",
+        "",
+        payload["body"],
+    ]
+    if fallback_note:
+        message_lines[1:1] = [fallback_note]
+    if comments:
+        message_lines.extend(
+            [
+                "",
+                "Inline comments:",
+                *(f"- {comment.path}:{comment.line} {comment.body}" for comment in comments),
+            ]
+        )
+    return "\n".join(message_lines)
 
 
 def review_pull_request(
@@ -879,6 +1032,7 @@ def review_pull_request(
     auth_source: str | None = None,
     log_prefix: str = "",
 ) -> dict[str, Any]:
+    """PR diff를 수집하고 모델 리뷰를 생성한 뒤 GitHub에 등록한다."""
     started_at = time.monotonic()
     github = GitHubApi(token=token, repository=repository, api_url=api_url)
     log_progress(log_prefix, f"Fetching PR files for {repository}#{pull_number}")
@@ -896,38 +1050,30 @@ def review_pull_request(
 
     prompt = make_prompt(repository, pull_number, pr_files)
     if os.environ.get("WRITE_PROMPT_DEBUG") == "1":
-        debug_path = os.environ.get("PROMPT_DEBUG_PATH", "/tmp/mlx_pr_review_prompt.json")
-        with open(debug_path, "w", encoding="utf-8") as fh:
-            fh.write(prompt)
+        write_prompt_debug_file(prompt)
 
     mlx_started_at = time.monotonic()
     log_progress(log_prefix, "Running MLX review model")
     mlx_result = run_mlx(prompt)
     log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
-    comments, summary, event, positives, concerns = validate_mlx_output(mlx_result, pr_files)
-    payload = build_review_payload(summary, event, comments, positives, concerns)
-
-    result = {
-        "status": "completed",
-        "repository": repository,
-        "pull_number": pull_number,
-        "summary": summary,
-        "event": event,
-        "comment_count": len(comments),
-        "positive_count": len(positives),
-        "concern_count": len(concerns),
-        "payload": payload,
-        "auth_source": auth_source or "personal_access_token",
-    }
+    validated_review = validate_mlx_output(mlx_result, pr_files)
+    payload = build_review_payload(
+        validated_review.summary,
+        validated_review.event,
+        validated_review.comments,
+        validated_review.positives,
+        validated_review.concerns,
+    )
+    result = build_review_result(repository, pull_number, validated_review, payload, auth_source)
 
     if dry_run:
         log_progress(log_prefix, f"Dry run completed in {time.monotonic() - started_at:.1f}s")
         return result
 
-    posted_event = event
+    posted_event = validated_review.event
     fallback_note = ""
     try:
-        log_progress(log_prefix, f"Posting GitHub review as {event}")
+        log_progress(log_prefix, f"Posting GitHub review as {validated_review.event}")
         response = github.post_review(pull_number, payload)
     except RuntimeError as exc:
         if not should_retry_review_as_comment(exc, payload):
@@ -939,33 +1085,18 @@ def review_pull_request(
         response = github.post_review(pull_number, retry_payload)
         payload = retry_payload
         posted_event = "COMMENT"
-        result["requested_event"] = event
+        result["requested_event"] = validated_review.event
         result["event"] = posted_event
         result["payload"] = payload
         fallback_note = "Requested changes is not allowed on your own pull request, so the review was posted as COMMENT instead."
 
-    message_lines = [
-        "Posted review successfully.",
-        f"Review ID: {response.get('id')}",
-        f"Event: {posted_event}",
-        f"Comments: {len(comments)}",
-        "",
-        payload["body"],
-    ]
-    if fallback_note:
-        message_lines[1:1] = [fallback_note]
-    if comments:
-        message_lines.extend(
-            [
-                "",
-                "Inline comments:",
-                *(
-                    f"- {comment.path}:{comment.line} {comment.body}"
-                    for comment in comments
-                ),
-            ]
-        )
     result["review_id"] = response.get("id")
-    result["message"] = "\n".join(message_lines)
+    result["message"] = build_review_message(
+        posted_event=posted_event,
+        comments=validated_review.comments,
+        payload=payload,
+        response=response,
+        fallback_note=fallback_note,
+    )
     log_progress(log_prefix, f"Review posted successfully in {time.monotonic() - started_at:.1f}s")
     return result

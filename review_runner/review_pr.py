@@ -9,7 +9,14 @@ import json
 
 from review_runner.review_service import DEFAULT_API_URL, resolve_github_token, review_pull_request
 
+
+def is_dry_run() -> bool:
+    """CLI와 웹훅 서버가 같은 기준으로 dry-run 여부를 읽도록 맞춘다."""
+    return os.environ.get("DRY_RUN") == "1"
+
+
 def parse_event() -> tuple[str, int]:
+    """GitHub Actions 이벤트 파일에서 저장소와 PR 번호를 꺼낸다."""
     event_path = os.environ["GITHUB_EVENT_PATH"]
     repository = os.environ.get("GITHUB_REPOSITORY")
     with open(event_path, "r", encoding="utf-8") as fh:
@@ -21,6 +28,7 @@ def parse_event() -> tuple[str, int]:
 
 
 def main() -> int:
+    """단일 PR 리뷰 CLI 실행 흐름을 담당한다."""
     repository, pull_number = parse_event()
     api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
     auth = resolve_github_token(repository=repository, api_url=api_url)
@@ -29,10 +37,10 @@ def main() -> int:
         pull_number=pull_number,
         token=auth.token,
         api_url=api_url,
-        dry_run=os.environ.get("DRY_RUN") == "1",
+        dry_run=is_dry_run(),
         auth_source=auth.source,
     )
-    if os.environ.get("DRY_RUN") == "1":
+    if is_dry_run():
         print(json.dumps(result.get("payload", result), ensure_ascii=False, indent=2))
         return 0
 

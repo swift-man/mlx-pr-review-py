@@ -21,6 +21,7 @@ app = FastAPI(title="GitHub MLX Review Webhook", version="1.0.0")
 
 
 def require_env(name: str) -> str:
+    """필수 환경변수가 비어 있으면 서버 시작 대신 명확한 오류를 낸다."""
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(f"{name} is required")
@@ -28,6 +29,7 @@ def require_env(name: str) -> str:
 
 
 def verify_signature(payload: bytes, signature_header: str | None, secret: str) -> None:
+    """GitHub webhook 서명을 검증해 위조 요청을 초기에 차단한다."""
     if not signature_header:
         raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
 
@@ -37,6 +39,7 @@ def verify_signature(payload: bytes, signature_header: str | None, secret: str) 
 
 
 def should_process_pull_request(event: dict[str, Any]) -> tuple[bool, str]:
+    """리뷰를 실제로 돌릴 pull_request 액션만 통과시킨다."""
     action = event.get("action")
     pull_request = event.get("pull_request") or {}
 
@@ -47,9 +50,25 @@ def should_process_pull_request(event: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
+def build_delivery_prefix(delivery_id: str | None) -> str:
+    """서버 로그에서 같은 webhook 흐름을 쉽게 묶어보기 위한 접두사다."""
+    return f"[delivery={delivery_id}] " if delivery_id else ""
+
+
+def extract_pull_request_target(event: dict[str, Any]) -> tuple[str, int]:
+    """payload에서 리뷰 대상 저장소와 PR 번호를 꺼낸다."""
+    repository = (event.get("repository") or {}).get("full_name")
+    pull_request = event.get("pull_request") or {}
+    pull_number = pull_request.get("number")
+    if not repository or not isinstance(pull_number, int):
+        raise HTTPException(status_code=400, detail="Missing repository or pull_request.number")
+    return repository, pull_number
+
+
 def handle_pull_request_event(repository: str, pull_number: int, delivery_id: str | None) -> None:
+    """백그라운드 스레드에서 실제 리뷰 생성과 GitHub 등록을 처리한다."""
     started_at = time.monotonic()
-    prefix = f"[delivery={delivery_id}] " if delivery_id else ""
+    prefix = build_delivery_prefix(delivery_id)
     print(f"{prefix}Starting review for {repository}#{pull_number}", flush=True)
     api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
     auth = resolve_github_token(repository=repository, api_url=api_url)
@@ -70,11 +89,13 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
+    """로드밸런서와 수동 점검용 최소 헬스체크 엔드포인트다."""
     return {"status": "ok"}
 
 
 @app.post("/github/webhook", status_code=202)
 async def github_webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """GitHub webhook을 검증한 뒤 빠르게 202를 반환하고 리뷰는 백그라운드에서 처리한다."""
     body = await request.body()
     secret = require_env("GITHUB_WEBHOOK_SECRET")
     verify_signature(body, request.headers.get("X-Hub-Signature-256"), secret)
@@ -97,12 +118,8 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
     if not should_process:
         return {"status": "ignored", "reason": reason, "delivery_id": delivery_id}
 
-    repository = (event.get("repository") or {}).get("full_name")
-    pull_request = event.get("pull_request") or {}
-    pull_number = pull_request.get("number")
-    if not repository or not isinstance(pull_number, int):
-        raise HTTPException(status_code=400, detail="Missing repository or pull_request.number")
-
+    repository, pull_number = extract_pull_request_target(event)
+    # GitHub에는 빠르게 202를 돌려주고, 무거운 리뷰 작업은 별도 스레드에서 이어간다.
     background_tasks.add_task(handle_pull_request_event, repository, pull_number, delivery_id)
     return {
         "status": "accepted",
