@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
-from review_runner.review_service import DEFAULT_API_URL, review_pull_request
+from review_runner.review_service import DEFAULT_API_URL, resolve_github_token, review_pull_request
 
 
 SUPPORTED_PULL_REQUEST_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
@@ -47,14 +47,15 @@ def should_process_pull_request(event: dict[str, Any]) -> tuple[bool, str]:
 
 
 def handle_pull_request_event(repository: str, pull_number: int, delivery_id: str | None) -> None:
-    token = require_env("GITHUB_TOKEN")
     api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
+    auth = resolve_github_token(repository=repository, api_url=api_url)
     result = review_pull_request(
         repository=repository,
         pull_number=pull_number,
-        token=token,
+        token=auth.token,
         api_url=api_url,
         dry_run=os.environ.get("DRY_RUN") == "1",
+        auth_source=auth.source,
     )
     prefix = f"[delivery={delivery_id}] " if delivery_id else ""
     print(prefix + json.dumps(result, ensure_ascii=False))

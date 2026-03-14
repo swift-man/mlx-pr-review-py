@@ -37,7 +37,7 @@ Mac mini에서 아래 항목이 준비되어 있어야 합니다.
 - Python 3.11 + `venv`
 - Nginx
 - GitHub webhook secret
-- GitHub Review API를 호출할 토큰
+- GitHub Review API를 호출할 인증 정보
 - MLX 실행 커맨드
 
 Python 3.11이 아직 없다면 먼저 설치합니다.
@@ -74,7 +74,11 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `LOCAL_REVIEW_HOME=/Users/runner/pr-review`
 - `HOST=127.0.0.1`
 - `PORT=8000`
-- `GITHUB_TOKEN=...`
+- `GITHUB_TOKEN=...` 또는 아래 GitHub App 설정
+- `GITHUB_APP_ID=123456` (옵션)
+- `GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app.pem` (옵션)
+- `GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."` (옵션)
+- `GITHUB_APP_INSTALLATION_ID=12345678` (옵션, 생략 시 `OWNER/REPO` 기준 자동 조회)
 - `GITHUB_WEBHOOK_SECRET=...`
 - `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client`
 - `MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit`
@@ -86,6 +90,8 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 
 `GITHUB_WEBHOOK_SECRET`는 GitHub 저장소 Webhook 설정의 Secret과 반드시 같은 값이어야 합니다.
 `GITHUB_REPOSITORY`는 수동 테스트 때 `swift-man/review.gorani.me`처럼 `OWNER/REPO` 형식이어야 합니다.
+GitHub App 인증을 쓰고 싶다면 `GITHUB_APP_ID`와 private key를 설정하면 되고, 이 경우 `GITHUB_TOKEN`보다 GitHub App installation token이 우선 사용됩니다.
+GitHub App으로 인증하면 리뷰 작성자가 개인 계정이 아니라 App bot으로 보입니다.
 실서비스 리뷰는 `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client`를 사용하고,
 실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client`로 바꿔서 테스트할 수 있습니다.
 
@@ -95,6 +101,15 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 export LOCAL_REVIEW_HOME=/Users/runner/pr-review
 export MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 zsh /Users/runner/pr-review/scripts/warm_mlx_model.sh
+```
+
+GitHub App bot으로 리뷰를 남기고 싶다면 warm-up과 별개로 아래 환경 변수도 준비해두면 됩니다.
+
+```bash
+export GITHUB_APP_ID=123456
+export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/github-app.private-key.pem
+# 선택: 설치 ID를 알고 있으면 직접 지정
+export GITHUB_APP_INSTALLATION_ID=12345678
 ```
 
 ## 4. 서버 시작
@@ -108,6 +123,28 @@ export LOCAL_REVIEW_HOME=/Users/runner/pr-review
 export HOST=127.0.0.1
 export PORT=8000
 export GITHUB_TOKEN=ghp_xxx
+export GITHUB_WEBHOOK_SECRET=replace-me
+export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+export SSL_CERT_FILE="$CERT_PATH"
+export GITHUB_CA_BUNDLE="$CERT_PATH"
+export DRY_RUN=1
+zsh /Users/runner/pr-review/scripts/run_webhook_server.sh
+```
+
+GitHub App bot으로 실행할 때는 `GITHUB_TOKEN` 대신 아래처럼 App 환경 변수를 사용하면 됩니다.
+
+```bash
+CERT_PATH="$(
+  /Users/runner/pr-review/venv/bin/python -c 'import certifi; print(certifi.where())'
+)"
+
+export LOCAL_REVIEW_HOME=/Users/runner/pr-review
+export HOST=127.0.0.1
+export PORT=8000
+export GITHUB_APP_ID=123456
+export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/github-app.private-key.pem
+export GITHUB_APP_INSTALLATION_ID=12345678
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
 export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
@@ -329,6 +366,14 @@ export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 export DRY_RUN=1
 export PYTHONPATH=/Users/runner/pr-review
 /Users/runner/pr-review/venv/bin/python -m review_runner.review_pr
+```
+
+GitHub App bot으로 dry run을 하고 싶다면 `GITHUB_TOKEN` 대신 아래처럼 App 환경 변수를 export 하면 됩니다.
+
+```bash
+export GITHUB_APP_ID=123456
+export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/github-app.private-key.pem
+export GITHUB_APP_INSTALLATION_ID=12345678
 ```
 
 ## 14. 자주 만나는 오류

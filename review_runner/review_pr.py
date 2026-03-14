@@ -7,7 +7,7 @@ import os
 import sys
 import json
 
-from review_runner.review_service import DEFAULT_API_URL, review_pull_request
+from review_runner.review_service import DEFAULT_API_URL, resolve_github_token, review_pull_request
 
 def parse_event() -> tuple[str, int]:
     event_path = os.environ["GITHUB_EVENT_PATH"]
@@ -21,17 +21,16 @@ def parse_event() -> tuple[str, int]:
 
 
 def main() -> int:
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        raise RuntimeError("GITHUB_TOKEN is required")
-
     repository, pull_number = parse_event()
+    api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
+    auth = resolve_github_token(repository=repository, api_url=api_url)
     result = review_pull_request(
         repository=repository,
         pull_number=pull_number,
-        token=token,
-        api_url=os.environ.get("GITHUB_API_URL", DEFAULT_API_URL),
+        token=auth.token,
+        api_url=api_url,
         dry_run=os.environ.get("DRY_RUN") == "1",
+        auth_source=auth.source,
     )
     if os.environ.get("DRY_RUN") == "1":
         print(json.dumps(result.get("payload", result), ensure_ascii=False, indent=2))

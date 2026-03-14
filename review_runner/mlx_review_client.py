@@ -32,6 +32,7 @@ SUMMARY_STOP_RE = re.compile(
 GENERIC_FIELD_STOP_RE = re.compile(
     r'(?i)(?:["\']?summary["\']?\s*:|["\']?event["\']?\s*:|["\']?positives["\']?\s*:|["\']?concerns["\']?\s*:|["\']?comments["\']?\s*:|\bpositive(?:s)?\d*\s*:|\bconcern(?:s)?\d*\s*:)'
 )
+
 POSITIVE_ITEM_RE = re.compile(
     r'(?is)\bpositive(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
 )

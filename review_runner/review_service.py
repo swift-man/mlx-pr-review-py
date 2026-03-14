@@ -9,6 +9,7 @@ import re
 import shlex
 import ssl
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import certifi
+import jwt
 
 
 DEFAULT_API_URL = "https://api.github.com"
@@ -167,6 +169,144 @@ def build_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cafile)
 
 
+def request_json_url(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any] | None = None,
+    ssl_context: ssl.SSLContext | None = None,
+) -> Any:
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, context=ssl_context or build_ssl_context()) as response:
+            raw = response.read().decode("utf-8")
+            if not raw:
+                return None
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        message = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GitHub API {method} {url} failed: {exc.code} {message}") from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLError):
+            ca_bundle = os.environ.get(DEFAULT_CA_BUNDLE_ENV) or os.environ.get("SSL_CERT_FILE") or certifi.where()
+            raise RuntimeError(
+                "GitHub API TLS verification failed. "
+                "Set SSL_CERT_FILE or GITHUB_CA_BUNDLE if you need a custom CA bundle. "
+                f"Current CA bundle: {ca_bundle}"
+            ) from exc
+        raise
+
+
+def build_github_headers(token: str, *, content_type: bool = True) -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "mac-mini-pr-reviewer",
+    }
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def load_github_app_private_key() -> str:
+    inline_key = os.environ.get("GITHUB_APP_PRIVATE_KEY")
+    if inline_key:
+        return inline_key.replace("\\n", "\n")
+
+    key_path = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
+    if key_path:
+        with open(key_path, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    raise RuntimeError("Set GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH for GitHub App authentication")
+
+
+def build_github_app_jwt(app_id: str, private_key: str) -> str:
+    now = int(time.time())
+    payload = {
+        "iat": now - 60,
+        "exp": now + 9 * 60,
+        "iss": app_id,
+    }
+    token = jwt.encode(payload, private_key, algorithm="RS256")
+    return str(token)
+
+
+@dataclass
+class ResolvedGitHubToken:
+    token: str
+    source: str
+    installation_id: int | None = None
+
+
+def resolve_github_app_installation_id(app_jwt: str, repository: str, api_url: str, ssl_context: ssl.SSLContext) -> int:
+    installation = request_json_url(
+        "GET",
+        f"{api_url.rstrip('/')}/repos/{repository}/installation",
+        headers=build_github_headers(app_jwt, content_type=False),
+        ssl_context=ssl_context,
+    )
+    try:
+        return int(installation["id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Could not resolve GitHub App installation ID for repository {repository}") from exc
+
+
+def resolve_github_token(repository: str | None = None, api_url: str = DEFAULT_API_URL) -> ResolvedGitHubToken:
+    app_id = os.environ.get("GITHUB_APP_ID")
+    if app_id:
+        private_key = load_github_app_private_key()
+        ssl_context = build_ssl_context()
+        app_jwt = build_github_app_jwt(app_id, private_key)
+
+        raw_installation_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
+        if raw_installation_id:
+            try:
+                installation_id = int(raw_installation_id)
+            except ValueError as exc:
+                raise RuntimeError("GITHUB_APP_INSTALLATION_ID must be an integer") from exc
+        else:
+            if not repository:
+                raise RuntimeError(
+                    "GITHUB_APP_INSTALLATION_ID is required when the repository is not available for installation lookup"
+                )
+            installation_id = resolve_github_app_installation_id(app_jwt, repository, api_url, ssl_context)
+
+        response = request_json_url(
+            "POST",
+            f"{api_url.rstrip('/')}/app/installations/{installation_id}/access_tokens",
+            headers=build_github_headers(app_jwt),
+            body={},
+            ssl_context=ssl_context,
+        )
+        token = str(response.get("token") or "").strip()
+        if not token:
+            raise RuntimeError("GitHub App installation token response did not include a token")
+        return ResolvedGitHubToken(
+            token=token,
+            source="github_app_installation",
+            installation_id=installation_id,
+        )
+
+    token = str(os.environ.get("GITHUB_TOKEN") or "").strip()
+    if token:
+        return ResolvedGitHubToken(token=token, source="personal_access_token")
+
+    raise RuntimeError(
+        "Set GITHUB_TOKEN or configure GitHub App authentication with GITHUB_APP_ID plus a private key"
+    )
+
+
 @dataclass
 class ReviewComment:
     path: str
@@ -202,41 +342,13 @@ class GitHubApi:
         url = f"{self.api_url}{path}"
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
-
-        payload = None
-        if body is not None:
-            payload = json.dumps(body).encode("utf-8")
-
-        request = urllib.request.Request(
+        return request_json_url(
+            method,
             url,
-            data=payload,
-            method=method,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self.token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "mac-mini-pr-reviewer",
-                "Content-Type": "application/json",
-            },
+            headers=build_github_headers(self.token),
+            body=body,
+            ssl_context=self.ssl_context,
         )
-        try:
-            with urllib.request.urlopen(request, context=self.ssl_context) as response:
-                raw = response.read().decode("utf-8")
-                if not raw:
-                    return None
-                return json.loads(raw)
-        except urllib.error.HTTPError as exc:
-            message = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"GitHub API {method} {url} failed: {exc.code} {message}") from exc
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, ssl.SSLError):
-                ca_bundle = os.environ.get(DEFAULT_CA_BUNDLE_ENV) or os.environ.get("SSL_CERT_FILE") or certifi.where()
-                raise RuntimeError(
-                    "GitHub API TLS verification failed. "
-                    "Set SSL_CERT_FILE or GITHUB_CA_BUNDLE if you need a custom CA bundle. "
-                    f"Current CA bundle: {ca_bundle}"
-                ) from exc
-            raise
 
     def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
         files: list[dict[str, Any]] = []
@@ -760,6 +872,7 @@ def review_pull_request(
     token: str,
     api_url: str = DEFAULT_API_URL,
     dry_run: bool = False,
+    auth_source: str | None = None,
 ) -> dict[str, Any]:
     github = GitHubApi(token=token, repository=repository, api_url=api_url)
     raw_files = github.list_pr_files(pull_number)
@@ -793,6 +906,7 @@ def review_pull_request(
         "positive_count": len(positives),
         "concern_count": len(concerns),
         "payload": payload,
+        "auth_source": auth_source or "personal_access_token",
     }
 
     if dry_run:
