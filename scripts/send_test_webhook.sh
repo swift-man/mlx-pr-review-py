@@ -1,6 +1,14 @@
 #!/bin/zsh
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$SCRIPT_DIR/local_review_env.sh}"
+
+if [[ -f "$ENV_FILE" ]]; then
+  # 서버 실행에 쓰는 같은 secret와 저장소 정보를 재사용한다.
+  source "$ENV_FILE"
+fi
+
 if [[ $# -gt 0 ]]; then
   echo "usage: $0"
   echo
