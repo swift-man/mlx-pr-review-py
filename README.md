@@ -95,6 +95,15 @@ GitHub App으로 인증하면 리뷰 작성자가 개인 계정이 아니라 App
 실서비스 리뷰는 `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client`를 사용하고,
 실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client`로 바꿔서 테스트할 수 있습니다.
 
+매번 `export`를 다시 입력하기 귀찮다면 `/Users/runner/pr-review/scripts/local_review_env.example.sh`를
+`/Users/runner/pr-review/scripts/local_review_env.sh`로 복사해 실제 값만 넣어두면 됩니다.
+이 파일은 [`scripts/run_webhook_server.sh`](/Users/m4_25/develop/codereview/scripts/run_webhook_server.sh)와
+[`scripts/send_test_webhook.sh`](/Users/m4_25/develop/codereview/scripts/send_test_webhook.sh)가 자동으로 읽습니다.
+
+```bash
+cp /Users/runner/pr-review/scripts/local_review_env.example.sh /Users/runner/pr-review/scripts/local_review_env.sh
+```
+
 처음 요청에서 모델을 다운받게 하지 않으려면 미리 warm-up을 한 번 실행해두는 편이 좋습니다.
 
 ```bash

@@ -1003,10 +1003,10 @@ def build_review_message(
 ) -> str:
     """최종 콘솔 로그와 반환 메시지에 공통으로 쓰는 본문을 만든다."""
     message_lines = [
-        "Posted review successfully.",
-        f"Review ID: {response.get('id')}",
-        f"Event: {posted_event}",
-        f"Comments: {len(comments)}",
+        "리뷰 등록이 완료되었습니다.",
+        f"리뷰 ID: {response.get('id')}",
+        f"이벤트: {posted_event}",
+        f"라인 코멘트 수: {len(comments)}",
         "",
         payload["body"],
     ]
@@ -1016,7 +1016,7 @@ def build_review_message(
         message_lines.extend(
             [
                 "",
-                "Inline comments:",
+                "라인 코멘트:",
                 *(f"- {comment.path}:{comment.line} {comment.body}" for comment in comments),
             ]
         )
@@ -1088,7 +1088,7 @@ def review_pull_request(
         result["requested_event"] = validated_review.event
         result["event"] = posted_event
         result["payload"] = payload
-        fallback_note = "Requested changes is not allowed on your own pull request, so the review was posted as COMMENT instead."
+        fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
 
     result["review_id"] = response.get("id")
     result["message"] = build_review_message(

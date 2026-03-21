@@ -17,6 +17,7 @@ cp "$SOURCE_ROOT/review_runner/requirements.txt" "$TARGET_ROOT/review_runner/"
 cp "$SOURCE_ROOT/scripts/run_webhook_server.sh" "$TARGET_ROOT/scripts/"
 cp "$SOURCE_ROOT/scripts/send_test_webhook.sh" "$TARGET_ROOT/scripts/"
 cp "$SOURCE_ROOT/scripts/warm_mlx_model.sh" "$TARGET_ROOT/scripts/"
+cp "$SOURCE_ROOT/scripts/local_review_env.example.sh" "$TARGET_ROOT/scripts/"
 cp "$SOURCE_ROOT/deploy/nginx-pr-review.conf" "$TARGET_ROOT/deploy/"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"

@@ -1,12 +1,20 @@
 #!/bin/zsh
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$SCRIPT_DIR/local_review_env.sh}"
+
+if [[ -f "$ENV_FILE" ]]; then
+  # 운영용 값은 로컬 전용 env 스크립트에서 읽고, 저장소에는 커밋하지 않는다.
+  source "$ENV_FILE"
+fi
+
 if [[ $# -gt 0 ]]; then
   echo "usage: $0"
   exit 1
 fi
 
-ROOT_DIR="${LOCAL_REVIEW_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+ROOT_DIR="${LOCAL_REVIEW_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 

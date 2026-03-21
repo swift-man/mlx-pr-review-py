@@ -49,6 +49,8 @@ SMART_QUOTES_TRANSLATION = str.maketrans(
 )
 SECTION_HEADER_RE = re.compile(r"(?im)^\s*(positives|concerns|comments|event|response_schema)\s*:\s*$")
 MARKDOWN_ITEM_RE = re.compile(r"(?m)^\s*-\s+(.+?)\s*$")
+HANGUL_RE = re.compile(r"[가-힣]")
+LATIN_RE = re.compile(r"[A-Za-z]")
 PROMPT_ECHO_MARKERS = (
     "review_runner/review_service.py",
     "review_runner/",
@@ -130,6 +132,11 @@ def normalize_text_list(value: Any, max_items: int = 5) -> list[str]:
     return normalized_items
 
 
+def contains_hangul(text: str) -> bool:
+    """자연어 리뷰 문장에 한글이 실제로 포함돼 있는지 확인한다."""
+    return bool(HANGUL_RE.search(text))
+
+
 def load_runtime() -> tuple[Any, Any]:
     """모델과 토크나이저를 한 번만 로드해 웹훅 요청 사이에서 재사용한다."""
     try:
@@ -184,6 +191,7 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "Do not answer with generic praise such as 'PR diff가 잘 작성되었습니다' or '잘 정리되어 있습니다' unless it is tied to a specific strength visible in the diff. "
                 "Do not say there are no improvements needed when the diff removes a guard, returns early from a validation branch, or prints a secret value. "
                 "Do not flag an MLX_MODEL value change by itself unless the diff also shows a concrete compatibility, availability, memory, or rollout risk. "
+                "If you are about to answer in English, stop and rewrite the entire JSON in Korean before responding. "
                 f"Return at most {max_findings} findings. "
                 "Do not write praise-only line comments. "
                 'Follow this shape exactly: {"summary":"한국어 요약","event":"COMMENT","positives":["한국어 장점"],"concerns":["한국어 개선점"],"comments":[{"path":"file.py","line":12,"body":"한국어 라인 코멘트"}]}. '
@@ -202,6 +210,7 @@ def build_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 "특히 signature 검증을 건너뛰는 return, token/secret 출력은 높은 우선순위 이슈로 취급하세요. "
                 "공개 응답 키 이름이나 GitHub 헤더 이름의 오타처럼 기본 계약을 깨는 변경도 반드시 지적하세요. "
                 "단순히 MLX_MODEL 값이 바뀌었다는 이유만으로는 코멘트하지 말고, 실제 호환성/가용성/메모리 위험이 diff에 보일 때만 지적하세요. "
+                "영어로 작성하려고 하면 멈추고, 전체 JSON을 한국어로 다시 작성하세요. "
                 "영문 diff 메타데이터를 그대로 복사하지 말고, 한국어 리뷰 문장으로 정리하세요.\n"
                 f"{compact_payload}"
             ),
@@ -455,22 +464,35 @@ def looks_like_prompt_echo(text: str) -> bool:
     return False
 
 
-def sanitize_summary(summary: str) -> str:
-    normalized = normalize_text(summary)
-    if not normalized or looks_like_prompt_echo(normalized):
-        return DEFAULT_SUMMARY
+def looks_like_non_korean_review_text(text: str) -> bool:
+    """리뷰 자연어 문장이 영어 위주로 생성됐는지 판별한다."""
+    normalized = normalize_text(text)
+    if not normalized or contains_hangul(normalized):
+        return False
+    return bool(LATIN_RE.search(normalized))
+
+
+def sanitize_korean_text(text: Any, fallback: str = "") -> str:
+    """한글이 빠진 자연어는 기본값으로 되돌려 리뷰 본문을 한국어로 유지한다."""
+    normalized = normalize_text(text)
+    if not normalized or looks_like_prompt_echo(normalized) or looks_like_non_korean_review_text(normalized):
+        return fallback
     return normalized
 
 
+def sanitize_summary(summary: str) -> str:
+    return sanitize_korean_text(summary, DEFAULT_SUMMARY)
+
+
 def sanitize_items(items: list[str], max_items: int = MAX_SALVAGE_ITEMS) -> list[str]:
-    """복구된 목록에서 중복과 프롬프트 echo를 걷어낸다."""
+    """복구된 목록에서 중복, 프롬프트 echo, 영어 위주 문장을 걷어낸다."""
     sanitized: list[str] = []
     seen: set[str] = set()
     for item in items:
-        text = normalize_text(item)
+        text = sanitize_korean_text(item)
         if text.startswith("- "):
             text = text[2:].strip()
-        if not text or text in seen or looks_like_prompt_echo(text):
+        if not text or text in seen:
             continue
         seen.add(text)
         sanitized.append(text)
@@ -621,7 +643,7 @@ def parse_model_json(raw_output: str) -> dict[str, Any]:
 def normalize_comment(raw_comment: dict[str, Any]) -> dict[str, Any] | None:
     """리뷰 코멘트를 path/line/body가 모두 있는 최소 구조로 정규화한다."""
     path = str(raw_comment.get("path") or "").strip()
-    body = normalize_text(raw_comment.get("body"))
+    body = sanitize_korean_text(raw_comment.get("body"))
     line = raw_comment.get("line")
     try:
         line_number = int(line)
@@ -658,18 +680,15 @@ def normalize_response(raw_response: dict[str, Any]) -> dict[str, Any]:
         if len(comments) >= max_findings:
             break
 
-    summary = normalize_text(raw_response.get("summary"))
-    if not summary:
-        summary = DEFAULT_SUMMARY
-
-    positives = normalize_text_list(raw_response.get("positives"))
-    concerns = normalize_text_list(raw_response.get("concerns"))
+    summary = sanitize_korean_text(raw_response.get("summary"), DEFAULT_SUMMARY)
+    positives = sanitize_items(normalize_text_list(raw_response.get("positives")), max_items=10)
+    concerns = sanitize_items(normalize_text_list(raw_response.get("concerns")), max_items=10)
     event = normalize_event_value(str(raw_response.get("event") or ""), has_comments=bool(comments))
 
     return {
         "summary": summary,
         "event": event,
-        "positives": positives,
+        "positives": positives or list(DEFAULT_POSITIVES),
         "concerns": concerns,
         "comments": comments,
     }
