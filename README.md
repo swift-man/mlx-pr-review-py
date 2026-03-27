@@ -80,7 +80,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."` (옵션)
 - `GITHUB_APP_INSTALLATION_ID=12345678` (옵션, 생략 시 `OWNER/REPO` 기준 자동 조회)
 - `GITHUB_WEBHOOK_SECRET=...`
-- `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client`
+- `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client` (옵션)
 - `MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit`
 - `GITHUB_API_URL=https://api.github.com` (옵션)
 - `MLX_MAX_TOKENS=1200` (옵션)
@@ -92,8 +92,9 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 `GITHUB_REPOSITORY`는 수동 테스트 때 `swift-man/review.gorani.me`처럼 `OWNER/REPO` 형식이어야 합니다.
 GitHub App 인증을 쓰고 싶다면 `GITHUB_APP_ID`와 private key를 설정하면 되고, 이 경우 `GITHUB_TOKEN`보다 GitHub App installation token이 우선 사용됩니다.
 GitHub App으로 인증하면 리뷰 작성자가 개인 계정이 아니라 App bot으로 보입니다.
-실서비스 리뷰는 `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client`를 사용하고,
-실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client`로 바꿔서 테스트할 수 있습니다.
+`MLX_REVIEW_CMD`를 비워 두거나 기본값인 `python -m review_runner.mlx_review_client`를 쓰면
+웹훅 서버 프로세스 안에서 MLX 모델을 재사용하고, 동시 리뷰 요청은 메모리 급증을 막기 위해 한 번에 하나씩 처리합니다.
+실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client` 같은 커스텀 커맨드로 바꿔서 테스트할 수 있습니다.
 
 매번 `export`를 다시 입력하기 귀찮다면 `/Users/runner/pr-review/scripts/local_review_env.example.sh`를
 `/Users/runner/pr-review/scripts/local_review_env.sh`로 복사해 실제 값만 넣어두면 됩니다.
@@ -105,6 +106,7 @@ cp /Users/runner/pr-review/scripts/local_review_env.example.sh /Users/runner/pr-
 ```
 
 처음 요청에서 모델을 다운받게 하지 않으려면 미리 warm-up을 한 번 실행해두는 편이 좋습니다.
+이 스크립트는 모델 다운로드와 로컬 캐시를 미리 채우는 용도이고, 상주 메모리 로드는 웹훅 서버 프로세스에서 첫 실요청 때 이뤄집니다.
 
 ```bash
 export LOCAL_REVIEW_HOME=/Users/runner/pr-review
@@ -315,9 +317,10 @@ zsh /Users/runner/pr-review/scripts/send_test_webhook.sh
 3. `pull_request` 이벤트와 허용 액션만 통과
 4. GitHub API `pulls/{number}/files`로 파일 목록과 patch 조회
 5. patch를 MLX 프롬프트 JSON으로 직렬화
-6. MLX JSON 응답 검증
-7. GitHub Review API payload로 변환
-8. 라인 코멘트와 전체 리뷰를 한 번에 등록
+6. 공유된 MLX 실행 슬롯을 잡고 모델을 재사용해 JSON 응답 생성
+7. MLX JSON 응답 검증
+8. GitHub Review API payload로 변환
+9. 라인 코멘트와 전체 리뷰를 한 번에 등록
 
 ## 10. CLI 테스트
 
