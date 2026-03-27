@@ -7,9 +7,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -67,6 +69,8 @@ PROMPT_ECHO_MARKERS = (
     "praise-only",
 )
 
+_MLX_RUN_LOCK = threading.Lock()
+
 
 def log_progress(prefix: str, message: str) -> None:
     """웹훅 처리 중간 단계를 한 줄 로그로 남긴다."""
@@ -76,6 +80,27 @@ def log_progress(prefix: str, message: str) -> None:
 def default_mlx_review_command() -> list[str]:
     """별도 설정이 없으면 현재 서버와 같은 Python 인터프리터로 MLX 클라이언트를 실행한다."""
     return [sys.executable, "-m", "review_runner.mlx_review_client"]
+
+
+def configured_mlx_review_command() -> list[str]:
+    """환경변수에 지정된 MLX 리뷰 커맨드가 있으면 파싱하고, 없으면 기본 커맨드를 쓴다."""
+    raw_command = os.environ.get("MLX_REVIEW_CMD")
+    return shlex.split(raw_command) if raw_command else default_mlx_review_command()
+
+
+def resolve_command_executable(command: list[str]) -> str:
+    """PATH에 있는 실행 파일까지 포함해 실제 실행 경로를 정규화한다."""
+    if not command:
+        return ""
+    executable = shutil.which(command[0]) or command[0]
+    return os.path.realpath(executable)
+
+
+def uses_inprocess_mlx_client(command: list[str]) -> bool:
+    """기본 MLX 클라이언트는 subprocess 대신 같은 프로세스 안에서 직접 호출한다."""
+    if len(command) != 3 or command[1:] != ["-m", "review_runner.mlx_review_client"]:
+        return False
+    return resolve_command_executable(command) == os.path.realpath(sys.executable)
 
 
 def normalize_text(value: Any) -> str:
@@ -806,10 +831,19 @@ def write_prompt_debug_file(prompt: str) -> None:
         fh.write(prompt)
 
 
-def run_mlx(prompt: str) -> dict[str, Any]:
-    """설정된 MLX 리뷰 커맨드를 실행하고 JSON 결과를 돌려준다."""
-    raw_command = os.environ.get("MLX_REVIEW_CMD")
-    command = shlex.split(raw_command) if raw_command else default_mlx_review_command()
+def run_mlx_inprocess(prompt: str) -> dict[str, Any]:
+    """기본 MLX 클라이언트는 서버 프로세스 안에서 직접 실행해 모델을 재사용한다."""
+    from review_runner.mlx_review_client import review_payload
+
+    try:
+        payload = json.loads(prompt)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("MLX prompt payload must be valid JSON") from exc
+    return review_payload(payload)
+
+
+def run_mlx_subprocess(command: list[str], prompt: str) -> dict[str, Any]:
+    """커스텀 MLX 어댑터는 기존처럼 subprocess로 실행한다."""
     completed = subprocess.run(
         command,
         input=prompt,
@@ -831,6 +865,22 @@ def run_mlx(prompt: str) -> dict[str, Any]:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"MLX command returned invalid JSON:\n{stdout}") from exc
+
+
+def run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+    """MLX 리뷰 실행은 한 번에 하나씩 처리해 모델 중복 로드와 메모리 급증을 막는다."""
+    command = configured_mlx_review_command()
+    lock_acquired = _MLX_RUN_LOCK.acquire(blocking=False)
+    if not lock_acquired:
+        log_progress(log_prefix, "Another MLX review is already running; waiting for the shared model slot")
+        _MLX_RUN_LOCK.acquire()
+
+    try:
+        if uses_inprocess_mlx_client(command):
+            return run_mlx_inprocess(prompt)
+        return run_mlx_subprocess(command, prompt)
+    finally:
+        _MLX_RUN_LOCK.release()
 
 
 def collect_validated_comments(
@@ -1054,7 +1104,7 @@ def review_pull_request(
 
     mlx_started_at = time.monotonic()
     log_progress(log_prefix, "Running MLX review model")
-    mlx_result = run_mlx(prompt)
+    mlx_result = run_mlx(prompt, log_prefix=log_prefix)
     log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
     validated_review = validate_mlx_output(mlx_result, pr_files)
     payload = build_review_payload(
