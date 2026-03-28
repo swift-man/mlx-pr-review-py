@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import ssl
@@ -29,6 +30,14 @@ DEFAULT_NO_FINDINGS_SUMMARY = (
     "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
 )
 DEFAULT_FINDINGS_SUMMARY = "자동 리뷰에서 확인이 필요한 변경 사항이 발견되었습니다. 아래 코멘트와 개선점을 확인해 주세요."
+NO_FINDINGS_SUMMARY_MARKERS = (
+    DEFAULT_NO_FINDINGS_SUMMARY,
+    "즉시 수정이 필요한 문제는 보이지 않습니다.",
+    "검토할 만한 문제를 찾지 못했습니다.",
+    "지적할 만한 문제는 보이지 않습니다.",
+    "별도 개선 필요 사항은 발견되지 않았습니다.",
+    "개선이 필요한 점은 발견되지 않았습니다.",
+)
 DEFAULT_FALLBACK_POSITIVES = [
     "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
 ]
@@ -627,25 +636,39 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
 
 
 def detect_secret_logging(pr_file: PullRequestFile) -> list[ReviewComment]:
-    findings: list[ReviewComment] = []
+    first_match_line: int | None = None
+    match_count = 0
 
     for kind, line_number, text in iter_patch_lines(pr_file.patch):
         if kind != "add":
             continue
 
         if LOG_CALL_RE.search(text) and SECRET_LOG_RE.search(text):
-            findings.append(
-                ReviewComment(
-                    path=pr_file.filename,
-                    line=line_number,
-                    body=(
-                        "토큰이나 secret 값을 로그에 남기면 서버 로그 접근만으로 인증 정보가 유출될 수 있습니다. "
-                        "민감한 값은 출력하지 말고, 필요하면 마스킹된 메타데이터만 기록하세요."
-                    ),
-                )
-            )
+            match_count += 1
+            if first_match_line is None:
+                first_match_line = line_number
 
-    return findings
+    if first_match_line is None:
+        return []
+
+    if match_count == 1:
+        body = (
+            "토큰이나 secret 값을 로그에 남기면 서버 로그 접근만으로 인증 정보가 유출될 수 있습니다. "
+            "민감한 값은 출력하지 말고, 필요하면 마스킹된 메타데이터만 기록하세요."
+        )
+    else:
+        body = (
+            "이 파일에서 토큰이나 secret 값을 로그에 남기는 코드가 여러 곳 추가되었습니다. "
+            "민감한 값은 출력하지 말고, 필요하면 마스킹된 메타데이터만 기록하세요."
+        )
+
+    return [
+        ReviewComment(
+            path=pr_file.filename,
+            line=first_match_line,
+            body=body,
+        )
+    ]
 
 
 def detect_contract_typos(pr_file: PullRequestFile) -> list[ReviewComment]:
@@ -743,12 +766,20 @@ def looks_like_generic_model_change_comment(text: str) -> bool:
     return any(marker in normalized for marker in LOW_SIGNAL_MODEL_CHANGE_MARKERS)
 
 
+def looks_like_no_findings_summary(text: str) -> bool:
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in NO_FINDINGS_SUMMARY_MARKERS)
+
+
 def sanitize_summary(summary: Any, has_findings: bool) -> str:
     normalized = normalize_text(summary)
     fallback = DEFAULT_FINDINGS_SUMMARY if has_findings else DEFAULT_NO_FINDINGS_SUMMARY
 
     if (
         is_placeholder_summary(normalized)
+        or (has_findings and looks_like_no_findings_summary(normalized))
         or looks_like_prompt_echo(normalized)
         or looks_like_diff_stat_dump(normalized)
         or looks_like_generic_model_change_comment(normalized)
@@ -852,9 +883,26 @@ def run_mlx_subprocess(command: list[str], prompt: str) -> dict[str, Any]:
         check=False,
     )
     if completed.returncode != 0:
+        failure_reason = f"exit code {completed.returncode}"
+        if completed.returncode < 0:
+            signal_number = -completed.returncode
+            try:
+                signal_name = signal.Signals(signal_number).name
+            except ValueError:
+                failure_reason = f"signal {signal_number}"
+            else:
+                failure_reason = f"signal {signal_number} ({signal_name})"
+
+        native_abort_hint = ""
+        if completed.returncode in {-signal.SIGABRT, 128 + signal.SIGABRT}:
+            native_abort_hint = (
+                "\nHINT:\n"
+                "The MLX worker aborted with SIGABRT, which usually means a native MLX/Metal failure rather than a Python exception. "
+                "If this repeats on this Mac, try exporting MLX_DEVICE=cpu before starting the server or the MLX worker."
+            )
         raise RuntimeError(
-            "MLX command failed with exit code "
-            f"{completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            "MLX command failed with "
+            f"{failure_reason}{native_abort_hint}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
         )
 
     stdout = completed.stdout.strip()

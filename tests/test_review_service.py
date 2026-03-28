@@ -1,9 +1,19 @@
 import os
+import signal
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
+
+if "certifi" not in sys.modules:
+    fake_certifi = types.ModuleType("certifi")
+    fake_certifi.where = lambda: "/tmp/fake-cert.pem"
+    sys.modules["certifi"] = fake_certifi
+
+if "jwt" not in sys.modules:
+    sys.modules["jwt"] = types.ModuleType("jwt")
 
 from review_runner import review_service
 
@@ -45,6 +55,13 @@ class RunMlxTests(unittest.TestCase):
         self.assertEqual(result["summary"], "ok")
         subprocess_run.assert_called_once()
         review_payload.assert_not_called()
+
+    def test_run_mlx_surfaces_native_abort_hint_for_sigabrt_subprocess(self) -> None:
+        completed = subprocess_result(stdout="", stderr="abort() called", returncode=-signal.SIGABRT)
+        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+            with mock.patch("review_runner.review_service.subprocess.run", return_value=completed):
+                with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
+                    review_service.run_mlx('{"repository":"demo"}')
 
     def test_run_mlx_serializes_concurrent_reviews(self) -> None:
         entered_first = threading.Event()
@@ -93,6 +110,55 @@ class RunMlxTests(unittest.TestCase):
 
         self.assertEqual(max_active_calls, 1)
         self.assertCountEqual(results, [{"summary": "first"}, {"summary": "second"}])
+
+
+class ReviewNormalizationTests(unittest.TestCase):
+    def test_detect_secret_logging_emits_one_comment_per_file(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/dbsec.py",
+            status="modified",
+            patch=(
+                "@@ -0,0 +218,3 @@\n"
+                '+print(f"access token={token}")\n'
+                '+logger.info("secret=%s", secret)\n'
+                '+logging.warning("api_key=%s", api_key)\n'
+            ),
+            additions=3,
+            deletions=0,
+            right_side_lines={218, 219, 220},
+        )
+
+        comments = review_service.detect_secret_logging(pr_file)
+
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].path, "price_proxy/dbsec.py")
+        self.assertEqual(comments[0].line, 218)
+        self.assertIn("여러 곳", comments[0].body)
+
+    def test_validate_mlx_output_rewrites_no_findings_summary_when_findings_exist(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/dbsec.py",
+            status="modified",
+            patch='@@ -0,0 +218,1 @@\n+print(f"access token={token}")\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={218},
+        )
+
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": review_service.DEFAULT_NO_FINDINGS_SUMMARY,
+                "event": "COMMENT",
+                "positives": [],
+                "concerns": [],
+                "comments": [],
+            },
+            [pr_file],
+        )
+
+        self.assertEqual(validated.summary, review_service.DEFAULT_FINDINGS_SUMMARY)
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertEqual(len(validated.comments), 1)
 
 
 def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> mock.Mock:
