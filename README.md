@@ -82,6 +82,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `GITHUB_WEBHOOK_SECRET=...`
 - `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client` (옵션)
 - `MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit`
+- `MLX_DEVICE=cpu` (옵션, Metal 장애 시 fallback. 비워두면 MLX 기본 장치 사용)
 - `GITHUB_API_URL=https://api.github.com` (옵션)
 - `MLX_MAX_TOKENS=1200` (옵션)
 - `MLX_MAX_FINDINGS=10` (옵션)
@@ -137,6 +138,7 @@ export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
 export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+# export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
 export DRY_RUN=1
@@ -159,6 +161,7 @@ export GITHUB_APP_INSTALLATION_ID=12345678
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
 export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+# export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
 export DRY_RUN=1
@@ -212,6 +215,7 @@ export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
 export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+# export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
 export DRY_RUN=1
@@ -425,5 +429,21 @@ brew install python@3.11
 /Users/runner/pr-review/venv/bin/python -m pip install -r /Users/runner/pr-review/review_runner/requirements.txt
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
 ```
+
+### `Abort trap: 6`, `SIGABRT`, `libmlx.dylib`, `com.Metal.CompletionQueueDispatch`
+
+이 조합은 대개 Python 레벨 예외가 아니라 MLX/Metal 쪽 네이티브 abort입니다. 특히 crash report에
+`mlx::core::gpu::check_error(MTL::CommandBuffer*)`가 보이면 GPU command buffer 완료 시점에서
+MLX가 실패를 감지하고 프로세스를 중단한 경우에 가깝습니다.
+
+우선 아래처럼 CPU fallback으로 같은 요청이 통과하는지 확인합니다.
+
+```bash
+export MLX_DEVICE=cpu
+export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
+```
+
+`MLX_DEVICE=cpu`에서 안정적으로 동작하면 애플리케이션 로직보다는 해당 Mac의 Metal/driver/MLX 조합 문제일 가능성이 큽니다.
+이 저장소의 MLX 클라이언트는 `MLX_DEVICE=cpu|gpu`를 읽으며, warm-up 결과에도 선택된 device가 함께 출력됩니다.
 
 # review.gorani.me

@@ -103,6 +103,38 @@ def get_model_name() -> str:
     return os.environ.get("MLX_MODEL", DEFAULT_MODEL)
 
 
+def get_requested_device() -> str | None:
+    """선택적 장치 override를 읽어 Metal 장애 시 CPU fallback을 허용한다."""
+    raw_value = os.environ.get("MLX_DEVICE")
+    if raw_value is None:
+        return None
+
+    device_name = raw_value.strip().lower()
+    if device_name in {"", "auto", "default"}:
+        return None
+    if device_name not in {"cpu", "gpu"}:
+        raise RuntimeError("MLX_DEVICE must be one of: auto, cpu, gpu")
+    return device_name
+
+
+def configure_default_device() -> str:
+    """요청된 기본 장치를 적용하고, 값이 없으면 기존 MLX 기본 동작을 유지한다."""
+    device_name = get_requested_device()
+    if device_name is None:
+        return "auto"
+
+    try:
+        import mlx.core as mx
+    except ImportError as exc:
+        raise RuntimeError(
+            "MLX runtime is not installed. Install the review venv with `pip install -r review_runner/requirements.txt`."
+        ) from exc
+
+    target_device = getattr(mx, device_name)
+    mx.set_default_device(target_device)
+    return device_name
+
+
 def normalize_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -139,6 +171,8 @@ def contains_hangul(text: str) -> bool:
 
 def load_runtime() -> tuple[Any, Any]:
     """모델과 토크나이저를 한 번만 로드해 웹훅 요청 사이에서 재사용한다."""
+    configure_default_device()
+
     try:
         from mlx_lm import load
     except ImportError as exc:
@@ -716,7 +750,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.warmup:
         load_runtime()
-        print(json.dumps({"status": "ready", "model": get_model_name()}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "model": get_model_name(),
+                    "device": get_requested_device() or "auto",
+                },
+                ensure_ascii=False,
+            )
+        )
         return 0
 
     payload = json.load(sys.stdin)

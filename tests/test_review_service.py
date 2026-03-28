@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import threading
 import time
@@ -45,6 +46,13 @@ class RunMlxTests(unittest.TestCase):
         self.assertEqual(result["summary"], "ok")
         subprocess_run.assert_called_once()
         review_payload.assert_not_called()
+
+    def test_run_mlx_surfaces_native_abort_hint_for_sigabrt_subprocess(self) -> None:
+        completed = subprocess_result(stdout="", stderr="abort() called", returncode=-signal.SIGABRT)
+        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+            with mock.patch("review_runner.review_service.subprocess.run", return_value=completed):
+                with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
+                    review_service.run_mlx('{"repository":"demo"}')
 
     def test_run_mlx_serializes_concurrent_reviews(self) -> None:
         entered_first = threading.Event()

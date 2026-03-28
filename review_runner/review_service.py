@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import ssl
@@ -852,9 +853,26 @@ def run_mlx_subprocess(command: list[str], prompt: str) -> dict[str, Any]:
         check=False,
     )
     if completed.returncode != 0:
+        failure_reason = f"exit code {completed.returncode}"
+        if completed.returncode < 0:
+            signal_number = -completed.returncode
+            try:
+                signal_name = signal.Signals(signal_number).name
+            except ValueError:
+                failure_reason = f"signal {signal_number}"
+            else:
+                failure_reason = f"signal {signal_number} ({signal_name})"
+
+        native_abort_hint = ""
+        if completed.returncode in {-signal.SIGABRT, 128 + signal.SIGABRT}:
+            native_abort_hint = (
+                "\nHINT:\n"
+                "The MLX worker aborted with SIGABRT, which usually means a native MLX/Metal failure rather than a Python exception. "
+                "If this repeats on this Mac, try exporting MLX_DEVICE=cpu before starting the server or the MLX worker."
+            )
         raise RuntimeError(
-            "MLX command failed with exit code "
-            f"{completed.returncode}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            "MLX command failed with "
+            f"{failure_reason}{native_abort_hint}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
         )
 
     stdout = completed.stdout.strip()
