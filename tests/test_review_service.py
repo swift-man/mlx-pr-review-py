@@ -63,6 +63,42 @@ class RunMlxTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
                     review_service.run_mlx('{"repository":"demo"}')
 
+    def test_run_mlx_retries_with_cpu_after_native_abort_when_device_is_auto(self) -> None:
+        failed = subprocess_result(
+            stdout="",
+            stderr="[METAL] Command buffer execution failed: Insufficient Memory",
+            returncode=-signal.SIGABRT,
+        )
+        recovered = subprocess_result(
+            stdout='{"summary":"ok","event":"COMMENT","positives":[],"concerns":[],"comments":[]}'
+        )
+        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+            with mock.patch(
+                "review_runner.review_service.subprocess.run",
+                side_effect=[failed, recovered],
+            ) as subprocess_run:
+                result = review_service.run_mlx('{"repository":"demo"}')
+
+        self.assertEqual(result["summary"], "ok")
+        self.assertEqual(subprocess_run.call_count, 2)
+        _, first_kwargs = subprocess_run.call_args_list[0]
+        _, second_kwargs = subprocess_run.call_args_list[1]
+        self.assertIsNone(first_kwargs.get("env"))
+        self.assertEqual(second_kwargs["env"]["MLX_DEVICE"], "cpu")
+
+    def test_run_mlx_does_not_override_explicit_gpu_setting_on_native_abort(self) -> None:
+        completed = subprocess_result(
+            stdout="",
+            stderr="[METAL] Command buffer execution failed: Insufficient Memory",
+            returncode=-signal.SIGABRT,
+        )
+        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json", "MLX_DEVICE": "gpu"}, clear=False):
+            with mock.patch("review_runner.review_service.subprocess.run", return_value=completed) as subprocess_run:
+                with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
+                    review_service.run_mlx('{"repository":"demo"}')
+
+        subprocess_run.assert_called_once()
+
     def test_run_mlx_serializes_concurrent_reviews(self) -> None:
         entered_first = threading.Event()
         release_first = threading.Event()
