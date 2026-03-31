@@ -873,38 +873,80 @@ def run_mlx_inprocess(prompt: str) -> dict[str, Any]:
     return review_payload(payload)
 
 
-def run_mlx_subprocess(command: list[str], prompt: str) -> dict[str, Any]:
-    """커스텀 MLX 어댑터는 기존처럼 subprocess로 실행한다."""
-    completed = subprocess.run(
+def current_mlx_device_setting() -> str:
+    """현재 프로세스에 적용된 MLX 장치 설정을 auto/cpu/gpu 중 하나로 정규화한다."""
+    raw_value = os.environ.get("MLX_DEVICE")
+    if raw_value is None:
+        return "auto"
+
+    device_name = raw_value.strip().lower()
+    if device_name in {"", "auto", "default"}:
+        return "auto"
+    return device_name
+
+
+def run_mlx_subprocess_attempt(
+    command: list[str],
+    prompt: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """MLX subprocess 한 번을 실행하고 원시 결과를 돌려준다."""
+    return subprocess.run(
         command,
         input=prompt,
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
-    if completed.returncode != 0:
-        failure_reason = f"exit code {completed.returncode}"
-        if completed.returncode < 0:
-            signal_number = -completed.returncode
-            try:
-                signal_name = signal.Signals(signal_number).name
-            except ValueError:
-                failure_reason = f"signal {signal_number}"
-            else:
-                failure_reason = f"signal {signal_number} ({signal_name})"
 
-        native_abort_hint = ""
-        if completed.returncode in {-signal.SIGABRT, 128 + signal.SIGABRT}:
-            native_abort_hint = (
-                "\nHINT:\n"
-                "The MLX worker aborted with SIGABRT, which usually means a native MLX/Metal failure rather than a Python exception. "
-                "If this repeats on this Mac, try exporting MLX_DEVICE=cpu before starting the server or the MLX worker."
-            )
-        raise RuntimeError(
-            "MLX command failed with "
-            f"{failure_reason}{native_abort_hint}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+
+def describe_mlx_subprocess_failure(completed: subprocess.CompletedProcess[str]) -> str:
+    """subprocess 실패를 운영자가 바로 이해할 수 있게 문자열로 포맷한다."""
+    failure_reason = f"exit code {completed.returncode}"
+    if completed.returncode < 0:
+        signal_number = -completed.returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            failure_reason = f"signal {signal_number}"
+        else:
+            failure_reason = f"signal {signal_number} ({signal_name})"
+
+    native_abort_hint = ""
+    if completed.returncode in {-signal.SIGABRT, 128 + signal.SIGABRT}:
+        native_abort_hint = (
+            "\nHINT:\n"
+            "The MLX worker aborted with SIGABRT, which usually means a native MLX/Metal failure rather than a Python exception. "
+            "If this repeats on this Mac, try exporting MLX_DEVICE=cpu before starting the server or the MLX worker."
         )
 
+    return (
+        "MLX command failed with "
+        f"{failure_reason}{native_abort_hint}\nSTDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+    )
+
+
+def is_recoverable_mlx_native_failure(completed: subprocess.CompletedProcess[str]) -> bool:
+    """Metal/GPU 네이티브 abort처럼 CPU 재시도로 회복될 가능성이 큰 경우만 잡아낸다."""
+    if completed.returncode in {-signal.SIGABRT, 128 + signal.SIGABRT}:
+        return True
+
+    stderr = completed.stderr.lower()
+    native_failure_markers = (
+        "[metal]",
+        "insufficient memory",
+        "kiogpucommandbuffercallbackerroroutofmemory",
+        "command buffer execution failed",
+        "com.metal.completionqueuedispatch",
+        "libmlx.dylib",
+    )
+    return any(marker in stderr for marker in native_failure_markers)
+
+
+def parse_mlx_subprocess_output(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    """성공한 subprocess stdout을 검증해 JSON으로 파싱한다."""
     stdout = completed.stdout.strip()
     if not stdout:
         raise RuntimeError("MLX command returned empty output")
@@ -913,6 +955,29 @@ def run_mlx_subprocess(command: list[str], prompt: str) -> dict[str, Any]:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"MLX command returned invalid JSON:\n{stdout}") from exc
+
+
+def run_mlx_subprocess(command: list[str], prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+    """커스텀 MLX 어댑터는 기존처럼 subprocess로 실행하되 Metal abort면 CPU로 한 번 재시도한다."""
+    completed = run_mlx_subprocess_attempt(command, prompt)
+    if completed.returncode != 0:
+        if current_mlx_device_setting() == "auto" and is_recoverable_mlx_native_failure(completed):
+            retry_env = os.environ.copy()
+            retry_env["MLX_DEVICE"] = "cpu"
+            log_progress(log_prefix, "MLX worker hit a native Metal failure; retrying once with MLX_DEVICE=cpu")
+            retry_completed = run_mlx_subprocess_attempt(command, prompt, env=retry_env)
+            if retry_completed.returncode == 0:
+                log_progress(log_prefix, "MLX CPU fallback succeeded")
+                return parse_mlx_subprocess_output(retry_completed)
+            raise RuntimeError(
+                "MLX command failed on the default device, and CPU fallback also failed.\n"
+                f"INITIAL ATTEMPT:\n{describe_mlx_subprocess_failure(completed)}\n\n"
+                f"CPU FALLBACK:\n{describe_mlx_subprocess_failure(retry_completed)}"
+            )
+
+        raise RuntimeError(describe_mlx_subprocess_failure(completed))
+
+    return parse_mlx_subprocess_output(completed)
 
 
 def run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
@@ -926,7 +991,7 @@ def run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
     try:
         if uses_inprocess_mlx_client(command):
             return run_mlx_inprocess(prompt)
-        return run_mlx_subprocess(command, prompt)
+        return run_mlx_subprocess(command, prompt, log_prefix=log_prefix)
     finally:
         _MLX_RUN_LOCK.release()
 
