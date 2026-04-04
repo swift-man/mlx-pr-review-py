@@ -738,6 +738,7 @@ def review_payload(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         parsed = parse_model_json(raw_output)
     except RuntimeError as exc:
+        # 모델 출력이 깨져도 웹훅 전체를 실패시키지 않기 위해 최소 응답으로 폴백한다.
         parsed = fallback_response(raw_output)
     return normalize_response(parsed)
 

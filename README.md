@@ -198,6 +198,15 @@ pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 
 코드 변경이 있거나 환경 변수를 바꿨다면 아래 순서대로 재시작하면 됩니다.
 
+한 번에 다시 배포하고 실행하려면 아래 래퍼 스크립트를 써도 됩니다.
+
+```bash
+./scripts/redeploy_local_review.sh /Users/runner/pr-review
+```
+
+이 스크립트는 기존 uvicorn 프로세스를 종료한 뒤, 최신 소스를 `/Users/runner/pr-review`로 다시 복사하고,
+`/Users/runner/pr-review/scripts/local_review_env.sh`를 읽어 서버를 포그라운드로 다시 띄웁니다.
+
 ```bash
 pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 
