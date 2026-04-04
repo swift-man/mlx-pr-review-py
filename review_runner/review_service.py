@@ -1013,6 +1013,7 @@ def collect_validated_comments(
             continue
 
         pr_file = file_index.get(path)
+        # GitHub Review API는 실제 patch의 RIGHT-side 라인만 허용하므로 여기서 엄격하게 거른다.
         if pr_file is None or line not in pr_file.right_side_lines:
             continue
 

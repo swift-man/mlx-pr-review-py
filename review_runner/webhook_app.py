@@ -101,6 +101,7 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
     api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
     auth_source: str | None = None
 
+    # 인증 단계 실패와 리뷰 실행 실패를 분리해 남겨야 운영 로그만으로도 원인을 좁히기 쉽다.
     try:
         auth = resolve_github_token(repository=repository, api_url=api_url)
         auth_source = auth.source
@@ -118,6 +119,7 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
         print(prefix + json.dumps(failure_result, ensure_ascii=False))
         return
 
+    # background task 예외가 ASGI traceback으로만 보이지 않도록 구조화된 실패 결과를 남긴다.
     try:
         result = review_pull_request(
             repository=repository,
