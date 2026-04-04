@@ -109,6 +109,13 @@
 - README, 스크립트 사용법, 실제 기본 경로가 다르면 문서도 같이 고칩니다.
 - 운영자가 따라 하는 절차는 복붙 가능한 명령 형태로 남깁니다.
 
+재실행이 필요한 상태라면 아래 명령을 안내합니다.
+
+```bash
+cd /Users/m4_25/develop/codereview
+./scripts/redeploy_local_review.sh /Users/runner/pr-review
+```
+
 ## 8. 변경 전 체크리스트
 
 - 이 변경이 HTTP 입구, 유스케이스, 인프라 중 어디에 속하는지 설명 가능한가
@@ -121,6 +128,13 @@
 - 관련 테스트를 돌렸는가
 - 실패 로그가 원인을 드러내는가
 - 배포 복사본 기준 재시작 절차가 필요한가
+- 재실행이 필요하다면 아래 명령을 함께 안내했는가
+
+```bash
+cd /Users/m4_25/develop/codereview
+./scripts/redeploy_local_review.sh /Users/runner/pr-review
+```
+
 - 과한 추상화 없이도 다음 변경이 쉬워졌는가
 
 이 문서는 "무조건 크게 리팩터링하라"는 뜻이 아닙니다.

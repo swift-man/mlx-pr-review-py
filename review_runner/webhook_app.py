@@ -55,6 +55,34 @@ def build_delivery_prefix(delivery_id: str | None) -> str:
     return f"[delivery={delivery_id}] " if delivery_id else ""
 
 
+def describe_exception(exc: Exception) -> str:
+    """비어 있지 않은 예외 메시지를 만들어 구조화 로그에 넣는다."""
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def build_failed_review_result(
+    repository: str,
+    pull_number: int,
+    delivery_id: str | None,
+    stage: str,
+    error: Exception,
+    *,
+    auth_source: str | None = None,
+) -> dict[str, Any]:
+    """백그라운드 작업 실패를 운영 로그에서 바로 읽을 수 있는 구조로 정리한다."""
+    return {
+        "status": "failed",
+        "repository": repository,
+        "pull_number": pull_number,
+        "delivery_id": delivery_id,
+        "stage": stage,
+        "error_type": error.__class__.__name__,
+        "error": describe_exception(error),
+        "auth_source": auth_source,
+    }
+
+
 def extract_pull_request_target(event: dict[str, Any]) -> tuple[str, int]:
     """payload에서 리뷰 대상 저장소와 PR 번호를 꺼낸다."""
     repository = (event.get("repository") or {}).get("full_name")
@@ -71,17 +99,52 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
     prefix = build_delivery_prefix(delivery_id)
     print(f"{prefix}Starting review for {repository}#{pull_number}", flush=True)
     api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
-    auth = resolve_github_token(repository=repository, api_url=api_url)
-    print(f"{prefix}Resolved GitHub auth via {auth.source}", flush=True)
-    result = review_pull_request(
-        repository=repository,
-        pull_number=pull_number,
-        token=auth.token,
-        api_url=api_url,
-        dry_run=os.environ.get("DRY_RUN") == "1",
-        auth_source=auth.source,
-        log_prefix=prefix,
-    )
+    auth_source: str | None = None
+
+    try:
+        auth = resolve_github_token(repository=repository, api_url=api_url)
+        auth_source = auth.source
+        print(f"{prefix}Resolved GitHub auth via {auth_source}", flush=True)
+    except Exception as exc:
+        duration = time.monotonic() - started_at
+        failure_result = build_failed_review_result(
+            repository,
+            pull_number,
+            delivery_id,
+            "auth_resolution",
+            exc,
+        )
+        print(f"{prefix}Review failed in {duration:.1f}s during auth_resolution: {failure_result['error']}", flush=True)
+        print(prefix + json.dumps(failure_result, ensure_ascii=False))
+        return
+
+    try:
+        result = review_pull_request(
+            repository=repository,
+            pull_number=pull_number,
+            token=auth.token,
+            api_url=api_url,
+            dry_run=os.environ.get("DRY_RUN") == "1",
+            auth_source=auth_source,
+            log_prefix=prefix,
+        )
+    except Exception as exc:
+        duration = time.monotonic() - started_at
+        failure_result = build_failed_review_result(
+            repository,
+            pull_number,
+            delivery_id,
+            "review_execution",
+            exc,
+            auth_source=auth_source,
+        )
+        print(
+            f"{prefix}Review failed in {duration:.1f}s during review_execution: {failure_result['error']}",
+            flush=True,
+        )
+        print(prefix + json.dumps(failure_result, ensure_ascii=False))
+        return
+
     duration = time.monotonic() - started_at
     print(f"{prefix}Review finished in {duration:.1f}s", flush=True)
     print(prefix + json.dumps(result, ensure_ascii=False))
