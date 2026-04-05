@@ -68,7 +68,10 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("When writing positives, explain the technical reason", system_prompt)
         self.assertIn("Do not place praise, strengths, or neutral observations inside concerns.", system_prompt)
         self.assertIn("Do not ask to rename internal variable names", system_prompt)
+        self.assertIn("Good positives follow this pattern: changed construct -> technical role -> concrete effect", system_prompt)
         self.assertIn("positives 에는 왜 좋은지와 어떤 기술적 효과가 있는지까지 설명하세요.", user_prompt)
+        self.assertIn("그 요소가 코드에서 하는 역할", user_prompt)
+        self.assertIn("__init__, __repr__, __eq__", user_prompt)
         self.assertIn("concerns 에는 실제 문제, 위험, 누락된 검증이나 테스트만 적고", user_prompt)
         self.assertIn("내부 변수명, 상수명, 클래스명, 함수명을 영어에서 한국어로 바꾸라고 요구하지 마세요.", user_prompt)
 
