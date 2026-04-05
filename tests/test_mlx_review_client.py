@@ -60,6 +60,16 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE must be one of: auto, cpu, gpu"):
                 mlx_review_client.configure_default_device()
 
+    def test_build_messages_requests_technical_positives_and_empty_concerns_when_no_issue(self) -> None:
+        messages = mlx_review_client.build_messages({"repository": "demo/repo", "pull_request": 1, "files": []})
+
+        system_prompt = messages[0]["content"]
+        user_prompt = messages[1]["content"]
+        self.assertIn("When writing positives, explain the technical reason", system_prompt)
+        self.assertIn("Do not place praise, strengths, or neutral observations inside concerns.", system_prompt)
+        self.assertIn("positives 에는 왜 좋은지와 어떤 기술적 효과가 있는지까지 설명하세요.", user_prompt)
+        self.assertIn("concerns 에는 실제 문제, 위험, 누락된 검증이나 테스트만 적고", user_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
