@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import certifi
@@ -97,6 +97,16 @@ _MLX_RUN_LOCK = threading.Lock()
 def log_progress(prefix: str, message: str) -> None:
     """웹훅 처리 중간 단계를 한 줄 로그로 남긴다."""
     print(f"{prefix}{message}", flush=True)
+
+
+def increment_reason(counter: dict[str, int], reason: str) -> None:
+    counter[reason] = counter.get(reason, 0) + 1
+
+
+def format_reason_counts(counter: dict[str, int]) -> str:
+    if not counter:
+        return "none"
+    return ", ".join(f"{reason}={count}" for reason, count in sorted(counter.items()))
 
 
 def default_mlx_review_command() -> list[str]:
@@ -437,6 +447,32 @@ class ValidatedReview:
     event: str
     positives: list[str]
     concerns: list[str]
+
+
+@dataclass
+class CommentValidationStats:
+    raw_model_comments: int = 0
+    accepted_model_comments: int = 0
+    dropped_model_comment_reasons: dict[str, int] = field(default_factory=dict)
+    rule_based_added: int = 0
+    rule_based_duplicates: int = 0
+
+
+@dataclass
+class ReviewGenerationArtifacts:
+    prompt: str
+    mlx_result: dict[str, Any]
+    validated_review: ValidatedReview
+    payload: dict[str, Any]
+
+
+@dataclass
+class PostedReviewResult:
+    response: Any
+    posted_event: str
+    payload: dict[str, Any]
+    fallback_note: str
+    requested_event: str | None = None
 
 
 class GitHubApi:
@@ -1053,41 +1089,94 @@ def run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
         _MLX_RUN_LOCK.release()
 
 
+def log_mlx_result_metadata(result: dict[str, Any], log_prefix: str) -> None:
+    metadata = result.get("_meta")
+    if not isinstance(metadata, dict):
+        log_progress(log_prefix, "MLX parser metadata unavailable")
+        return
+
+    parse_mode = metadata.get("parse_mode", "unknown")
+    parse_error = normalize_text(metadata.get("parse_error"))
+    raw_comment_count = metadata.get("raw_comment_count", 0)
+    normalized_comment_count = metadata.get("normalized_comment_count", 0)
+    dropped_reasons = metadata.get("dropped_comment_reasons")
+    dropped_text = format_reason_counts(dropped_reasons) if isinstance(dropped_reasons, dict) else "none"
+
+    message = (
+        f"MLX parser parse_mode={parse_mode} raw_comments={raw_comment_count} "
+        f"normalized_comments={normalized_comment_count} dropped_after_parse={dropped_text}"
+    )
+    if parse_error:
+        message += f" parse_error={parse_error}"
+    log_progress(log_prefix, message)
+
+
+def log_comment_validation_stats(stats: CommentValidationStats, log_prefix: str) -> None:
+    log_progress(
+        log_prefix,
+        "Comment validation "
+        f"accepted_model_comments={stats.accepted_model_comments}/{stats.raw_model_comments} "
+        f"rule_based_added={stats.rule_based_added} "
+        f"rule_based_duplicates={stats.rule_based_duplicates} "
+        f"dropped_after_validation={format_reason_counts(stats.dropped_model_comment_reasons)}",
+    )
+
+
 def collect_validated_comments(
     result: dict[str, Any],
     files: list[PullRequestFile],
-) -> list[ReviewComment]:
+) -> tuple[list[ReviewComment], CommentValidationStats]:
     """모델 코멘트와 규칙 기반 코멘트를 합치고 중복을 제거한다."""
     file_index = {f.filename: f for f in files}
     comments: list[ReviewComment] = []
     seen_comment_keys: set[tuple[str, int, str]] = set()
+    raw_comments = result.get("comments", [])
+    stats = CommentValidationStats(raw_model_comments=len(raw_comments) if isinstance(raw_comments, list) else 0)
 
-    for raw in result.get("comments", []):
+    for raw in raw_comments if isinstance(raw_comments, list) else []:
         path = raw.get("path")
         line = raw.get("line")
         body = normalize_text(raw.get("body"))
-        if not path or not isinstance(line, int) or not body or looks_like_praise_only_comment(body):
+        if not path:
+            increment_reason(stats.dropped_model_comment_reasons, "missing_path")
+            continue
+        if not isinstance(line, int):
+            increment_reason(stats.dropped_model_comment_reasons, "invalid_line_type")
+            continue
+        if not body:
+            increment_reason(stats.dropped_model_comment_reasons, "empty_body")
+            continue
+        if looks_like_praise_only_comment(body):
+            increment_reason(stats.dropped_model_comment_reasons, "style_or_praise_only")
             continue
 
         pr_file = file_index.get(path)
         # GitHub Review API는 실제 patch의 RIGHT-side 라인만 허용하므로 여기서 엄격하게 거른다.
-        if pr_file is None or line not in pr_file.right_side_lines:
+        if pr_file is None:
+            increment_reason(stats.dropped_model_comment_reasons, "path_mismatch")
+            continue
+        if line not in pr_file.right_side_lines:
+            increment_reason(stats.dropped_model_comment_reasons, "invalid_right_side_line")
             continue
 
         key = (path, line, body)
         if key in seen_comment_keys:
+            increment_reason(stats.dropped_model_comment_reasons, "duplicate_model_comment")
             continue
         seen_comment_keys.add(key)
         comments.append(ReviewComment(path=path, line=line, body=body))
+        stats.accepted_model_comments += 1
 
     for comment in detect_rule_based_comments(files):
         key = (comment.path, comment.line, comment.body)
         if key in seen_comment_keys:
+            stats.rule_based_duplicates += 1
             continue
         seen_comment_keys.add(key)
         comments.append(comment)
+        stats.rule_based_added += 1
 
-    return comments
+    return comments, stats
 
 
 def decide_review_event(raw_event: Any, *, has_findings: bool) -> str:
@@ -1103,9 +1192,14 @@ def decide_review_event(raw_event: Any, *, has_findings: bool) -> str:
 def validate_mlx_output(
     result: dict[str, Any],
     files: list[PullRequestFile],
+    *,
+    log_prefix: str = "",
 ) -> ValidatedReview:
     """모델 출력을 실제 리뷰 payload로 쓰기 전에 안전하게 정리한다."""
-    comments = collect_validated_comments(result, files)
+    comments, validation_stats = collect_validated_comments(result, files)
+    if log_prefix:
+        log_mlx_result_metadata(result, log_prefix)
+        log_comment_validation_stats(validation_stats, log_prefix)
 
     summary = normalize_text(result.get("summary")) or "자동 리뷰를 완료했습니다."
     positives = sanitize_positive_items(normalize_text_list(result.get("positives"), max_items=10))
@@ -1244,6 +1338,81 @@ def build_review_message(
     return "\n".join(message_lines)
 
 
+def load_patchable_pr_files(github: GitHubApi, pull_number: int, *, log_prefix: str = "") -> list[PullRequestFile]:
+    log_progress(log_prefix, f"Fetching PR files for {github.repository}#{pull_number}")
+    raw_files = github.list_pr_files(pull_number)
+    pr_files = build_pr_files(raw_files)
+    log_progress(log_prefix, f"Loaded {len(pr_files)} patchable file(s)")
+    return pr_files
+
+
+def generate_review_artifacts(
+    repository: str,
+    pull_number: int,
+    pr_files: list[PullRequestFile],
+    *,
+    log_prefix: str = "",
+) -> ReviewGenerationArtifacts:
+    prompt = make_prompt(repository, pull_number, pr_files)
+    if os.environ.get("WRITE_PROMPT_DEBUG") == "1":
+        write_prompt_debug_file(prompt)
+
+    mlx_started_at = time.monotonic()
+    log_progress(log_prefix, "Running MLX review model")
+    mlx_result = run_mlx(prompt, log_prefix=log_prefix)
+    log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
+    validated_review = validate_mlx_output(mlx_result, pr_files, log_prefix=log_prefix)
+    payload = build_review_payload(
+        validated_review.summary,
+        validated_review.event,
+        validated_review.comments,
+        validated_review.positives,
+        validated_review.concerns,
+    )
+    return ReviewGenerationArtifacts(
+        prompt=prompt,
+        mlx_result=mlx_result,
+        validated_review=validated_review,
+        payload=payload,
+    )
+
+
+def post_review_with_fallback(
+    github: GitHubApi,
+    pull_number: int,
+    *,
+    payload: dict[str, Any],
+    requested_event: str,
+    log_prefix: str = "",
+) -> PostedReviewResult:
+    posted_event = requested_event
+    fallback_note = ""
+    requested_event_after_retry: str | None = None
+    try:
+        log_progress(log_prefix, f"Posting GitHub review as {requested_event}")
+        response = github.post_review(pull_number, payload)
+    except RuntimeError as exc:
+        if not should_retry_review_as_comment(exc, payload):
+            raise
+
+        retry_payload = dict(payload)
+        retry_payload["event"] = "COMMENT"
+        log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
+        response = github.post_review(pull_number, retry_payload)
+        payload = retry_payload
+        posted_event = "COMMENT"
+        requested_event_after_retry = requested_event
+        fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
+
+    return PostedReviewResult(
+        response=response,
+        posted_event=posted_event,
+        payload=payload,
+        fallback_note=fallback_note,
+        requested_event=requested_event_after_retry,
+    )
+
+
 def review_pull_request(
     repository: str,
     pull_number: int,
@@ -1256,10 +1425,7 @@ def review_pull_request(
     """PR diff를 수집하고 모델 리뷰를 생성한 뒤 GitHub에 등록한다."""
     started_at = time.monotonic()
     github = GitHubApi(token=token, repository=repository, api_url=api_url)
-    log_progress(log_prefix, f"Fetching PR files for {repository}#{pull_number}")
-    raw_files = github.list_pr_files(pull_number)
-    pr_files = build_pr_files(raw_files)
-    log_progress(log_prefix, f"Loaded {len(pr_files)} patchable file(s)")
+    pr_files = load_patchable_pr_files(github, pull_number, log_prefix=log_prefix)
 
     if not pr_files:
         return {
@@ -1269,55 +1435,38 @@ def review_pull_request(
             "pull_number": pull_number,
         }
 
-    prompt = make_prompt(repository, pull_number, pr_files)
-    if os.environ.get("WRITE_PROMPT_DEBUG") == "1":
-        write_prompt_debug_file(prompt)
-
-    mlx_started_at = time.monotonic()
-    log_progress(log_prefix, "Running MLX review model")
-    mlx_result = run_mlx(prompt, log_prefix=log_prefix)
-    log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
-    validated_review = validate_mlx_output(mlx_result, pr_files)
-    payload = build_review_payload(
-        validated_review.summary,
-        validated_review.event,
-        validated_review.comments,
-        validated_review.positives,
-        validated_review.concerns,
+    artifacts = generate_review_artifacts(repository, pull_number, pr_files, log_prefix=log_prefix)
+    result = build_review_result(
+        repository,
+        pull_number,
+        artifacts.validated_review,
+        artifacts.payload,
+        auth_source,
     )
-    result = build_review_result(repository, pull_number, validated_review, payload, auth_source)
 
     if dry_run:
         log_progress(log_prefix, f"Dry run completed in {time.monotonic() - started_at:.1f}s")
         return result
 
-    posted_event = validated_review.event
-    fallback_note = ""
-    try:
-        log_progress(log_prefix, f"Posting GitHub review as {validated_review.event}")
-        response = github.post_review(pull_number, payload)
-    except RuntimeError as exc:
-        if not should_retry_review_as_comment(exc, payload):
-            raise
+    posted = post_review_with_fallback(
+        github,
+        pull_number,
+        payload=artifacts.payload,
+        requested_event=artifacts.validated_review.event,
+        log_prefix=log_prefix,
+    )
+    if posted.requested_event is not None:
+        result["requested_event"] = posted.requested_event
+        result["event"] = posted.posted_event
+        result["payload"] = posted.payload
 
-        retry_payload = dict(payload)
-        retry_payload["event"] = "COMMENT"
-        log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
-        response = github.post_review(pull_number, retry_payload)
-        payload = retry_payload
-        posted_event = "COMMENT"
-        result["requested_event"] = validated_review.event
-        result["event"] = posted_event
-        result["payload"] = payload
-        fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
-
-    result["review_id"] = response.get("id")
+    result["review_id"] = posted.response.get("id")
     result["message"] = build_review_message(
-        posted_event=posted_event,
-        comments=validated_review.comments,
-        payload=payload,
-        response=response,
-        fallback_note=fallback_note,
+        posted_event=posted.posted_event,
+        comments=artifacts.validated_review.comments,
+        payload=posted.payload,
+        response=posted.response,
+        fallback_note=posted.fallback_note,
     )
     log_progress(log_prefix, f"Review posted successfully in {time.monotonic() - started_at:.1f}s")
     return result
