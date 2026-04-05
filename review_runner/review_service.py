@@ -53,6 +53,19 @@ LOW_SIGNAL_MODEL_CHANGE_MARKERS = (
     "mlx_model의 값이 업데이트",
     "새로운 모델이 적합한지 확인",
 )
+POSITIVE_CONCERN_MARKERS = (
+    "가독성을 높",
+    "신뢰성을 높",
+    "유지보수성을 높",
+    "명확해졌",
+    "단순해졌",
+    "효율적으로 관리",
+    "안정적으로 관리",
+    "도움이 됩니다",
+    "좋습니다",
+    "적절합니다",
+    "개선되었습니다",
+)
 NO_CONCERN_TEXTS = {
     DEFAULT_NO_CONCERNS_TEXT,
     "별도 개선 필요 사항은 발견되지 않았습니다.",
@@ -153,6 +166,8 @@ def sanitize_text_items(items: list[str], max_items: int = 5) -> list[str]:
             or text in NO_CONCERN_TEXTS
             or looks_like_prompt_echo(text)
             or looks_like_diff_stat_dump(text)
+            or looks_like_positive_only_concern(text)
+            or looks_like_identifier_localization_comment(text)
             or looks_like_generic_model_change_comment(text)
         ):
             continue
@@ -191,6 +206,12 @@ def looks_like_praise_only_comment(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return False
+
+    if looks_like_identifier_localization_comment(normalized):
+        return True
+
+    if looks_like_positive_only_concern(normalized):
+        return True
 
     if looks_like_generic_model_change_comment(normalized):
         return True
@@ -764,6 +785,42 @@ def looks_like_generic_model_change_comment(text: str) -> bool:
     if not normalized:
         return False
     return any(marker in normalized for marker in LOW_SIGNAL_MODEL_CHANGE_MARKERS)
+
+
+def looks_like_positive_only_concern(text: str) -> bool:
+    normalized = normalize_text(text).lower()
+    if not normalized:
+        return False
+
+    if any(marker in normalized for marker in POSITIVE_CONCERN_MARKERS):
+        return True
+
+    if (
+        "추가되어" in normalized
+        and "할 수 있습니다" in normalized
+        and not any(marker in normalized for marker in ("필요", "주의", "위험", "문제", "누락", "부족", "검토"))
+    ):
+        return True
+
+    return False
+
+
+def looks_like_identifier_localization_comment(text: str) -> bool:
+    normalized = normalize_text(text).lower()
+    if not normalized:
+        return False
+
+    if "영어로 작성" not in normalized and "영문" not in normalized:
+        return False
+
+    if "한국어로 변경" not in normalized and "한글로 변경" not in normalized:
+        return False
+
+    # 공개 계약이나 사용자 노출 문자열이 아니라 내부 식별자 이름만 지적하는 경우는 스타일 코멘트로 본다.
+    if any(marker in normalized for marker in ("응답", "헤더", "api", "계약", "사용자", "노출", "문구", "메시지")):
+        return False
+
+    return True
 
 
 def looks_like_no_findings_summary(text: str) -> bool:

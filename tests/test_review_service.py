@@ -196,6 +196,67 @@ class ReviewNormalizationTests(unittest.TestCase):
         self.assertEqual(validated.event, "REQUEST_CHANGES")
         self.assertEqual(len(validated.comments), 1)
 
+    def test_validate_mlx_output_filters_positive_sentences_out_of_concerns(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="fortune/service.py",
+            status="modified",
+            patch='@@ -10,0 +10,1 @@\n+@dataclass\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={10},
+        )
+
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "운세 데이터 구조를 정리했습니다.",
+                "event": "COMMENT",
+                "positives": ["dataclass를 도입해 필드 계약이 한눈에 드러나고 초기화 보일러플레이트가 줄었습니다."],
+                "concerns": [
+                    "dataclass를 사용하여 코드의 가독성을 높였습니다.",
+                    "새로운 테스트 파일이 추가되어 코드의 신뢰성을 높였습니다.",
+                ],
+                "comments": [],
+            },
+            [pr_file],
+        )
+
+        self.assertEqual(validated.concerns, [])
+        self.assertEqual(validated.event, "COMMENT")
+        self.assertEqual(
+            validated.positives,
+            ["dataclass를 도입해 필드 계약이 한눈에 드러나고 초기화 보일러플레이트가 줄었습니다."],
+        )
+
+    def test_validate_mlx_output_filters_identifier_localization_style_concerns(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="fortune/service.py",
+            status="modified",
+            patch='@@ -12,0 +12,1 @@\n+POSITIVE_CONCERN_MARKERS = ()\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={12},
+        )
+
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "구조를 정리했습니다.",
+                "event": "COMMENT",
+                "positives": ["캐시 관련 상수를 한곳에 모아 의도를 파악하기 쉬워졌습니다."],
+                "concerns": ["POSITIVE_CONCERN_MARKERS는 영어로 작성되어 있습니다. 한국어로 변경해주세요."],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 12,
+                        "body": "POSITIVE_CONCERN_MARKERS는 영어로 작성되어 있습니다. 한국어로 변경해주세요.",
+                    }
+                ],
+            },
+            [pr_file],
+        )
+
+        self.assertEqual(validated.concerns, [])
+        self.assertEqual(validated.comments, [])
+
 
 def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> mock.Mock:
     completed = mock.Mock()
