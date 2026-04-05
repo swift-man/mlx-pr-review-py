@@ -259,6 +259,36 @@ class ReviewNormalizationTests(unittest.TestCase):
         self.assertEqual(validated.concerns, [])
         self.assertEqual(validated.comments, [])
 
+    def test_validate_mlx_output_filters_process_policy_comments(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="review_runner/mlx_review_prompt.py",
+            status="modified",
+            patch='@@ -20,0 +20,1 @@\n+"PR 제목과 description 은 한글로 작성합니다."\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={20},
+        )
+
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "프롬프트 구성을 정리했습니다.",
+                "event": "COMMENT",
+                "positives": ["프롬프트 규칙을 모듈로 분리해 유지보수 경계를 더 분명하게 만들었습니다."],
+                "concerns": ["PR 제목과 description이 한국어로 작성되어야 하며, 리뷰 텍스트는 작업 흐름을 분석해야 합니다."],
+                "comments": [
+                    {
+                        "path": "review_runner/mlx_review_prompt.py",
+                        "line": 20,
+                        "body": "PR 제목과 description이 한국어로 작성되어야 하며, 리뷰 텍스트는 작업 흐름을 분석해야 합니다.",
+                    }
+                ],
+            },
+            [pr_file],
+        )
+
+        self.assertEqual(validated.concerns, [])
+        self.assertEqual(validated.comments, [])
+
     def test_validate_mlx_output_logs_parser_and_validation_drop_stats(self) -> None:
         pr_file = review_service.PullRequestFile(
             filename="fortune/service.py",

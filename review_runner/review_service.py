@@ -53,6 +53,17 @@ LOW_SIGNAL_MODEL_CHANGE_MARKERS = (
     "mlx_model의 값이 업데이트",
     "새로운 모델이 적합한지 확인",
 )
+PROCESS_POLICY_MARKERS = (
+    "pr 제목",
+    "pr description",
+    "리뷰 텍스트는 작업 흐름을 분석",
+    "작업 흐름을 분석",
+    "한글로 작성되어야",
+    "한국어로 작성되어야",
+    "한국어로 작성해야",
+    "agents.md",
+    "커밋 메시지",
+)
 POSITIVE_CONCERN_MARKERS = (
     "가독성을 높",
     "신뢰성을 높",
@@ -179,6 +190,7 @@ def sanitize_text_items(items: list[str], max_items: int = 5) -> list[str]:
             or looks_like_positive_only_concern(text)
             or looks_like_identifier_localization_comment(text)
             or looks_like_generic_model_change_comment(text)
+            or looks_like_process_policy_comment(text)
         ):
             continue
         seen.add(text)
@@ -202,6 +214,7 @@ def sanitize_positive_items(items: list[str], max_items: int = 5) -> list[str]:
             or looks_like_diff_stat_dump(text)
             or looks_like_generic_positive(text)
             or looks_like_generic_model_change_comment(text)
+            or looks_like_process_policy_comment(text)
         ):
             continue
         seen.add(text)
@@ -224,6 +237,9 @@ def looks_like_praise_only_comment(text: str) -> bool:
         return True
 
     if looks_like_generic_model_change_comment(normalized):
+        return True
+
+    if looks_like_process_policy_comment(normalized):
         return True
 
     if looks_like_generic_positive(normalized):
@@ -821,6 +837,13 @@ def looks_like_generic_model_change_comment(text: str) -> bool:
     if not normalized:
         return False
     return any(marker in normalized for marker in LOW_SIGNAL_MODEL_CHANGE_MARKERS)
+
+
+def looks_like_process_policy_comment(text: str) -> bool:
+    normalized = normalize_text(text).lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in PROCESS_POLICY_MARKERS)
 
 
 def looks_like_positive_only_concern(text: str) -> bool:
