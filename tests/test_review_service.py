@@ -227,6 +227,36 @@ class ReviewNormalizationTests(unittest.TestCase):
             ["dataclass를 도입해 필드 계약이 한눈에 드러나고 초기화 보일러플레이트가 줄었습니다."],
         )
 
+    def test_validate_mlx_output_filters_identifier_localization_style_concerns(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="fortune/service.py",
+            status="modified",
+            patch='@@ -12,0 +12,1 @@\n+POSITIVE_CONCERN_MARKERS = ()\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={12},
+        )
+
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "구조를 정리했습니다.",
+                "event": "COMMENT",
+                "positives": ["캐시 관련 상수를 한곳에 모아 의도를 파악하기 쉬워졌습니다."],
+                "concerns": ["POSITIVE_CONCERN_MARKERS는 영어로 작성되어 있습니다. 한국어로 변경해주세요."],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 12,
+                        "body": "POSITIVE_CONCERN_MARKERS는 영어로 작성되어 있습니다. 한국어로 변경해주세요.",
+                    }
+                ],
+            },
+            [pr_file],
+        )
+
+        self.assertEqual(validated.concerns, [])
+        self.assertEqual(validated.comments, [])
+
 
 def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> mock.Mock:
     completed = mock.Mock()

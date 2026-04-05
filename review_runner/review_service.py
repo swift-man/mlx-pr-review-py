@@ -167,6 +167,7 @@ def sanitize_text_items(items: list[str], max_items: int = 5) -> list[str]:
             or looks_like_prompt_echo(text)
             or looks_like_diff_stat_dump(text)
             or looks_like_positive_only_concern(text)
+            or looks_like_identifier_localization_comment(text)
             or looks_like_generic_model_change_comment(text)
         ):
             continue
@@ -205,6 +206,9 @@ def looks_like_praise_only_comment(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return False
+
+    if looks_like_identifier_localization_comment(normalized):
+        return True
 
     if looks_like_positive_only_concern(normalized):
         return True
@@ -799,6 +803,24 @@ def looks_like_positive_only_concern(text: str) -> bool:
         return True
 
     return False
+
+
+def looks_like_identifier_localization_comment(text: str) -> bool:
+    normalized = normalize_text(text).lower()
+    if not normalized:
+        return False
+
+    if "영어로 작성" not in normalized and "영문" not in normalized:
+        return False
+
+    if "한국어로 변경" not in normalized and "한글로 변경" not in normalized:
+        return False
+
+    # 공개 계약이나 사용자 노출 문자열이 아니라 내부 식별자 이름만 지적하는 경우는 스타일 코멘트로 본다.
+    if any(marker in normalized for marker in ("응답", "헤더", "api", "계약", "사용자", "노출", "문구", "메시지")):
+        return False
+
+    return True
 
 
 def looks_like_no_findings_summary(text: str) -> bool:
