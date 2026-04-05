@@ -1,0 +1,38 @@
+{
+  "summary": "데이터 캐시 흐름을 정리했습니다.",
+  "event": "REQUEST_CHANGES",
+  "positives": [
+    "dataclass로 캐시 엔트리의 필드 계약이 드러나 초기화 코드가 단순해졌습니다."
+  ],
+  "concerns": [
+    "캐시 만료와 DB 조회가 함께 바뀌어 회귀 테스트가 더 필요해 보입니다."
+  ],
+  "comments": [
+    {
+      "path": "fortune/cache.py",
+      "line": 27,
+      "body": "캐시 만료 분기와 DB 조회 분기가 함께 바뀌었으니 회귀 테스트를 추가해두는 편이 안전합니다."
+    },
+    {
+      "path": "fortune/cache.py",
+      "line": 27,
+      "body": "캐시 만료 분기와 DB 조회 분기가 함께 바뀌었으니 회귀 테스트를 추가해두는 편이 안전합니다."
+    },
+    {
+      "path": "",
+      "line": 31,
+      "body": "경로가 없는 코멘트입니다."
+    },
+    {
+      "path": "fortune/cache.py",
+      "line": "x",
+      "body": "라인 번호가 잘못되었습니다."
+    },
+    {
+      "path": "fortune/cache.py",
+      "line": 40,
+      "body": "Please add tests."
+    },
+    "bad"
+  ]
+}

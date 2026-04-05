@@ -5,6 +5,8 @@ import threading
 import time
 import types
 import unittest
+from contextlib import redirect_stdout
+import io
 from unittest import mock
 
 if "certifi" not in sys.modules:
@@ -256,6 +258,96 @@ class ReviewNormalizationTests(unittest.TestCase):
 
         self.assertEqual(validated.concerns, [])
         self.assertEqual(validated.comments, [])
+
+    def test_validate_mlx_output_filters_process_policy_comments(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="review_runner/mlx_review_prompt.py",
+            status="modified",
+            patch='@@ -20,0 +20,1 @@\n+"PR 제목과 description 은 한글로 작성합니다."\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={20},
+        )
+
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "프롬프트 구성을 정리했습니다.",
+                "event": "COMMENT",
+                "positives": ["프롬프트 규칙을 모듈로 분리해 유지보수 경계를 더 분명하게 만들었습니다."],
+                "concerns": ["PR 제목과 description이 한국어로 작성되어야 하며, 리뷰 텍스트는 작업 흐름을 분석해야 합니다."],
+                "comments": [
+                    {
+                        "path": "review_runner/mlx_review_prompt.py",
+                        "line": 20,
+                        "body": "PR 제목과 description이 한국어로 작성되어야 하며, 리뷰 텍스트는 작업 흐름을 분석해야 합니다.",
+                    }
+                ],
+            },
+            [pr_file],
+        )
+
+        self.assertEqual(validated.concerns, [])
+        self.assertEqual(validated.comments, [])
+
+    def test_validate_mlx_output_logs_parser_and_validation_drop_stats(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="fortune/service.py",
+            status="modified",
+            patch='@@ -12,0 +12,1 @@\n+cache_entry = build_cache_entry()\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={12},
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            validated = review_service.validate_mlx_output(
+                {
+                    "_meta": {
+                        "parse_mode": "salvaged_candidate",
+                        "parse_error": "Expecting ',' delimiter",
+                        "raw_comment_count": 4,
+                        "normalized_comment_count": 2,
+                        "dropped_comment_reasons": {"duplicate_comment": 1, "invalid_body": 1},
+                    },
+                    "summary": "캐시 구조를 정리했습니다.",
+                    "event": "COMMENT",
+                    "positives": ["캐시 생성 경로를 한곳으로 모아 흐름을 따라가기 쉬워졌습니다."],
+                    "concerns": [],
+                    "comments": [
+                        {
+                            "path": "fortune/service.py",
+                            "line": 12,
+                            "body": "캐시 생성 경로가 바뀌었으니 정상 흐름과 만료 흐름을 함께 검증하는 테스트를 추가해두는 편이 안전합니다.",
+                        },
+                        {
+                            "path": "missing.py",
+                            "line": 12,
+                            "body": "이 파일은 PR에 없습니다.",
+                        },
+                        {
+                            "path": "fortune/service.py",
+                            "line": 12,
+                            "body": "핵심 변경 의도가 diff 안에서 비교적 명확하게 드러납니다.",
+                        },
+                    ],
+                },
+                [pr_file],
+                log_prefix="[delivery=test] ",
+            )
+
+        lines = stdout.getvalue().splitlines()
+        self.assertIn(
+            "[delivery=test] MLX parser parse_mode=salvaged_candidate raw_comments=4 normalized_comments=2 "
+            "dropped_after_parse=duplicate_comment=1, invalid_body=1 parse_error=Expecting ',' delimiter",
+            lines,
+        )
+        self.assertIn(
+            "[delivery=test] Comment validation accepted_model_comments=1/3 rule_based_added=0 "
+            "rule_based_duplicates=0 dropped_after_validation=path_mismatch=1, style_or_praise_only=1",
+            lines,
+        )
+        self.assertEqual(len(validated.comments), 1)
 
 
 def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> mock.Mock:
