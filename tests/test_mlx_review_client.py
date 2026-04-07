@@ -72,6 +72,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("Do not turn repository process rules into code review findings.", system_prompt)
         self.assertIn("Do not ask to rename internal variable names", system_prompt)
         self.assertIn("Good positives follow this pattern: changed construct -> technical role -> concrete effect", system_prompt)
+        self.assertIn("If the diff adds test scaffolding such as dummy classes, fake modules, monkeypatching, or sys.modules registration", system_prompt)
         self.assertIn("summary 는 무엇을 추가했는지만 나열하지 말고", user_prompt)
         self.assertIn("기존 문제나 불편 -> 이번 변경 -> 기대 효과", user_prompt)
         self.assertIn("흩어진 운세 데이터 표현과 중복 조회 부담을 줄이기 위해", user_prompt)
@@ -79,6 +80,8 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("PR 제목/description 언어, 커밋 메시지 스타일, AGENTS.md 작업 규칙 자체를 코드 리뷰 concern 으로 적지 마세요.", user_prompt)
         self.assertIn("그 요소가 코드에서 하는 역할", user_prompt)
         self.assertIn("__init__, __repr__, __eq__", user_prompt)
+        self.assertIn("types.ModuleType", user_prompt)
+        self.assertIn("sys.modules", user_prompt)
         self.assertIn("concerns 에는 실제 문제, 위험, 누락된 검증이나 테스트만 적고", user_prompt)
         self.assertIn("내부 변수명, 상수명, 클래스명, 함수명을 영어에서 한국어로 바꾸라고 요구하지 마세요.", user_prompt)
 
