@@ -376,18 +376,28 @@ class DescriptiveChangeNarrationTests(unittest.TestCase):
                 )
 
     def test_keeps_concern_with_risk_marker_even_if_suffix_matches(self) -> None:
-        # 서술형 어미여도 위험 신호가 있으면 실제 concern 일 수 있으므로 유지.
+        # 서술형 어미로 끝나면서 동시에 위험 신호가 있는 경우만 화이트리스트 경로가 실제로
+        # 실행된다. suffix 가 매칭되지 않는 문자열로는 whitelist 로직을 검증할 수 없어서,
+        # 각 케이스는 반드시 DESCRIPTIVE_NARRATION_SUFFIXES 중 하나로 끝나야 한다.
         cases = (
-            "테스트가 누락되었습니다.",
-            "signature 검증이 제거되었습니다. 인증 우회 위험이 있습니다.",
-            "입력 검증 로직이 삭제되었습니다. 취약점이 생겼습니다.",
-            "필수 가드가 제거되었습니다. 주의가 필요합니다.",
+            "인증 우회 위험 코드가 추가되었습니다.",
+            "필수 검증이 누락된 채 응답 스키마가 변경되었습니다.",
+            "SQL 인젝션에 취약한 쿼리가 도입되었습니다.",
+            "중요 에러 처리 로직이 삭제되었습니다.",
         )
         for text in cases:
             with self.subTest(text=text):
+                stripped = text.rstrip(" .!?~。")
+                self.assertTrue(
+                    stripped.endswith(review_service.DESCRIPTIVE_NARRATION_SUFFIXES),
+                    msg=(
+                        f"test fixture must end with a narration suffix to exercise the "
+                        f"risk-marker whitelist branch: {text!r}"
+                    ),
+                )
                 self.assertFalse(
                     review_service.looks_like_descriptive_change_narration(text),
-                    msg=f"filter should have kept this concern: {text!r}",
+                    msg=f"risk marker should prevent filtering: {text!r}",
                 )
 
     def test_keeps_problem_statement_concerns(self) -> None:
