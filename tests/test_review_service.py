@@ -419,6 +419,29 @@ class DescriptiveChangeNarrationTests(unittest.TestCase):
             ["signature 검증이 제거되었습니다. 인증 우회 위험이 있습니다."],
         )
 
+    def test_looks_like_praise_only_comment_drops_narration_line_comment(self) -> None:
+        # 라인 코멘트 경로에도 서술형 문장이 걸러지는지 확인해 추후 리팩토링 시 연결이
+        # 조용히 끊기지 않도록 고정한다.
+        self.assertTrue(
+            review_service.looks_like_praise_only_comment("주석이 한국어로 수정되었습니다.")
+        )
+        self.assertTrue(
+            review_service.looks_like_praise_only_comment("새로운 테스트 파일이 추가되었습니다.")
+        )
+
+    def test_strips_trailing_non_period_punctuation(self) -> None:
+        # MLX 가 간혹 마침표 대신 !/?/~ 를 붙여도 동일하게 필터되어야 한다.
+        for text in (
+            "주석이 수정되었습니다!",
+            "필드가 변경되었습니다?",
+            "테스트 파일이 추가되었습니다~",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(
+                    review_service.looks_like_descriptive_change_narration(text),
+                    msg=f"trailing punctuation should not disable the filter: {text!r}",
+                )
+
 
 class ExtractModelNameFromResultTests(unittest.TestCase):
     def test_returns_model_name_when_meta_is_dict_with_string_value(self) -> None:

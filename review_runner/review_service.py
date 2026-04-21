@@ -142,7 +142,8 @@ CONCERN_RISK_MARKERS = (
     "미흡",
     "빠져",
     "놓치",
-    "깨",
+    "깨짐",
+    "깨지",
 )
 
 _MLX_RUN_LOCK = threading.Lock()
@@ -904,8 +905,10 @@ def looks_like_descriptive_change_narration(text: str) -> bool:
     if not normalized:
         return False
 
-    stripped = normalized.rstrip(" .")
-    if not any(stripped.endswith(suffix) for suffix in DESCRIPTIVE_NARRATION_SUFFIXES):
+    # MLX 출력은 주로 '.' 로 끝나지만 간혹 !/?/~/。 가 섞여 나오니 말미 구두점을 일괄 제거한다.
+    stripped = normalized.rstrip(" .!?~。")
+    # str.endswith 는 suffix 튜플을 그대로 받아 C 레벨에서 매칭하므로 제너레이터보다 간결하고 빠르다.
+    if not stripped.endswith(DESCRIPTIVE_NARRATION_SUFFIXES):
         return False
 
     return not any(marker in normalized for marker in CONCERN_RISK_MARKERS)
