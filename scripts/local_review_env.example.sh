@@ -21,7 +21,7 @@ export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/mlx-review-bot.2026-0
 
 export GITHUB_WEBHOOK_SECRET=replace-me
 export GITHUB_REPOSITORY=swift-man/review.gorani.me
-export MLX_MODEL="mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 # Metal/MLX abort가 반복되면 주석을 해제해 CPU fallback으로 확인하세요.
 # export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"

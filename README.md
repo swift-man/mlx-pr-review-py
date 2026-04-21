@@ -81,10 +81,10 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `GITHUB_APP_INSTALLATION_ID=12345678` (옵션, 생략 시 `OWNER/REPO` 기준 자동 조회)
 - `GITHUB_WEBHOOK_SECRET=...`
 - `MLX_REVIEW_CMD=/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client` (옵션)
-- `MLX_MODEL=mlx-community/Qwen2.5-Coder-14B-Instruct-4bit`
+- `MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit`
 - `MLX_DEVICE=cpu` (옵션, Metal 장애 시 fallback. 비워두면 MLX 기본 장치 사용)
 - `GITHUB_API_URL=https://api.github.com` (옵션)
-- `MLX_MAX_TOKENS=2400` (옵션)
+- `MLX_MAX_TOKENS=1200` (옵션)
 - `MLX_MAX_FINDINGS=10` (옵션)
 - `MLX_TRUST_REMOTE_CODE=0` (옵션)
 - `DRY_RUN=1` (옵션, 실제 GitHub 리뷰를 남기지 않고 흐름만 확인할 때)
@@ -111,7 +111,7 @@ cp /Users/runner/pr-review/scripts/local_review_env.example.sh /Users/runner/pr-
 
 ```bash
 export LOCAL_REVIEW_HOME=/Users/runner/pr-review
-export MLX_MODEL=mlx-community/Qwen2.5-Coder-14B-Instruct-4bit
+export MLX_MODEL=mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
 zsh /Users/runner/pr-review/scripts/warm_mlx_model.sh
 ```
 
@@ -137,7 +137,7 @@ export PORT=8000
 export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 # export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
@@ -160,7 +160,7 @@ export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/github-app.private-ke
 export GITHUB_APP_INSTALLATION_ID=12345678
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 # export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
@@ -223,7 +223,7 @@ export PORT=8000
 export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 # export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
@@ -387,7 +387,7 @@ export GITHUB_TOKEN=ghp_xxx
 export GITHUB_REPOSITORY=OWNER/REPO
 export GITHUB_EVENT_PATH=/path/to/event.json
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
+export MLX_MODEL="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
 export DRY_RUN=1
 export PYTHONPATH=/Users/runner/pr-review
 /Users/runner/pr-review/venv/bin/python -m review_runner.review_pr
