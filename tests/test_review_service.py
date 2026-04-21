@@ -387,7 +387,7 @@ class DescriptiveChangeNarrationTests(unittest.TestCase):
         )
         for text in cases:
             with self.subTest(text=text):
-                stripped = text.rstrip(" .!?~。")
+                stripped = text.rstrip(review_service.NARRATION_TRAILING_PUNCTUATION)
                 self.assertTrue(
                     stripped.endswith(review_service.DESCRIPTIVE_NARRATION_SUFFIXES),
                     msg=(

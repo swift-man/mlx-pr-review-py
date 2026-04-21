@@ -101,6 +101,10 @@ PROMPT_ECHO_MARKERS = (
     "style-only",
     "praise-only",
 )
+# MLX 출력 말미에 흔히 붙는 구두점. narration 어미 매칭 전에 strip 해서 '.', '!', '?', '~',
+# '。' 등이 섞여도 동일하게 탐지되도록 한다. 프로덕션 필터와 테스트 픽스처 assertion 이
+# 같은 소스를 공유하게 모듈 상수로 노출한다.
+NARRATION_TRAILING_PUNCTUATION = " .!?~。"
 # diff 가 수행한 구조 변경을 사실 서술로만 적은 concern 을 걸러내기 위한 어미 목록.
 # concern 은 '문제 진술' 이어야 하고 '~되었습니다' 류 narration 은 문제가 아니라 변경 요약이다.
 DESCRIPTIVE_NARRATION_SUFFIXES = (
@@ -906,7 +910,7 @@ def looks_like_descriptive_change_narration(text: str) -> bool:
         return False
 
     # MLX 출력은 주로 '.' 로 끝나지만 간혹 !/?/~/。 가 섞여 나오니 말미 구두점을 일괄 제거한다.
-    stripped = normalized.rstrip(" .!?~。")
+    stripped = normalized.rstrip(NARRATION_TRAILING_PUNCTUATION)
     # str.endswith 는 suffix 튜플을 그대로 받아 C 레벨에서 매칭하므로 제너레이터보다 간결하고 빠르다.
     if not stripped.endswith(DESCRIPTIVE_NARRATION_SUFFIXES):
         return False
