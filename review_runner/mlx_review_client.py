@@ -17,8 +17,8 @@ from review_runner.mlx_review_parser import (
 from review_runner.mlx_review_prompt import build_messages
 
 
-DEFAULT_MODEL = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
-DEFAULT_MAX_TOKENS = 1200
+DEFAULT_MODEL = "mlx-community/Qwen2.5-Coder-14B-Instruct-4bit"
+DEFAULT_MAX_TOKENS = 2400
 
 _MODEL = None
 _TOKENIZER = None
