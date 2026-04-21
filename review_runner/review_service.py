@@ -1250,6 +1250,21 @@ def validate_mlx_output(
     )
 
 
+def extract_model_name_from_result(mlx_result: dict[str, Any]) -> str | None:
+    """_meta 가 dict 가 아니거나 model_name 이 문자열이 아니면 안전하게 None 을 돌려준다.
+
+    커스텀 MLX 클라이언트나 예외 경로에서 _meta 가 비정상 타입으로 실려올 수 있어,
+    GitHub 리뷰 body 조립 단계에서는 사이드이펙트 없이 푸터를 생략할 수 있게 한다.
+    """
+    metadata = mlx_result.get("_meta")
+    if not isinstance(metadata, dict):
+        return None
+    model_name = metadata.get("model_name")
+    if not isinstance(model_name, str):
+        return None
+    return model_name
+
+
 def build_review_payload(
     summary: str,
     event: str,
@@ -1398,14 +1413,13 @@ def generate_review_artifacts(
     mlx_result = run_mlx(prompt, log_prefix=log_prefix)
     log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
     validated_review = validate_mlx_output(mlx_result, pr_files, log_prefix=log_prefix)
-    mlx_metadata = mlx_result.get("_meta") or {}
     payload = build_review_payload(
         validated_review.summary,
         validated_review.event,
         validated_review.comments,
         validated_review.positives,
         validated_review.concerns,
-        model_name=mlx_metadata.get("model_name"),
+        model_name=extract_model_name_from_result(mlx_result),
     )
     return ReviewGenerationArtifacts(
         prompt=prompt,

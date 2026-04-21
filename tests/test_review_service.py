@@ -358,6 +358,34 @@ def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> 
     return completed
 
 
+class ExtractModelNameFromResultTests(unittest.TestCase):
+    def test_returns_model_name_when_meta_is_dict_with_string_value(self) -> None:
+        result = {"_meta": {"model_name": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"}}
+        self.assertEqual(
+            review_service.extract_model_name_from_result(result),
+            "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+        )
+
+    def test_returns_none_when_meta_is_missing(self) -> None:
+        self.assertIsNone(review_service.extract_model_name_from_result({}))
+
+    def test_returns_none_when_meta_is_not_dict(self) -> None:
+        # 커스텀 클라이언트가 _meta 에 문자열/리스트를 실어 보내도 AttributeError 없이 None 을 돌려줘야 한다.
+        for bad_meta in ("some string", ["list"], 42, True):
+            with self.subTest(bad_meta=bad_meta):
+                self.assertIsNone(
+                    review_service.extract_model_name_from_result({"_meta": bad_meta})
+                )
+
+    def test_returns_none_when_model_name_value_is_non_string(self) -> None:
+        self.assertIsNone(
+            review_service.extract_model_name_from_result({"_meta": {"model_name": None}})
+        )
+        self.assertIsNone(
+            review_service.extract_model_name_from_result({"_meta": {"model_name": 123}})
+        )
+
+
 class BuildReviewPayloadTests(unittest.TestCase):
     def test_body_appends_model_name_footer_when_provided(self) -> None:
         payload = review_service.build_review_payload(
