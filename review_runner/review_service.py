@@ -1256,6 +1256,8 @@ def build_review_payload(
     comments: list[ReviewComment],
     positives: list[str],
     concerns: list[str],
+    *,
+    model_name: str | None = None,
 ) -> dict[str, Any]:
     """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다."""
     positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
@@ -1284,6 +1286,17 @@ def build_review_payload(
         body_lines.append(f"- 자동 리뷰에서 {len(comments)}개의 라인 단위 개선 사항을 남겼습니다.")
     else:
         body_lines.append("- 라인 단위로 남길 개선 사항은 발견되지 않았습니다.")
+
+    # 어떤 모델 구성이 이 리뷰를 생성했는지 추적하기 위한 푸터. 모델 정보가 없는 경우는 생략.
+    normalized_model_name = normalize_text(model_name) if model_name else ""
+    if normalized_model_name:
+        body_lines.extend(
+            [
+                "",
+                "---",
+                f"<sub>사용된 모델: {normalized_model_name}</sub>",
+            ]
+        )
 
     return {
         "body": "\n".join(body_lines),
@@ -1385,12 +1398,14 @@ def generate_review_artifacts(
     mlx_result = run_mlx(prompt, log_prefix=log_prefix)
     log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
     validated_review = validate_mlx_output(mlx_result, pr_files, log_prefix=log_prefix)
+    mlx_metadata = mlx_result.get("_meta") or {}
     payload = build_review_payload(
         validated_review.summary,
         validated_review.event,
         validated_review.comments,
         validated_review.positives,
         validated_review.concerns,
+        model_name=mlx_metadata.get("model_name"),
     )
     return ReviewGenerationArtifacts(
         prompt=prompt,

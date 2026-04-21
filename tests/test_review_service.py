@@ -358,5 +358,54 @@ def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> 
     return completed
 
 
+class BuildReviewPayloadTests(unittest.TestCase):
+    def test_body_appends_model_name_footer_when_provided(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[],
+            positives=["좋은 점"],
+            concerns=[],
+            model_name="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+        )
+
+        body = payload["body"]
+        self.assertIn("---", body)
+        self.assertIn(
+            "<sub>사용된 모델: mlx-community/Qwen2.5-Coder-7B-Instruct-4bit</sub>",
+            body,
+        )
+        # 푸터는 본문 가장 마지막에 위치해야 추적용 메타 정보가 리뷰 하단에 노출된다.
+        self.assertTrue(
+            body.rstrip().endswith(
+                "<sub>사용된 모델: mlx-community/Qwen2.5-Coder-7B-Instruct-4bit</sub>"
+            )
+        )
+
+    def test_body_omits_model_name_footer_when_absent(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[],
+            positives=["좋은 점"],
+            concerns=[],
+        )
+
+        self.assertNotIn("사용된 모델", payload["body"])
+
+    def test_body_omits_model_name_footer_for_blank_value(self) -> None:
+        # mock 리뷰 클라이언트 등에서 _meta 에 빈 문자열이 들어와도 푸터 라인은 추가되면 안 된다.
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[],
+            positives=["좋은 점"],
+            concerns=[],
+            model_name="   ",
+        )
+
+        self.assertNotIn("사용된 모델", payload["body"])
+
+
 if __name__ == "__main__":
     unittest.main()
