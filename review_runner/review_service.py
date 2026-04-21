@@ -101,6 +101,50 @@ PROMPT_ECHO_MARKERS = (
     "style-only",
     "praise-only",
 )
+# diff 가 수행한 구조 변경을 사실 서술로만 적은 concern 을 걸러내기 위한 어미 목록.
+# concern 은 '문제 진술' 이어야 하고 '~되었습니다' 류 narration 은 문제가 아니라 변경 요약이다.
+DESCRIPTIVE_NARRATION_SUFFIXES = (
+    "추가되었습니다",
+    "변경되었습니다",
+    "수정되었습니다",
+    "도입되었습니다",
+    "교체되었습니다",
+    "삭제되었습니다",
+    "제거되었습니다",
+    "업데이트되었습니다",
+    "생성되었습니다",
+    "갱신되었습니다",
+    "반영되었습니다",
+    "작성되었습니다",
+    "적용되었습니다",
+    "이동되었습니다",
+    "전환되었습니다",
+    "개편되었습니다",
+    "번역되었습니다",
+)
+# 위 서술형 어미가 있어도 문장 어디든 아래 위험 신호가 있으면 실제 concern 일 가능성이 높다.
+CONCERN_RISK_MARKERS = (
+    "위험",
+    "누락",
+    "문제",
+    "실패",
+    "버그",
+    "주의",
+    "우려",
+    "필요",
+    "부족",
+    "우회",
+    "취약",
+    "오류",
+    "에러",
+    "결함",
+    "크래시",
+    "미흡",
+    "빠져",
+    "놓치",
+    "깨짐",
+    "깨지",
+)
 
 _MLX_RUN_LOCK = threading.Lock()
 
@@ -191,6 +235,7 @@ def sanitize_text_items(items: list[str], max_items: int = 5) -> list[str]:
             or looks_like_identifier_localization_comment(text)
             or looks_like_generic_model_change_comment(text)
             or looks_like_process_policy_comment(text)
+            or looks_like_descriptive_change_narration(text)
         ):
             continue
         seen.add(text)
@@ -243,6 +288,9 @@ def looks_like_praise_only_comment(text: str) -> bool:
         return True
 
     if looks_like_generic_positive(normalized):
+        return True
+
+    if looks_like_descriptive_change_narration(normalized):
         return True
 
     lowered = normalized.lower()
@@ -844,6 +892,26 @@ def looks_like_process_policy_comment(text: str) -> bool:
     if not normalized:
         return False
     return any(marker in normalized for marker in PROCESS_POLICY_MARKERS)
+
+
+def looks_like_descriptive_change_narration(text: str) -> bool:
+    """diff 가 수행한 구조 변경을 사실 서술로만 적은 concern 을 식별한다.
+
+    '~추가되었습니다', '~변경되었습니다' 처럼 서술형 어미로 끝나는 문장은 기본적으로
+    concern 이 아니라 변경 요약이다. 다만 같은 문장/문단 안에 '위험', '누락' 같은
+    위험 신호가 하나라도 있으면 실제 문제 지적일 수 있으므로 제외한다.
+    """
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+
+    # MLX 출력은 주로 '.' 로 끝나지만 간혹 !/?/~/。 가 섞여 나오니 말미 구두점을 일괄 제거한다.
+    stripped = normalized.rstrip(" .!?~。")
+    # str.endswith 는 suffix 튜플을 그대로 받아 C 레벨에서 매칭하므로 제너레이터보다 간결하고 빠르다.
+    if not stripped.endswith(DESCRIPTIVE_NARRATION_SUFFIXES):
+        return False
+
+    return not any(marker in normalized for marker in CONCERN_RISK_MARKERS)
 
 
 def looks_like_positive_only_concern(text: str) -> bool:

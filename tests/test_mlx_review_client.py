@@ -73,6 +73,8 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("Prefer returning an empty concerns array over padding it with restated diff content.", system_prompt)
         self.assertIn("The same restriction applies to line comments in comments[].body", system_prompt)
         self.assertIn("MLX_MODEL value was changed", system_prompt)
+        self.assertIn("Do not put structural changes the diff performs", system_prompt)
+        self.assertIn("Concerns must be stated as problems, not as facts.", system_prompt)
         self.assertIn("Do not turn repository process rules into code review findings.", system_prompt)
         self.assertIn("Do not ask to rename internal variable names", system_prompt)
         self.assertIn("Good positives follow this pattern: changed construct -> technical role -> concrete effect", system_prompt)
@@ -92,6 +94,9 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("concerns 가 비어 있어도 됩니다", user_prompt)
         self.assertIn("라인 코멘트(comments[].body) 에도 diff 가 이미 수행한 변경을 재진술하지 마세요", user_prompt)
         self.assertIn("'MLX_MODEL 값을 변경했습니다'", user_prompt)
+        self.assertIn("concerns 에 diff 가 수행한 구조적 변경", user_prompt)
+        self.assertIn("'주석이 한국어로 수정되었습니다'", user_prompt)
+        self.assertIn("'~되었습니다' 로 끝나는 사실 서술", user_prompt)
         self.assertIn("내부 변수명, 상수명, 클래스명, 함수명을 영어에서 한국어로 바꾸라고 요구하지 마세요.", user_prompt)
 
 
