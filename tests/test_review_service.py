@@ -358,6 +358,68 @@ def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> 
     return completed
 
 
+class DescriptiveChangeNarrationTests(unittest.TestCase):
+    def test_filters_narration_ending_without_risk_marker(self) -> None:
+        # 실제 관측된 저신호 concern 패턴. 모두 filter 되어야 한다.
+        cases = (
+            "nginx-gemini-review.conf 파일의 주석이 한국어로 수정되었습니다.",
+            "scripts/local_review_env.example.sh 파일의 주석이 한국어로 수정되었습니다.",
+            "새로운 테스트 파일이 추가되었습니다.",
+            "diff_right_lines 필드의 타입이 MappingProxyType 으로 변경되었습니다.",
+            "헬퍼 함수가 도입되었습니다.",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertTrue(
+                    review_service.looks_like_descriptive_change_narration(text),
+                    msg=f"expected narration filter to match: {text!r}",
+                )
+
+    def test_keeps_concern_with_risk_marker_even_if_suffix_matches(self) -> None:
+        # 서술형 어미여도 위험 신호가 있으면 실제 concern 일 수 있으므로 유지.
+        cases = (
+            "테스트가 누락되었습니다.",
+            "signature 검증이 제거되었습니다. 인증 우회 위험이 있습니다.",
+            "입력 검증 로직이 삭제되었습니다. 취약점이 생겼습니다.",
+            "필수 가드가 제거되었습니다. 주의가 필요합니다.",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertFalse(
+                    review_service.looks_like_descriptive_change_narration(text),
+                    msg=f"filter should have kept this concern: {text!r}",
+                )
+
+    def test_keeps_problem_statement_concerns(self) -> None:
+        # '~되었습니다' 어미가 아니라 문제 진술형 concern 은 항상 유지.
+        cases = (
+            "SQL 인젝션 공격에 취약합니다.",
+            "인증 토큰이 로그로 유출될 수 있습니다.",
+            "회귀 테스트가 필요합니다.",
+            "",
+            "   ",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertFalse(
+                    review_service.looks_like_descriptive_change_narration(text),
+                    msg=f"filter should not have matched: {text!r}",
+                )
+
+    def test_sanitize_text_items_drops_narration_concerns(self) -> None:
+        items = [
+            "nginx-gemini-review.conf 파일의 주석이 한국어로 수정되었습니다.",
+            "signature 검증이 제거되었습니다. 인증 우회 위험이 있습니다.",
+            "새로운 테스트 파일이 추가되었습니다.",
+        ]
+        sanitized = review_service.sanitize_text_items(items)
+        # 서술형 2건은 drop, 위험 신호가 있는 concern 1건만 남아야 한다.
+        self.assertEqual(
+            sanitized,
+            ["signature 검증이 제거되었습니다. 인증 우회 위험이 있습니다."],
+        )
+
+
 class ExtractModelNameFromResultTests(unittest.TestCase):
     def test_returns_model_name_when_meta_is_dict_with_string_value(self) -> None:
         result = {"_meta": {"model_name": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"}}
