@@ -190,7 +190,9 @@ def review_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raw_output,
         max_findings=get_env_int("MLX_MAX_FINDINGS", DEFAULT_MAX_FINDINGS),
     )
-    # 내부 파이프라인에서만 쓰는 진단 정보라 GitHub payload 생성 단계에서 무시된다.
+    # 어떤 모델 구성으로 리뷰가 생성됐는지 GitHub 리뷰 푸터에 노출하기 위해 기록한다.
+    metadata["model_name"] = get_model_name()
+    # 진단 정보는 GitHub payload 조립 단계에서 model_name 만 읽고 나머지는 로그로만 쓴다.
     normalized_response["_meta"] = metadata
     return normalized_response
 

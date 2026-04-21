@@ -1250,12 +1250,29 @@ def validate_mlx_output(
     )
 
 
+def extract_model_name_from_result(mlx_result: dict[str, Any]) -> str | None:
+    """_meta 가 dict 가 아니거나 model_name 이 문자열이 아니면 안전하게 None 을 돌려준다.
+
+    커스텀 MLX 클라이언트나 예외 경로에서 _meta 가 비정상 타입으로 실려올 수 있어,
+    GitHub 리뷰 body 조립 단계에서는 사이드이펙트 없이 푸터를 생략할 수 있게 한다.
+    """
+    metadata = mlx_result.get("_meta")
+    if not isinstance(metadata, dict):
+        return None
+    model_name = metadata.get("model_name")
+    if not isinstance(model_name, str):
+        return None
+    return model_name
+
+
 def build_review_payload(
     summary: str,
     event: str,
     comments: list[ReviewComment],
     positives: list[str],
     concerns: list[str],
+    *,
+    model_name: str | None = None,
 ) -> dict[str, Any]:
     """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다."""
     positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
@@ -1284,6 +1301,18 @@ def build_review_payload(
         body_lines.append(f"- 자동 리뷰에서 {len(comments)}개의 라인 단위 개선 사항을 남겼습니다.")
     else:
         body_lines.append("- 라인 단위로 남길 개선 사항은 발견되지 않았습니다.")
+
+    # 어떤 모델 구성이 이 리뷰를 생성했는지 추적하기 위한 푸터. 모델 정보가 없는 경우는 생략.
+    # normalize_text 는 None, 빈 문자열, 공백만 있는 값을 모두 "" 로 정규화하므로 별도 가드가 필요 없다.
+    normalized_model_name = normalize_text(model_name)
+    if normalized_model_name:
+        body_lines.extend(
+            [
+                "",
+                "---",
+                f"<sub>사용된 모델: {normalized_model_name}</sub>",
+            ]
+        )
 
     return {
         "body": "\n".join(body_lines),
@@ -1391,6 +1420,7 @@ def generate_review_artifacts(
         validated_review.comments,
         validated_review.positives,
         validated_review.concerns,
+        model_name=extract_model_name_from_result(mlx_result),
     )
     return ReviewGenerationArtifacts(
         prompt=prompt,
