@@ -69,6 +69,10 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("Good summaries follow this pattern: problem or motivation -> change -> expected effect", system_prompt)
         self.assertIn("When writing positives, explain the technical reason", system_prompt)
         self.assertIn("Do not place praise, strengths, or neutral observations inside concerns.", system_prompt)
+        self.assertIn("Never restate, paraphrase, or rephrase text that the diff itself introduces", system_prompt)
+        self.assertIn("Prefer returning an empty concerns array over padding it with restated diff content.", system_prompt)
+        self.assertIn("The same restriction applies to line comments in comments[].body", system_prompt)
+        self.assertIn("MLX_MODEL value was changed", system_prompt)
         self.assertIn("Do not turn repository process rules into code review findings.", system_prompt)
         self.assertIn("Do not ask to rename internal variable names", system_prompt)
         self.assertIn("Good positives follow this pattern: changed construct -> technical role -> concrete effect", system_prompt)
@@ -83,6 +87,11 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("types.ModuleType", user_prompt)
         self.assertIn("sys.modules", user_prompt)
         self.assertIn("concerns 에는 실제 문제, 위험, 누락된 검증이나 테스트만 적고", user_prompt)
+        self.assertIn("diff 의 + 라인에서 새로 추가된 주석, docstring, TODO 문구", user_prompt)
+        self.assertIn("# 환율은 전용 스케줄러가 갱신한다", user_prompt)
+        self.assertIn("concerns 가 비어 있어도 됩니다", user_prompt)
+        self.assertIn("라인 코멘트(comments[].body) 에도 diff 가 이미 수행한 변경을 재진술하지 마세요", user_prompt)
+        self.assertIn("'MLX_MODEL 값을 변경했습니다'", user_prompt)
         self.assertIn("내부 변수명, 상수명, 클래스명, 함수명을 영어에서 한국어로 바꾸라고 요구하지 마세요.", user_prompt)
 
 

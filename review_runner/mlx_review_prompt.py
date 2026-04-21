@@ -38,6 +38,8 @@ SYSTEM_PROMPT_RULES = (
     "Good positives follow this pattern: changed construct -> technical role -> concrete effect in this diff.",
     "Concerns must only describe actionable risks, bugs, regressions, or missing validation/tests that are directly visible in the diff.",
     "Do not place praise, strengths, or neutral observations inside concerns. If there is no real issue, return an empty concerns array.",
+    "Never restate, paraphrase, or rephrase text that the diff itself introduces - including newly added comments, docstrings, TODO lines, or help strings - as a concern. The author's own added explanation is not a concern by itself.",
+    "A valid concern must describe a bug, regression, missing validation, missing test, security risk, or public-contract break that the diff has NOT already handled. Prefer returning an empty concerns array over padding it with restated diff content.",
     "Do not turn repository process rules into code review findings. PR title language, PR description style, commit message style, or AGENTS.md instructions are not code issues by themselves.",
     "When a diff changes documentation, prompts, or agent instructions, review the technical behavior they affect. Do not simply restate the new rule as a concern.",
     "Do not ask to rename internal variable names, constant names, class names, or function names from English to Korean.",
@@ -46,6 +48,7 @@ SYSTEM_PROMPT_RULES = (
     "Do not flag an MLX_MODEL value change by itself unless the diff also shows a concrete compatibility, availability, memory, or rollout risk.",
     "If you are about to answer in English, stop and rewrite the entire JSON in Korean before responding.",
     "Do not write praise-only line comments.",
+    "The same restriction applies to line comments in comments[].body: do not write a line comment that merely narrates what the diff already does (for example 'MLX_MODEL value was changed' or 'an import was added'). Line comments must describe a concrete bug, risk, or required follow-up on that line; if there is none, omit the comment.",
 )
 
 USER_PROMPT_RULES = (
@@ -66,6 +69,10 @@ USER_PROMPT_RULES = (
     "예를 들어 dataclass는 필드 정의를 중심으로 __init__, __repr__, __eq__ 같은 메서드를 자동 생성해 데이터 컨테이너의 계약을 더 분명하게 만드는 도구라는 점까지 설명할 수 있습니다.",
     "예를 들어 types.ModuleType 으로 apscheduler.triggers.cron 같은 모듈을 만들어 sys.modules 에 주입했다면, 실제 외부 의존성 없이 import 경로를 흉내 내 테스트를 격리하고 실패 지점을 줄인다는 점까지 설명하세요.",
     "concerns 에는 실제 문제, 위험, 누락된 검증이나 테스트만 적고, 칭찬이나 중립 설명은 넣지 마세요.",
+    "diff 의 + 라인에서 새로 추가된 주석, docstring, TODO 문구, 도움말 문자열을 그대로 옮기거나 살짝 바꿔서 concerns 에 넣지 마세요. 저자가 설명을 덧붙였다는 사실 자체는 지적거리가 아닙니다.",
+    "예를 들어 + 라인에 '# 환율은 전용 스케줄러가 갱신한다' 같은 설명 주석이 추가됐다고 해서 그 내용을 'FX lookup 은 스케줄러 캐시만 사용해야 한다' 처럼 concerns 로 되돌려 쓰면 안 됩니다. 저자가 이미 반영한 내용을 재진술하는 concern 은 금지입니다.",
+    "concerns 가 비어 있어도 됩니다. 억지로 채우지 말고, diff 가 아직 해결하지 못한 실제 문제만 남기세요.",
+    "라인 코멘트(comments[].body) 에도 diff 가 이미 수행한 변경을 재진술하지 마세요. 예: 'MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다', '주석을 추가했습니다' 같은 변경 설명형 라인 코멘트는 금지입니다. 해당 라인에 구체적인 버그, 위험, 또는 후속 조치가 없다면 그 라인 코멘트는 생략하세요.",
     "PR 제목/description 언어, 커밋 메시지 스타일, AGENTS.md 작업 규칙 자체를 코드 리뷰 concern 으로 적지 마세요.",
     "문서나 프롬프트 파일이 바뀐 경우에도 새 규칙을 그대로 반복하지 말고, 그 변경이 실제 리뷰 품질이나 동작에 어떤 영향을 주는지 있을 때만 지적하세요.",
     "내부 변수명, 상수명, 클래스명, 함수명을 영어에서 한국어로 바꾸라고 요구하지 마세요.",
