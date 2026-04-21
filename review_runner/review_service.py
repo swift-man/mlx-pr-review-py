@@ -1303,7 +1303,8 @@ def build_review_payload(
         body_lines.append("- 라인 단위로 남길 개선 사항은 발견되지 않았습니다.")
 
     # 어떤 모델 구성이 이 리뷰를 생성했는지 추적하기 위한 푸터. 모델 정보가 없는 경우는 생략.
-    normalized_model_name = normalize_text(model_name) if model_name else ""
+    # normalize_text 는 None, 빈 문자열, 공백만 있는 값을 모두 "" 로 정규화하므로 별도 가드가 필요 없다.
+    normalized_model_name = normalize_text(model_name)
     if normalized_model_name:
         body_lines.extend(
             [
