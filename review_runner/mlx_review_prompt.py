@@ -48,6 +48,7 @@ SYSTEM_PROMPT_RULES = (
     "Do not flag an MLX_MODEL value change by itself unless the diff also shows a concrete compatibility, availability, memory, or rollout risk.",
     "If you are about to answer in English, stop and rewrite the entire JSON in Korean before responding.",
     "Do not write praise-only line comments.",
+    "The same restriction applies to line comments in comments[].body: do not write a line comment that merely narrates what the diff already does (for example 'MLX_MODEL value was changed' or 'an import was added'). Line comments must describe a concrete bug, risk, or required follow-up on that line; if there is none, omit the comment.",
 )
 
 USER_PROMPT_RULES = (
@@ -71,6 +72,7 @@ USER_PROMPT_RULES = (
     "diff 의 + 라인에서 새로 추가된 주석, docstring, TODO 문구, 도움말 문자열을 그대로 옮기거나 살짝 바꿔서 concerns 에 넣지 마세요. 저자가 설명을 덧붙였다는 사실 자체는 지적거리가 아닙니다.",
     "예를 들어 + 라인에 '# 환율은 전용 스케줄러가 갱신한다' 같은 설명 주석이 추가됐다고 해서 그 내용을 'FX lookup 은 스케줄러 캐시만 사용해야 한다' 처럼 concerns 로 되돌려 쓰면 안 됩니다. 저자가 이미 반영한 내용을 재진술하는 concern 은 금지입니다.",
     "concerns 가 비어 있어도 됩니다. 억지로 채우지 말고, diff 가 아직 해결하지 못한 실제 문제만 남기세요.",
+    "라인 코멘트(comments[].body) 에도 diff 가 이미 수행한 변경을 재진술하지 마세요. 예: 'MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다', '주석을 추가했습니다' 같은 변경 설명형 라인 코멘트는 금지입니다. 해당 라인에 구체적인 버그, 위험, 또는 후속 조치가 없다면 그 라인 코멘트는 생략하세요.",
     "PR 제목/description 언어, 커밋 메시지 스타일, AGENTS.md 작업 규칙 자체를 코드 리뷰 concern 으로 적지 마세요.",
     "문서나 프롬프트 파일이 바뀐 경우에도 새 규칙을 그대로 반복하지 말고, 그 변경이 실제 리뷰 품질이나 동작에 어떤 영향을 주는지 있을 때만 지적하세요.",
     "내부 변수명, 상수명, 클래스명, 함수명을 영어에서 한국어로 바꾸라고 요구하지 마세요.",
