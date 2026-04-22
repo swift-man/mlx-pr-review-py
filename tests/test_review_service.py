@@ -435,6 +435,35 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         self.assertEqual(validated.suggestions, [])
         self.assertEqual(validated.event, "REQUEST_CHANGES")
 
+    def test_direct_must_fix_and_suggestions_fields_pass_through_without_legacy_path(self) -> None:
+        # 모델이 새 스키마를 이미 따르는 경우 legacy_concerns 경로를 타지 않고 그대로
+        # 두 필드에 실려야 한다. split_legacy_concerns 의 risk marker 분배가 덮어쓰지
+        # 않는지도 함께 확인한다 (suggestions 에 위험 마커가 있어도 강제 승격 없음).
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "로직을 정리했습니다.",
+                "event": "COMMENT",
+                "positives": ["캐시 경로를 한곳으로 모아 의도가 드러납니다."],
+                "must_fix": ["signature 검증이 비활성화돼 인증 우회 위험이 있습니다."],
+                "suggestions": ["네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다."],
+                "comments": [],
+                # 구 필드는 비어 있어 legacy 경로는 탈 일이 없다.
+                "concerns": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertIn(
+            "signature 검증이 비활성화돼 인증 우회 위험이 있습니다.",
+            validated.must_fix,
+        )
+        self.assertIn(
+            "네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+            validated.suggestions,
+        )
+        # must_fix 가 실제로 있으므로 event 는 REQUEST_CHANGES 로 강제된다.
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
     def test_legacy_concerns_without_risk_marker_are_routed_to_suggestions(self) -> None:
         # 위험 신호 없는 legacy concern 은 suggestions 로 가고, must_fix 가 비어 있으므로
         # event 는 COMMENT 로 다운그레이드되어야 한다.

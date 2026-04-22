@@ -82,6 +82,14 @@ NO_CONCERN_TEXTS = {
     "별도 개선 필요 사항은 발견되지 않았습니다.",
     "개선이 필요한 점은 발견되지 않았습니다.",
     "개선이 필요한 점은 없습니다.",
+    # Phase 2 새 라벨('반드시 수정할 사항' / '권장 개선사항') 에 맞춰 모델이 생성할 법한
+    # 플레이스홀더 문구도 함께 차단한다. 새 프롬프트는 빈 배열을 권장하지만,
+    # 모델이 습관적으로 '~없습니다' 문장을 채워 넣는 경우를 안전망으로 거른다.
+    "반드시 수정할 사항은 없습니다.",
+    "반드시 수정할 사항은 발견되지 않았습니다.",
+    "권장 개선사항은 없습니다.",
+    "권장 개선사항은 발견되지 않았습니다.",
+    "수정이 필요한 항목은 없습니다.",
 }
 COMMON_TYPO_FIXES = {
     ("sta", "uts"): "status",
@@ -1281,12 +1289,17 @@ def collect_validated_comments(
     return comments, stats
 
 
-def decide_review_event(raw_event: Any, *, has_findings: bool) -> str:
-    """모델 event가 어색해도 최종 리뷰 이벤트를 일관되게 정한다."""
+def decide_review_event(raw_event: Any, *, should_request_changes: bool) -> str:
+    """모델이 event 를 어떻게 보냈든 최종 리뷰 이벤트를 일관되게 정한다.
+
+    should_request_changes 가 True 이면 REQUEST_CHANGES 로 강제한다. 호출부에서
+    must_fix 존재 여부 같은 '차단성 있는 findings' 만 이 값에 반영해야 한다.
+    suggestions 만 있는 경우는 False 를 전달해 COMMENT 로 내려가게 한다.
+    """
     event = normalize_text(raw_event).upper()
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
-        return "REQUEST_CHANGES" if has_findings else "COMMENT"
-    if has_findings:
+        return "REQUEST_CHANGES" if should_request_changes else "COMMENT"
+    if should_request_changes:
         return "REQUEST_CHANGES"
     return "COMMENT"
 
@@ -1339,10 +1352,12 @@ def validate_mlx_output(
     comment_summaries = summarize_comment_bodies(comments, max_items=3)
     must_fix = merge_distinct_items(must_fix, comment_summaries, max_items=5)
 
-    has_must_fix = bool(comments or must_fix)
+    # 차단성 항목(must_fix 또는 라인 코멘트) 이 있어야만 REQUEST_CHANGES 로 승격한다.
+    # 단순 권장사항만 있는 경우는 COMMENT 로 남겨 저자가 차단감을 느끼지 않도록 한다.
+    should_request_changes = bool(comments or must_fix)
+    # summary 재작성 등은 '뭐라도 남길 내용이 있는지' 로 판단하므로 has_findings 는 별도.
     has_findings = bool(comments or must_fix or suggestions)
-    # REQUEST_CHANGES 는 must_fix 가 있을 때만. suggestions 만 있으면 COMMENT.
-    event = decide_review_event(result.get("event"), has_findings=has_must_fix)
+    event = decide_review_event(result.get("event"), should_request_changes=should_request_changes)
 
     if not has_findings:
         summary = sanitize_summary(summary, has_findings=False)
