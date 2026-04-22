@@ -82,6 +82,14 @@ NO_CONCERN_TEXTS = {
     "별도 개선 필요 사항은 발견되지 않았습니다.",
     "개선이 필요한 점은 발견되지 않았습니다.",
     "개선이 필요한 점은 없습니다.",
+    # Phase 2 새 라벨('반드시 수정할 사항' / '권장 개선사항') 에 맞춰 모델이 생성할 법한
+    # 플레이스홀더 문구도 함께 차단한다. 새 프롬프트는 빈 배열을 권장하지만,
+    # 모델이 습관적으로 '~없습니다' 문장을 채워 넣는 경우를 안전망으로 거른다.
+    "반드시 수정할 사항은 없습니다.",
+    "반드시 수정할 사항은 발견되지 않았습니다.",
+    "권장 개선사항은 없습니다.",
+    "권장 개선사항은 발견되지 않았습니다.",
+    "수정이 필요한 항목은 없습니다.",
 }
 COMMON_TYPO_FIXES = {
     ("sta", "uts"): "status",
@@ -488,11 +496,52 @@ def resolve_github_token(repository: str | None = None, api_url: str = DEFAULT_A
     )
 
 
+SEVERITY_CRITICAL = "Critical"
+SEVERITY_MAJOR = "Major"
+SEVERITY_MINOR = "Minor"
+SEVERITY_SUGGESTION = "Suggestion"
+ALL_SEVERITIES = (SEVERITY_CRITICAL, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
+# Critical / Major 는 머지 전 반드시 봐야 하는 차단성 등급이라 event 를 REQUEST_CHANGES
+# 로 승격시킨다. Minor / Suggestion 은 개선 제안이라 COMMENT 로 남는다.
+BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_MAJOR})
+
+
+def normalize_severity(value: Any) -> str:
+    """모델이 실어 보낸 severity 값을 정규화된 4단계 중 하나로 변환한다.
+
+    대소문자와 앞뒤 공백을 무시하고, 코드 리뷰 관용어(blocker/high/low/nit 등)도
+    가까운 등급으로 매핑한다. 인식 불가이거나 누락된 경우 Minor 로 폴백해 잘못된
+    Critical 승격을 막는다.
+    """
+    if not isinstance(value, str):
+        return SEVERITY_MINOR
+    cleaned = value.strip().lower()
+    mapping = {
+        # 공식 4단계
+        "critical": SEVERITY_CRITICAL,
+        "major": SEVERITY_MAJOR,
+        "minor": SEVERITY_MINOR,
+        "suggestion": SEVERITY_SUGGESTION,
+        # 관용어 동의어 — 모델이 학습 데이터에서 흡수한 대체 표현들을 안전하게 흡수한다.
+        "blocker": SEVERITY_CRITICAL,
+        "severe": SEVERITY_CRITICAL,
+        "high": SEVERITY_MAJOR,
+        "medium": SEVERITY_MINOR,
+        "moderate": SEVERITY_MINOR,
+        "low": SEVERITY_SUGGESTION,
+        "nit": SEVERITY_SUGGESTION,
+        "nitpick": SEVERITY_SUGGESTION,
+        "optional": SEVERITY_SUGGESTION,
+    }
+    return mapping.get(cleaned, SEVERITY_MINOR)
+
+
 @dataclass
 class ReviewComment:
     path: str
     line: int
     body: str
+    severity: str = SEVERITY_MINOR
     side: str = "RIGHT"
 
 
@@ -508,13 +557,20 @@ class PullRequestFile:
 
 @dataclass
 class ValidatedReview:
-    """모델 출력과 규칙 기반 검사를 합쳐서 정규화한 리뷰 결과다."""
+    """모델 출력과 규칙 기반 검사를 합쳐서 정규화한 리뷰 결과다.
+
+    must_fix: 버그·보안·누락 등 머지 전 반드시 고쳐야 하는 항목. 비어 있지 않으면
+              event 는 REQUEST_CHANGES 로 강제된다.
+    suggestions: 권장 개선 (nice-to-have). 있어도 REQUEST_CHANGES 는 아니다.
+    positives: 이 PR 이 개선한 기술적 효과.
+    """
 
     comments: list[ReviewComment]
     summary: str
     event: str
     positives: list[str]
-    concerns: list[str]
+    must_fix: list[str]
+    suggestions: list[str]
 
 
 @dataclass
@@ -738,6 +794,7 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                                 "서명 헤더가 없을 때 바로 반환하면 서명 검증이 건너뛰어져 위조된 웹훅도 처리될 수 있습니다. "
                                 "누락된 서명은 401로 거부하도록 유지하세요."
                             ),
+                            severity=SEVERITY_CRITICAL,
                         )
                     )
                 elif re.search(r"if\s+not\s+.*signature.*:\s*return\b", stripped, re.IGNORECASE) or re.search(
@@ -753,6 +810,7 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                                 "서명 값이 없을 때 요청을 통과시키고 있어 인증되지 않은 웹훅을 받아들이게 됩니다. "
                                 "서명 누락이나 불일치는 예외를 발생시켜 요청을 거부해야 합니다."
                             ),
+                            severity=SEVERITY_CRITICAL,
                         )
                     )
             previous_visible_line = stripped
@@ -792,6 +850,7 @@ def detect_secret_logging(pr_file: PullRequestFile) -> list[ReviewComment]:
             path=pr_file.filename,
             line=first_match_line,
             body=body,
+            severity=SEVERITY_CRITICAL,
         )
     ]
 
@@ -815,6 +874,7 @@ def detect_contract_typos(pr_file: PullRequestFile) -> list[ReviewComment]:
                         f"`{typo}` 오타 때문에 기존 계약에서 기대하는 `{expected}` 키나 헤더를 찾지 못해 호출 흐름이 깨질 수 있습니다. "
                         f"공개 응답 필드와 GitHub 헤더 이름은 `{expected}`로 정확히 유지하세요."
                     ),
+                    severity=SEVERITY_MAJOR,
                 )
             )
             break
@@ -1259,7 +1319,10 @@ def collect_validated_comments(
             increment_reason(stats.dropped_model_comment_reasons, "duplicate_model_comment")
             continue
         seen_comment_keys.add(key)
-        comments.append(ReviewComment(path=path, line=line, body=body))
+        # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
+        # 잘못된 Critical 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
+        severity = normalize_severity(raw.get("severity"))
+        comments.append(ReviewComment(path=path, line=line, body=body, severity=severity))
         stats.accepted_model_comments += 1
 
     for comment in detect_rule_based_comments(files):
@@ -1274,14 +1337,35 @@ def collect_validated_comments(
     return comments, stats
 
 
-def decide_review_event(raw_event: Any, *, has_findings: bool) -> str:
-    """모델 event가 어색해도 최종 리뷰 이벤트를 일관되게 정한다."""
+def decide_review_event(raw_event: Any, *, should_request_changes: bool) -> str:
+    """모델이 event 를 어떻게 보냈든 최종 리뷰 이벤트를 일관되게 정한다.
+
+    should_request_changes 가 True 이면 REQUEST_CHANGES 로 강제한다. 호출부에서
+    must_fix 존재 여부 같은 '차단성 있는 findings' 만 이 값에 반영해야 한다.
+    suggestions 만 있는 경우는 False 를 전달해 COMMENT 로 내려가게 한다.
+    """
     event = normalize_text(raw_event).upper()
     if event not in {"COMMENT", "REQUEST_CHANGES"}:
-        return "REQUEST_CHANGES" if has_findings else "COMMENT"
-    if has_findings:
+        return "REQUEST_CHANGES" if should_request_changes else "COMMENT"
+    if should_request_changes:
         return "REQUEST_CHANGES"
     return "COMMENT"
+
+
+def split_legacy_concerns(items: list[str]) -> tuple[list[str], list[str]]:
+    """구 스키마의 concerns 를 CONCERN_RISK_MARKERS 포함 여부로 나눈다.
+
+    위험 신호(위험/누락/취약/에러 등)가 있으면 must_fix, 없으면 suggestions 로 흡수한다.
+    프롬프트가 새 스키마를 요구하지만 모델이 아직 따라오지 못할 때의 안전망이다.
+    """
+    must_fix: list[str] = []
+    suggestions: list[str] = []
+    for item in items:
+        if any(marker in item for marker in CONCERN_RISK_MARKERS):
+            must_fix.append(item)
+        else:
+            suggestions.append(item)
+    return must_fix, suggestions
 
 
 def validate_mlx_output(
@@ -1298,11 +1382,36 @@ def validate_mlx_output(
 
     summary = normalize_text(result.get("summary")) or "자동 리뷰를 완료했습니다."
     positives = sanitize_positive_items(normalize_text_list(result.get("positives"), max_items=10))
-    concerns = sanitize_text_items(normalize_text_list(result.get("concerns"), max_items=10))
-    comment_summaries = summarize_comment_bodies(comments, max_items=3)
-    concerns = merge_distinct_items(concerns, comment_summaries, max_items=3)
-    has_findings = bool(comments or concerns)
-    event = decide_review_event(result.get("event"), has_findings=has_findings)
+    must_fix = sanitize_text_items(normalize_text_list(result.get("must_fix"), max_items=10))
+    suggestions = sanitize_text_items(normalize_text_list(result.get("suggestions"), max_items=10))
+
+    # 파서가 '레거시 concerns' 로 흘려보낸 구 스키마 항목을 risk marker 기준으로
+    # 두 버킷에 분배한다. 새 스키마 필드가 이미 차 있으면 추가만 한다.
+    legacy_concerns = sanitize_text_items(
+        normalize_text_list(result.get("legacy_concerns") or result.get("concerns"), max_items=10)
+    )
+    if legacy_concerns:
+        extra_must_fix, extra_suggestions = split_legacy_concerns(legacy_concerns)
+        must_fix = merge_distinct_items(must_fix, extra_must_fix, max_items=10)
+        suggestions = merge_distinct_items(suggestions, extra_suggestions, max_items=10)
+
+    # 라인 코멘트 요약을 등급별로 다른 버킷에 태운다. Critical/Major 요약은 상단
+    # must_fix 에, Minor/Suggestion 요약은 suggestions 에 남겨 훑을 때 우선순위가
+    # 유지되도록 한다. 규칙 기반 감지기(서명 우회, 비밀값 로그) 는 명시적으로
+    # Critical / Major 를 붙이므로 반드시 must_fix 쪽으로 가 REQUEST_CHANGES 를 유도한다.
+    blocking_comments = [c for c in comments if c.severity in BLOCKING_SEVERITIES]
+    non_blocking_comments = [c for c in comments if c.severity not in BLOCKING_SEVERITIES]
+    must_fix_summaries = summarize_comment_bodies(blocking_comments, max_items=3)
+    suggestion_summaries = summarize_comment_bodies(non_blocking_comments, max_items=3)
+    must_fix = merge_distinct_items(must_fix, must_fix_summaries, max_items=5)
+    suggestions = merge_distinct_items(suggestions, suggestion_summaries, max_items=5)
+
+    # 차단성 신호(must_fix 또는 Critical/Major 라인 코멘트) 가 있을 때만
+    # REQUEST_CHANGES 로 승격한다. 순수 Minor/Suggestion 코멘트만 있으면 COMMENT 유지.
+    should_request_changes = bool(must_fix or blocking_comments)
+    # summary 재작성 등은 '뭐라도 남길 내용이 있는지' 로 판단하므로 has_findings 는 별도.
+    has_findings = bool(comments or must_fix or suggestions)
+    event = decide_review_event(result.get("event"), should_request_changes=should_request_changes)
 
     if not has_findings:
         summary = sanitize_summary(summary, has_findings=False)
@@ -1318,7 +1427,8 @@ def validate_mlx_output(
         summary=summary,
         event=event,
         positives=positives,
-        concerns=concerns,
+        must_fix=must_fix,
+        suggestions=suggestions,
     )
 
 
@@ -1342,33 +1452,32 @@ def build_review_payload(
     event: str,
     comments: list[ReviewComment],
     positives: list[str],
-    concerns: list[str],
+    must_fix: list[str],
+    suggestions: list[str],
     *,
     model_name: str | None = None,
 ) -> dict[str, Any]:
-    """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다."""
-    positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
-    concern_items = concerns or [DEFAULT_NO_CONCERNS_TEXT]
-    body_lines = [
-        normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY,
-        "",
-        "### 좋은 점",
-    ]
-    body_lines.extend(f"- {item}" for item in positive_items)
-    body_lines.extend(
-        [
-            "",
-            "### 개선이 필요한 점",
-        ]
-    )
-    body_lines.extend(f"- {item}" for item in concern_items)
-    body_lines.extend(
-        [
-            "",
-            "### 라인 단위 코멘트",
-        ]
-    )
+    """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다.
 
+    섹션 순서는 '반드시 수정할 사항 → 권장 개선사항 → 개선된 점' 이다. 훑을 때
+    가장 먼저 눈에 들어와야 할 차단성 항목을 상단에 둔다. 각 섹션은 내용이 있을
+    때만 출력해서 빈 bullet 플레이스홀더가 노이즈가 되지 않도록 한다.
+    """
+    body_lines: list[str] = [normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY]
+
+    if must_fix:
+        body_lines.extend(["", "### 반드시 수정할 사항"])
+        body_lines.extend(f"- {item}" for item in must_fix)
+
+    if suggestions:
+        body_lines.extend(["", "### 권장 개선사항"])
+        body_lines.extend(f"- {item}" for item in suggestions)
+
+    positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
+    body_lines.extend(["", "### 개선된 점"])
+    body_lines.extend(f"- {item}" for item in positive_items)
+
+    body_lines.extend(["", "### 라인 단위 코멘트"])
     if comments:
         body_lines.append(f"- 자동 리뷰에서 {len(comments)}개의 라인 단위 개선 사항을 남겼습니다.")
     else:
@@ -1394,7 +1503,9 @@ def build_review_payload(
                 "path": comment.path,
                 "line": comment.line,
                 "side": comment.side,
-                "body": comment.body,
+                # GitHub 라인 코멘트 본문 맨 앞에 '[Critical]' 같은 등급 태그를 붙여
+                # 훑는 사람이 심각도를 즉시 구분할 수 있게 한다.
+                "body": f"[{comment.severity}] {comment.body}",
             }
             for comment in comments
         ],
@@ -1491,7 +1602,8 @@ def generate_review_artifacts(
         validated_review.event,
         validated_review.comments,
         validated_review.positives,
-        validated_review.concerns,
+        validated_review.must_fix,
+        validated_review.suggestions,
         model_name=extract_model_name_from_result(mlx_result),
     )
     return ReviewGenerationArtifacts(

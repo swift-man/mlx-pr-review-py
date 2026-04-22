@@ -20,19 +20,27 @@ TRAILING_COMMA_RE = re.compile(r",(?=\s*[}\]])")
 BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
 UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(COMMENT|REQUEST_CHANGES)(\s*[,}])')
 SUMMARY_STOP_RE = re.compile(
-    r'(?i)(?:\bpositive(?:s)?\d*\s*:|["\']?positives["\']?\s*:|\bconcern(?:s)?\d*\s*:|["\']?concerns["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:)'
+    r'(?i)(?:\bpositive(?:s)?\d*\s*:|["\']?positives["\']?\s*:|\bconcern(?:s)?\d*\s*:|["\']?concerns["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:)'
 )
 GENERIC_FIELD_STOP_RE = re.compile(
-    r'(?i)(?:["\']?summary["\']?\s*:|["\']?event["\']?\s*:|["\']?positives["\']?\s*:|["\']?concerns["\']?\s*:|["\']?comments["\']?\s*:|\bpositive(?:s)?\d*\s*:|\bconcern(?:s)?\d*\s*:)'
+    r'(?i)(?:["\']?summary["\']?\s*:|["\']?event["\']?\s*:|["\']?positives["\']?\s*:|["\']?concerns["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|\bpositive(?:s)?\d*\s*:|\bconcern(?:s)?\d*\s*:)'
 )
 POSITIVE_ITEM_RE = re.compile(
-    r'(?is)\bpositive(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+    r'(?is)\bpositive(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
 )
 CONCERN_ITEM_RE = re.compile(
-    r'(?is)\bconcern(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+    r'(?is)\bconcern(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+)
+MUST_FIX_ITEM_RE = re.compile(
+    r'(?is)\bmust_fix\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
+)
+SUGGESTION_ITEM_RE = re.compile(
+    r'(?is)\bsuggestion(?:s)?\d*\s*:\s*(.+?)(?=(?:["\']?positive(?:s)?\d*["\']?\s*:|["\']?concern(?:s)?\d*["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:|$))'
 )
 SMART_QUOTES_TRANSLATION = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
-SECTION_HEADER_RE = re.compile(r"(?im)^\s*(positives|concerns|comments|event|response_schema)\s*:\s*$")
+SECTION_HEADER_RE = re.compile(
+    r"(?im)^\s*(positives|concerns|must_fix|suggestions|comments|event|response_schema)\s*:\s*$"
+)
 MARKDOWN_ITEM_RE = re.compile(r"(?m)^\s*-\s+(.+?)\s*$")
 HANGUL_RE = re.compile(r"[가-힣]")
 LATIN_RE = re.compile(r"[A-Za-z]")
@@ -326,11 +334,15 @@ def extract_freeform_summary(text: str) -> str:
 
 
 def fallback_response() -> dict[str, Any]:
+    # 파싱이 완전히 실패했을 때 GitHub 리뷰가 비어 보이지 않도록 최소 구조만 채운다.
+    # must_fix 와 suggestions 는 기본적으로 비어 있고 legacy_concerns 도 비워 둔다.
     return {
         "summary": DEFAULT_SUMMARY,
         "event": "COMMENT",
         "positives": list(DEFAULT_POSITIVES),
-        "concerns": [],
+        "must_fix": [],
+        "suggestions": [],
+        "legacy_concerns": [],
         "comments": [],
     }
 
@@ -360,16 +372,29 @@ def salvage_broken_output(text: str) -> dict[str, Any] | None:
     raw_summary = extract_string_field(text, "summary", SUMMARY_STOP_RE) or extract_freeform_summary(text)
     raw_event = extract_string_field(text, "event", GENERIC_FIELD_STOP_RE).upper() or extract_markdown_event(text).upper()
     positives = extract_section_items(text, "positives", POSITIVE_ITEM_RE)
-    concerns = extract_section_items(text, "concerns", CONCERN_ITEM_RE)
+    must_fix = extract_section_items(text, "must_fix", MUST_FIX_ITEM_RE)
+    suggestions = extract_section_items(text, "suggestions", SUGGESTION_ITEM_RE)
+    # 구 스키마(concerns 단일 필드)로 응답한 모델 출력도 살려낸다. 서비스 계층에서
+    # risk marker 여부로 must_fix / suggestions 로 나눠 흡수한다.
+    legacy_concerns = extract_section_items(text, "concerns", CONCERN_ITEM_RE)
     comments_raw = extract_array_field(text, "comments") or []
     comments = [item for item in comments_raw if isinstance(item, dict)]
 
     summary = sanitize_summary(raw_summary)
     positives = sanitize_items(positives)
-    concerns = sanitize_items(concerns)
+    must_fix = sanitize_items(must_fix)
+    suggestions = sanitize_items(suggestions)
+    legacy_concerns = sanitize_items(legacy_concerns)
     event = normalize_event_value(raw_event, has_comments=bool(comments))
 
-    has_meaningful_signal = bool(sanitize_korean_text(raw_summary)) or bool(positives) or bool(concerns) or bool(comments)
+    has_meaningful_signal = (
+        bool(sanitize_korean_text(raw_summary))
+        or bool(positives)
+        or bool(must_fix)
+        or bool(suggestions)
+        or bool(legacy_concerns)
+        or bool(comments)
+    )
     if not has_meaningful_signal:
         return None
 
@@ -377,7 +402,9 @@ def salvage_broken_output(text: str) -> dict[str, Any] | None:
         "summary": summary,
         "event": event,
         "positives": positives or list(DEFAULT_POSITIVES),
-        "concerns": concerns,
+        "must_fix": must_fix,
+        "suggestions": suggestions,
+        "legacy_concerns": legacy_concerns,
         "comments": comments,
     }
 
@@ -458,7 +485,18 @@ def normalize_comment(raw_comment: dict[str, Any]) -> tuple[dict[str, Any] | Non
     except (TypeError, ValueError):
         return None, "invalid_line"
 
-    return {"path": path, "line": line_number, "body": body}, None
+    # severity 는 review_service.normalize_severity 가 정규화하므로 여기서는 원본 값을
+    # 그대로 흘려보낸다. 키 자체가 없더라도 raw_comment.get 은 None 을 반환하고, 서비스
+    # 계층이 안전하게 Minor 로 폴백한다.
+    return (
+        {
+            "path": path,
+            "line": line_number,
+            "body": body,
+            "severity": raw_comment.get("severity"),
+        },
+        None,
+    )
 
 
 def normalize_response(raw_response: dict[str, Any], *, max_findings: int) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -488,14 +526,24 @@ def normalize_response(raw_response: dict[str, Any], *, max_findings: int) -> tu
 
     summary = sanitize_korean_text(raw_response.get("summary"), DEFAULT_SUMMARY)
     positives = sanitize_items(normalize_text_list(raw_response.get("positives")), max_items=10)
-    concerns = sanitize_items(normalize_text_list(raw_response.get("concerns")), max_items=10)
+    must_fix = sanitize_items(normalize_text_list(raw_response.get("must_fix")), max_items=10)
+    suggestions = sanitize_items(normalize_text_list(raw_response.get("suggestions")), max_items=10)
+    # 구 스키마(concerns 단일 필드)도 통과시키고, 서비스 계층에서 risk marker 기반으로
+    # must_fix / suggestions 로 흡수한다. 파서는 분류 기준을 몰라도 되도록 원본만 넘긴다.
+    # salvage 경로가 이미 legacy_concerns 키를 채웠을 수 있으니 먼저 그 키를 확인한다.
+    raw_legacy = raw_response.get("legacy_concerns")
+    if not raw_legacy:
+        raw_legacy = raw_response.get("concerns")
+    legacy_concerns = sanitize_items(normalize_text_list(raw_legacy), max_items=10)
     event = normalize_event_value(str(raw_response.get("event") or ""), has_comments=bool(comments))
 
     normalized_response = {
         "summary": summary,
         "event": event,
         "positives": positives or list(DEFAULT_POSITIVES),
-        "concerns": concerns,
+        "must_fix": must_fix,
+        "suggestions": suggestions,
+        "legacy_concerns": legacy_concerns,
         "comments": comments,
     }
     metadata = {

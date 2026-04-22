@@ -60,44 +60,74 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE must be one of: auto, cpu, gpu"):
                 mlx_review_client.configure_default_device()
 
-    def test_build_messages_requests_technical_positives_and_empty_concerns_when_no_issue(self) -> None:
+    def test_build_messages_uses_strict_reviewer_persona_and_new_schema(self) -> None:
+        """Phase 2 프롬프트 재작성 결과를 고정한다.
+
+        시스템 프롬프트는 역할 프라이밍 + 우선순위 리스트 + 새 스키마 계약(must_fix/
+        suggestions/positives 삼분할) 을 담고 있어야 한다. 유저 프롬프트는 규칙 나열
+        대신 짧은 지시만 유지한다.
+        """
         messages = mlx_review_client.build_messages({"repository": "demo/repo", "pull_request": 1, "files": []})
 
         system_prompt = messages[0]["content"]
         user_prompt = messages[1]["content"]
-        self.assertIn("The summary should explain the problem or maintenance burden being addressed", system_prompt)
-        self.assertIn("Good summaries follow this pattern: problem or motivation -> change -> expected effect", system_prompt)
-        self.assertIn("When writing positives, explain the technical reason", system_prompt)
-        self.assertIn("Do not place praise, strengths, or neutral observations inside concerns.", system_prompt)
-        self.assertIn("Never restate, paraphrase, or rephrase text that the diff itself introduces", system_prompt)
-        self.assertIn("Prefer returning an empty concerns array over padding it with restated diff content.", system_prompt)
-        self.assertIn("The same restriction applies to line comments in comments[].body", system_prompt)
-        self.assertIn("MLX_MODEL value was changed", system_prompt)
-        self.assertIn("Do not put structural changes the diff performs", system_prompt)
-        self.assertIn("Concerns must be stated as problems, not as facts.", system_prompt)
-        self.assertIn("Do not turn repository process rules into code review findings.", system_prompt)
-        self.assertIn("Do not ask to rename internal variable names", system_prompt)
-        self.assertIn("Good positives follow this pattern: changed construct -> technical role -> concrete effect", system_prompt)
-        self.assertIn("If the diff adds test scaffolding such as dummy classes, fake modules, monkeypatching, or sys.modules registration", system_prompt)
-        self.assertIn("summary 는 무엇을 추가했는지만 나열하지 말고", user_prompt)
-        self.assertIn("기존 문제나 불편 -> 이번 변경 -> 기대 효과", user_prompt)
-        self.assertIn("흩어진 운세 데이터 표현과 중복 조회 부담을 줄이기 위해", user_prompt)
-        self.assertIn("positives 에는 왜 좋은지와 어떤 기술적 효과가 있는지까지 설명하세요.", user_prompt)
-        self.assertIn("PR 제목/description 언어, 커밋 메시지 스타일, AGENTS.md 작업 규칙 자체를 코드 리뷰 concern 으로 적지 마세요.", user_prompt)
-        self.assertIn("그 요소가 코드에서 하는 역할", user_prompt)
-        self.assertIn("__init__, __repr__, __eq__", user_prompt)
-        self.assertIn("types.ModuleType", user_prompt)
-        self.assertIn("sys.modules", user_prompt)
-        self.assertIn("concerns 에는 실제 문제, 위험, 누락된 검증이나 테스트만 적고", user_prompt)
-        self.assertIn("diff 의 + 라인에서 새로 추가된 주석, docstring, TODO 문구", user_prompt)
-        self.assertIn("# 환율은 전용 스케줄러가 갱신한다", user_prompt)
-        self.assertIn("concerns 가 비어 있어도 됩니다", user_prompt)
-        self.assertIn("라인 코멘트(comments[].body) 에도 diff 가 이미 수행한 변경을 재진술하지 마세요", user_prompt)
-        self.assertIn("'MLX_MODEL 값을 변경했습니다'", user_prompt)
-        self.assertIn("concerns 에 diff 가 수행한 구조적 변경", user_prompt)
-        self.assertIn("'주석이 한국어로 수정되었습니다'", user_prompt)
-        self.assertIn("'~되었습니다' 로 끝나는 사실 서술", user_prompt)
-        self.assertIn("내부 변수명, 상수명, 클래스명, 함수명을 영어에서 한국어로 바꾸라고 요구하지 마세요.", user_prompt)
+
+        # 역할 프라이밍
+        self.assertIn("senior software engineer acting as a strict, evidence-driven", system_prompt)
+
+        # 우선순위 리스트 (1~6번이 명시되는지)
+        self.assertIn("Review priority", system_prompt)
+        self.assertIn("Bugs, missing exception handling", system_prompt)
+        self.assertIn("Concurrency, thread-safety", system_prompt)
+        self.assertIn("Security", system_prompt)
+
+        # 새 스키마 키 계약
+        self.assertIn("summary, event, positives, must_fix, suggestions, comments", system_prompt)
+        self.assertIn("positives, must_fix, suggestions must be JSON arrays of strings", system_prompt)
+
+        # 핵심 원칙
+        self.assertIn("Never speculate", system_prompt)
+        self.assertIn("Reject vague phrasing", system_prompt)
+        self.assertIn("'~가 추가되었습니다'", system_prompt)
+        self.assertIn("Prefer empty arrays over padding", system_prompt)
+
+        # 필드 정의가 세 바구니 모두 명시돼 있는지
+        self.assertIn("must_fix: items that must be addressed before merge", system_prompt)
+        self.assertIn("suggestions: nice-to-have improvements", system_prompt)
+        self.assertIn("positives: things THIS PR actually improves", system_prompt)
+
+        # event 규칙이 runtime 강제 안내를 포함
+        self.assertIn("runtime rewrites event based on must_fix", system_prompt)
+
+        # 보안/계약 체크리스트 보존
+        self.assertIn("disable validation", system_prompt)
+        self.assertIn("bypass auth/signature", system_prompt)
+        self.assertIn("log a token/secret", system_prompt)
+
+        # 스키마 예시와 빈 결과 예시가 새 키로 갱신됐는지
+        self.assertIn('"must_fix":["한국어 반드시 수정할 사항"]', system_prompt)
+        self.assertIn('"suggestions":["한국어 권장 개선사항"]', system_prompt)
+        self.assertIn('"must_fix":[],"suggestions":[]', system_prompt)
+
+        # 라인 코멘트 severity 4단계 정의가 프롬프트에 노출되는지
+        self.assertIn("Severity levels for comments", system_prompt)
+        self.assertIn("Critical", system_prompt)
+        self.assertIn("Major", system_prompt)
+        self.assertIn("Minor", system_prompt)
+        self.assertIn("Suggestion", system_prompt)
+        self.assertIn('"severity":"Major"', system_prompt)
+        # event 강제 규칙이 must_fix 와 라인 코멘트 두 경로를 모두 명시적으로 포함하는지.
+        self.assertIn(
+            "REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment",
+            system_prompt,
+        )
+        self.assertIn("Minor and Suggestion line comments alone keep event at COMMENT", system_prompt)
+
+        # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
+        self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
+        self.assertIn("JSON 객체 하나만", user_prompt)
+        self.assertIn("must_fix, suggestions, comments 가 비어 있어도 괜찮습니다", user_prompt)
+        self.assertIn("diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요", user_prompt)
 
 
 if __name__ == "__main__":

@@ -11,26 +11,31 @@
     {
       "path": "fortune/cache.py",
       "line": 27,
+      "severity": "Major",
       "body": "캐시 만료 분기와 DB 조회 분기가 함께 바뀌었으니 회귀 테스트를 추가해두는 편이 안전합니다."
     },
     {
       "path": "fortune/cache.py",
       "line": 27,
+      "severity": "Major",
       "body": "캐시 만료 분기와 DB 조회 분기가 함께 바뀌었으니 회귀 테스트를 추가해두는 편이 안전합니다."
     },
     {
       "path": "",
       "line": 31,
+      "severity": "Minor",
       "body": "경로가 없는 코멘트입니다."
     },
     {
       "path": "fortune/cache.py",
       "line": "x",
+      "severity": "Minor",
       "body": "라인 번호가 잘못되었습니다."
     },
     {
       "path": "fortune/cache.py",
       "line": 40,
+      "severity": "Minor",
       "body": "Please add tests."
     },
     "bad"
