@@ -40,7 +40,13 @@ SYSTEM_PROMPT_RULES = (
     "  - positives: things THIS PR actually improves, stated as 'changed construct -> technical role -> concrete effect'. Neutral observations ('기존 API 계약을 유지합니다') do not belong here - drop them or fold into summary.",
     "  - must_fix: items that must be addressed before merge - bugs, regressions, missing validation, missing tests for risky paths, security issues, public-contract breaks. Each item is a problem statement, not narration. If none, return [].",
     "  - suggestions: nice-to-have improvements the author may consider later. Still must be concrete and actionable. If none, return [].",
-    "  - comments[].body: line-scoped findings for the specific line. Same content rules as must_fix. Do NOT write praise or narration at the line level. If a line has no concrete issue, omit the comment.",
+    "  - comments[]: line-scoped findings. Each object has {path, line, severity, body}. severity must be exactly one of 'Critical', 'Major', 'Minor', 'Suggestion'. body follows the same content rules as must_fix and must NOT be praise or narration. If a line has no concrete issue, omit the comment entirely.",
+    "Severity levels for comments[]:",
+    "  - Critical: ship-blocking defects. Likely outage, data loss, security vulnerability, crash.",
+    "  - Major: bugs, missing exception handling, state inconsistency, concurrency issues, significant missing tests.",
+    "  - Minor: readability, duplicated code, naming, small structural improvements.",
+    "  - Suggestion: optional alternatives, refactor ideas, style preferences.",
+    "  When in doubt use Minor. The runtime renders severity as a prefix '[Critical]' on GitHub; only Critical or Major comments cause REQUEST_CHANGES.",
     "Hard bans that apply everywhere:",
     "  - No praise-only line comments.",
     "  - No line comments that merely narrate the diff ('MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다').",
@@ -66,7 +72,7 @@ RESPONSE_SHAPE_TEMPLATE = (
     '"positives":["한국어 개선된 점"],'
     '"must_fix":["한국어 반드시 수정할 사항"],'
     '"suggestions":["한국어 권장 개선사항"],'
-    '"comments":[{"path":"file.py","line":12,"body":"한국어 라인 코멘트"}]}'
+    '"comments":[{"path":"file.py","line":12,"severity":"Major","body":"한국어 라인 코멘트"}]}'
 )
 
 EMPTY_RESULT_TEMPLATE = (

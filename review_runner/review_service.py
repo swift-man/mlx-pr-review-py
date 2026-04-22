@@ -496,11 +496,40 @@ def resolve_github_token(repository: str | None = None, api_url: str = DEFAULT_A
     )
 
 
+SEVERITY_CRITICAL = "Critical"
+SEVERITY_MAJOR = "Major"
+SEVERITY_MINOR = "Minor"
+SEVERITY_SUGGESTION = "Suggestion"
+ALL_SEVERITIES = (SEVERITY_CRITICAL, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
+# Critical / Major 는 머지 전 반드시 봐야 하는 차단성 등급이라 event 를 REQUEST_CHANGES
+# 로 승격시킨다. Minor / Suggestion 은 개선 제안이라 COMMENT 로 남는다.
+BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_MAJOR})
+
+
+def normalize_severity(value: Any) -> str:
+    """모델이 실어 보낸 severity 값을 정규화된 4단계 중 하나로 변환한다.
+
+    인식 불가이거나 누락된 경우 Minor 로 폴백해 잘못된 Critical 승격을 막는다.
+    대소문자와 앞뒤 공백을 무시한다.
+    """
+    if not isinstance(value, str):
+        return SEVERITY_MINOR
+    cleaned = value.strip().lower()
+    mapping = {
+        "critical": SEVERITY_CRITICAL,
+        "major": SEVERITY_MAJOR,
+        "minor": SEVERITY_MINOR,
+        "suggestion": SEVERITY_SUGGESTION,
+    }
+    return mapping.get(cleaned, SEVERITY_MINOR)
+
+
 @dataclass
 class ReviewComment:
     path: str
     line: int
     body: str
+    severity: str = SEVERITY_MINOR
     side: str = "RIGHT"
 
 
@@ -753,6 +782,7 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                                 "서명 헤더가 없을 때 바로 반환하면 서명 검증이 건너뛰어져 위조된 웹훅도 처리될 수 있습니다. "
                                 "누락된 서명은 401로 거부하도록 유지하세요."
                             ),
+                            severity=SEVERITY_CRITICAL,
                         )
                     )
                 elif re.search(r"if\s+not\s+.*signature.*:\s*return\b", stripped, re.IGNORECASE) or re.search(
@@ -768,6 +798,7 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                                 "서명 값이 없을 때 요청을 통과시키고 있어 인증되지 않은 웹훅을 받아들이게 됩니다. "
                                 "서명 누락이나 불일치는 예외를 발생시켜 요청을 거부해야 합니다."
                             ),
+                            severity=SEVERITY_CRITICAL,
                         )
                     )
             previous_visible_line = stripped
@@ -807,6 +838,7 @@ def detect_secret_logging(pr_file: PullRequestFile) -> list[ReviewComment]:
             path=pr_file.filename,
             line=first_match_line,
             body=body,
+            severity=SEVERITY_CRITICAL,
         )
     ]
 
@@ -830,6 +862,7 @@ def detect_contract_typos(pr_file: PullRequestFile) -> list[ReviewComment]:
                         f"`{typo}` 오타 때문에 기존 계약에서 기대하는 `{expected}` 키나 헤더를 찾지 못해 호출 흐름이 깨질 수 있습니다. "
                         f"공개 응답 필드와 GitHub 헤더 이름은 `{expected}`로 정확히 유지하세요."
                     ),
+                    severity=SEVERITY_MAJOR,
                 )
             )
             break
@@ -1274,7 +1307,10 @@ def collect_validated_comments(
             increment_reason(stats.dropped_model_comment_reasons, "duplicate_model_comment")
             continue
         seen_comment_keys.add(key)
-        comments.append(ReviewComment(path=path, line=line, body=body))
+        # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
+        # 잘못된 Critical 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
+        severity = normalize_severity(raw.get("severity"))
+        comments.append(ReviewComment(path=path, line=line, body=body, severity=severity))
         stats.accepted_model_comments += 1
 
     for comment in detect_rule_based_comments(files):
@@ -1347,14 +1383,20 @@ def validate_mlx_output(
         must_fix = merge_distinct_items(must_fix, extra_must_fix, max_items=10)
         suggestions = merge_distinct_items(suggestions, extra_suggestions, max_items=10)
 
-    # 규칙 기반 라인 코멘트(서명 검증 우회, 비밀값 로그 등)는 전부 must_fix 로 승격한다.
-    # 이 경로로 들어온 코멘트는 보안/기본 계약 파괴라 REQUEST_CHANGES 를 유도해야 한다.
-    comment_summaries = summarize_comment_bodies(comments, max_items=3)
-    must_fix = merge_distinct_items(must_fix, comment_summaries, max_items=5)
+    # 라인 코멘트 요약을 등급별로 다른 버킷에 태운다. Critical/Major 요약은 상단
+    # must_fix 에, Minor/Suggestion 요약은 suggestions 에 남겨 훑을 때 우선순위가
+    # 유지되도록 한다. 규칙 기반 감지기(서명 우회, 비밀값 로그) 는 명시적으로
+    # Critical / Major 를 붙이므로 반드시 must_fix 쪽으로 가 REQUEST_CHANGES 를 유도한다.
+    blocking_comments = [c for c in comments if c.severity in BLOCKING_SEVERITIES]
+    non_blocking_comments = [c for c in comments if c.severity not in BLOCKING_SEVERITIES]
+    must_fix_summaries = summarize_comment_bodies(blocking_comments, max_items=3)
+    suggestion_summaries = summarize_comment_bodies(non_blocking_comments, max_items=3)
+    must_fix = merge_distinct_items(must_fix, must_fix_summaries, max_items=5)
+    suggestions = merge_distinct_items(suggestions, suggestion_summaries, max_items=5)
 
-    # 차단성 항목(must_fix 또는 라인 코멘트) 이 있어야만 REQUEST_CHANGES 로 승격한다.
-    # 단순 권장사항만 있는 경우는 COMMENT 로 남겨 저자가 차단감을 느끼지 않도록 한다.
-    should_request_changes = bool(comments or must_fix)
+    # 차단성 신호(must_fix 또는 Critical/Major 라인 코멘트) 가 있을 때만
+    # REQUEST_CHANGES 로 승격한다. 순수 Minor/Suggestion 코멘트만 있으면 COMMENT 유지.
+    should_request_changes = bool(must_fix or blocking_comments)
     # summary 재작성 등은 '뭐라도 남길 내용이 있는지' 로 판단하므로 has_findings 는 별도.
     has_findings = bool(comments or must_fix or suggestions)
     event = decide_review_event(result.get("event"), should_request_changes=should_request_changes)
@@ -1449,7 +1491,9 @@ def build_review_payload(
                 "path": comment.path,
                 "line": comment.line,
                 "side": comment.side,
-                "body": comment.body,
+                # GitHub 라인 코멘트 본문 맨 앞에 '[Critical]' 같은 등급 태그를 붙여
+                # 훑는 사람이 심각도를 즉시 구분할 수 있게 한다.
+                "body": f"[{comment.severity}] {comment.body}",
             }
             for comment in comments
         ],

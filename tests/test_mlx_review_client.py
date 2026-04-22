@@ -109,6 +109,15 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn('"suggestions":["한국어 권장 개선사항"]', system_prompt)
         self.assertIn('"must_fix":[],"suggestions":[]', system_prompt)
 
+        # 라인 코멘트 severity 4단계 정의가 프롬프트에 노출되는지
+        self.assertIn("Severity levels for comments", system_prompt)
+        self.assertIn("Critical", system_prompt)
+        self.assertIn("Major", system_prompt)
+        self.assertIn("Minor", system_prompt)
+        self.assertIn("Suggestion", system_prompt)
+        self.assertIn('"severity":"Major"', system_prompt)
+        self.assertIn("only Critical or Major comments cause REQUEST_CHANGES", system_prompt)
+
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)

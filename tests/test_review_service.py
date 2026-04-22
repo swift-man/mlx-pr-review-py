@@ -363,6 +363,170 @@ def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> 
     return completed
 
 
+class NormalizeSeverityTests(unittest.TestCase):
+    def test_recognizes_all_four_severities_case_insensitively(self) -> None:
+        cases = {
+            "Critical": review_service.SEVERITY_CRITICAL,
+            "critical": review_service.SEVERITY_CRITICAL,
+            "CRITICAL": review_service.SEVERITY_CRITICAL,
+            "  Major ": review_service.SEVERITY_MAJOR,
+            "MINOR": review_service.SEVERITY_MINOR,
+            "suggestion": review_service.SEVERITY_SUGGESTION,
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(review_service.normalize_severity(raw), expected)
+
+    def test_defaults_to_minor_when_missing_or_unknown(self) -> None:
+        # 모델이 누락하거나 엉뚱한 값을 보내도 Critical 로 튀지 않도록 Minor 폴백.
+        for raw in (None, "", "blocker", "high", 3, ["Critical"]):
+            with self.subTest(raw=raw):
+                self.assertEqual(review_service.normalize_severity(raw), review_service.SEVERITY_MINOR)
+
+
+class SeverityRoutingAndRenderingTests(unittest.TestCase):
+    def _make_pr_file(self) -> "review_service.PullRequestFile":
+        return review_service.PullRequestFile(
+            filename="fortune/service.py",
+            status="modified",
+            patch="@@ -0,0 +1,1 @@\n+x = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+
+    def test_critical_comment_drives_request_changes_and_major_too(self) -> None:
+        for severity in ("Critical", "Major"):
+            with self.subTest(severity=severity):
+                validated = review_service.validate_mlx_output(
+                    {
+                        "summary": "로직 변경.",
+                        "event": "COMMENT",
+                        "positives": [],
+                        "must_fix": [],
+                        "suggestions": [],
+                        "comments": [
+                            {
+                                "path": "fortune/service.py",
+                                "line": 1,
+                                "severity": severity,
+                                "body": "이 라인의 위험 요소를 반드시 처리해야 합니다.",
+                            }
+                        ],
+                    },
+                    [self._make_pr_file()],
+                )
+                self.assertEqual(validated.event, "REQUEST_CHANGES")
+                # 차단 등급 라인 코멘트 요약은 must_fix 쪽으로 흘러야 상단 섹션에 노출된다.
+                self.assertTrue(validated.must_fix)
+
+    def test_minor_comment_alone_stays_at_comment_level(self) -> None:
+        # Minor/Suggestion 만 있는 경우에는 REQUEST_CHANGES 가 발동하면 안 된다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "네이밍 정리.",
+                "event": "REQUEST_CHANGES",  # 모델이 요청해도 다운그레이드돼야 함
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Minor",
+                        "body": "네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.event, "COMMENT")
+        self.assertEqual(validated.must_fix, [])
+        self.assertTrue(validated.suggestions)
+
+    def test_rule_based_secret_logging_comment_gets_critical_severity(self) -> None:
+        # 비밀값 로그 감지는 직접 Critical 을 붙이므로 모델이 아무것도 안 보내도
+        # event 가 REQUEST_CHANGES 로 승격해야 한다.
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/dbsec.py",
+            status="modified",
+            patch='@@ -0,0 +218,1 @@\n+print(f"access token={token}")\n',
+            additions=1,
+            deletions=0,
+            right_side_lines={218},
+        )
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "토큰 출력을 점검합니다.",
+                "event": "COMMENT",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+            },
+            [pr_file],
+        )
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_CRITICAL)
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_build_review_payload_prefixes_line_comment_body_with_severity_tag(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="REQUEST_CHANGES",
+            comments=[
+                review_service.ReviewComment(
+                    path="fortune/service.py",
+                    line=10,
+                    body="서명 검증이 제거돼 인증 우회 위험이 있습니다.",
+                    severity=review_service.SEVERITY_CRITICAL,
+                ),
+                review_service.ReviewComment(
+                    path="fortune/service.py",
+                    line=20,
+                    body="네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+                    severity=review_service.SEVERITY_MINOR,
+                ),
+            ],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+        )
+        rendered_bodies = [c["body"] for c in payload["comments"]]
+        self.assertEqual(
+            rendered_bodies,
+            [
+                "[Critical] 서명 검증이 제거돼 인증 우회 위험이 있습니다.",
+                "[Minor] 네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+            ],
+        )
+
+    def test_unknown_severity_value_from_model_falls_back_to_minor(self) -> None:
+        # 모델이 'blocker' 같은 비표준 등급을 보내도 Minor 로 안전 폴백.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "테스트.",
+                "event": "COMMENT",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "blocker",
+                        "body": "이 라인은 살짝 아쉽습니다.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_MINOR)
+        # Minor 로 폴백됐으니 REQUEST_CHANGES 가 발동하면 안 된다.
+        self.assertEqual(validated.event, "COMMENT")
+
+
 class SplitLegacyConcernsTests(unittest.TestCase):
     def test_items_with_risk_markers_go_to_must_fix(self) -> None:
         must_fix, suggestions = review_service.split_legacy_concerns(
