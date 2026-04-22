@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import signal
 import sys
@@ -6,7 +8,6 @@ import time
 import types
 import unittest
 from contextlib import redirect_stdout
-import io
 from unittest import mock
 
 if "certifi" not in sys.modules:
@@ -17,7 +18,7 @@ if "certifi" not in sys.modules:
 if "jwt" not in sys.modules:
     sys.modules["jwt"] = types.ModuleType("jwt")
 
-from review_runner import review_service
+from review_runner import mlx_review_parser, review_service
 
 
 class RunMlxTests(unittest.TestCase):
@@ -378,8 +379,10 @@ class NormalizeSeverityTests(unittest.TestCase):
                 self.assertEqual(review_service.normalize_severity(raw), expected)
 
     def test_defaults_to_minor_when_missing_or_unknown(self) -> None:
-        # 모델이 누락하거나 엉뚱한 값을 보내도 Critical 로 튀지 않도록 Minor 폴백.
-        for raw in (None, "", "blocker", "high", 3, ["Critical"]):
+        # 모델이 누락하거나 완전히 엉뚱한 값을 보내도 Critical 로 튀지 않도록 Minor 폴백.
+        # 'blocker' / 'high' 같이 흔히 쓰는 관용어는 별도 매핑으로 흡수되므로 여기서는
+        # 매핑에 명시적으로 없는 값들만 검사한다.
+        for raw in (None, "", "urgent", "cosmetic", "p0", "wishlist", 3, ["Critical"]):
             with self.subTest(raw=raw):
                 self.assertEqual(review_service.normalize_severity(raw), review_service.SEVERITY_MINOR)
 
@@ -501,8 +504,58 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             ],
         )
 
+    def test_severity_survives_full_parser_to_validator_pipeline(self) -> None:
+        """파서가 severity 를 drop 하면 모델 생성 라인 코멘트가 모두 Minor 로 강등되는
+        실전 회귀를 막는 E2E 테스트. raw MLX JSON 문자열부터 validate_mlx_output 까지
+        실제 운영 경로를 그대로 타야 한다."""
+        raw_output = json.dumps(
+            {
+                "summary": "인증 우회 가능성을 점검합니다.",
+                "event": "COMMENT",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Critical",
+                        "body": "서명 검증이 비활성화돼 인증 우회 위험이 있습니다.",
+                    }
+                ],
+            }
+        )
+        parsed, _meta = mlx_review_parser.parse_and_normalize_model_output(raw_output)
+        validated = review_service.validate_mlx_output(parsed, [self._make_pr_file()])
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(
+            validated.comments[0].severity, review_service.SEVERITY_CRITICAL
+        )
+        # Critical 이 살아남으면 event 는 REQUEST_CHANGES 로 승격되고 요약은 must_fix 로 간다.
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertTrue(validated.must_fix)
+
+    def test_normalize_severity_accepts_common_synonyms(self) -> None:
+        # 코드 리뷰 관용어도 4단계로 안전하게 흡수한다.
+        cases = {
+            "blocker": review_service.SEVERITY_CRITICAL,
+            "severe": review_service.SEVERITY_CRITICAL,
+            "high": review_service.SEVERITY_MAJOR,
+            "medium": review_service.SEVERITY_MINOR,
+            "low": review_service.SEVERITY_SUGGESTION,
+            "nit": review_service.SEVERITY_SUGGESTION,
+            "nitpick": review_service.SEVERITY_SUGGESTION,
+            "optional": review_service.SEVERITY_SUGGESTION,
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(review_service.normalize_severity(raw), expected)
+
     def test_unknown_severity_value_from_model_falls_back_to_minor(self) -> None:
-        # 모델이 'blocker' 같은 비표준 등급을 보내도 Minor 로 안전 폴백.
+        # 모델이 매핑에 없는 비표준 등급(p0, urgent 등) 을 보내도 Minor 로 안전 폴백.
+        # blocker/high 같은 일반 관용어는 이미 Critical/Major 로 매핑되므로 여기서는
+        # 정말로 사전에 없는 문자열을 사용한다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "테스트.",
@@ -514,7 +567,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                     {
                         "path": "fortune/service.py",
                         "line": 1,
-                        "severity": "blocker",
+                        "severity": "p0",
                         "body": "이 라인은 살짝 아쉽습니다.",
                     }
                 ],

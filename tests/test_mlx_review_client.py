@@ -116,7 +116,12 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("Minor", system_prompt)
         self.assertIn("Suggestion", system_prompt)
         self.assertIn('"severity":"Major"', system_prompt)
-        self.assertIn("only Critical or Major comments cause REQUEST_CHANGES", system_prompt)
+        # event 강제 규칙이 must_fix 와 라인 코멘트 두 경로를 모두 명시적으로 포함하는지.
+        self.assertIn(
+            "REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment",
+            system_prompt,
+        )
+        self.assertIn("Minor and Suggestion line comments alone keep event at COMMENT", system_prompt)
 
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)

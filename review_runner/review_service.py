@@ -509,17 +509,29 @@ BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_MAJOR})
 def normalize_severity(value: Any) -> str:
     """모델이 실어 보낸 severity 값을 정규화된 4단계 중 하나로 변환한다.
 
-    인식 불가이거나 누락된 경우 Minor 로 폴백해 잘못된 Critical 승격을 막는다.
-    대소문자와 앞뒤 공백을 무시한다.
+    대소문자와 앞뒤 공백을 무시하고, 코드 리뷰 관용어(blocker/high/low/nit 등)도
+    가까운 등급으로 매핑한다. 인식 불가이거나 누락된 경우 Minor 로 폴백해 잘못된
+    Critical 승격을 막는다.
     """
     if not isinstance(value, str):
         return SEVERITY_MINOR
     cleaned = value.strip().lower()
     mapping = {
+        # 공식 4단계
         "critical": SEVERITY_CRITICAL,
         "major": SEVERITY_MAJOR,
         "minor": SEVERITY_MINOR,
         "suggestion": SEVERITY_SUGGESTION,
+        # 관용어 동의어 — 모델이 학습 데이터에서 흡수한 대체 표현들을 안전하게 흡수한다.
+        "blocker": SEVERITY_CRITICAL,
+        "severe": SEVERITY_CRITICAL,
+        "high": SEVERITY_MAJOR,
+        "medium": SEVERITY_MINOR,
+        "moderate": SEVERITY_MINOR,
+        "low": SEVERITY_SUGGESTION,
+        "nit": SEVERITY_SUGGESTION,
+        "nitpick": SEVERITY_SUGGESTION,
+        "optional": SEVERITY_SUGGESTION,
     }
     return mapping.get(cleaned, SEVERITY_MINOR)
 
