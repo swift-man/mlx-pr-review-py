@@ -508,13 +508,20 @@ class PullRequestFile:
 
 @dataclass
 class ValidatedReview:
-    """모델 출력과 규칙 기반 검사를 합쳐서 정규화한 리뷰 결과다."""
+    """모델 출력과 규칙 기반 검사를 합쳐서 정규화한 리뷰 결과다.
+
+    must_fix: 버그·보안·누락 등 머지 전 반드시 고쳐야 하는 항목. 비어 있지 않으면
+              event 는 REQUEST_CHANGES 로 강제된다.
+    suggestions: 권장 개선 (nice-to-have). 있어도 REQUEST_CHANGES 는 아니다.
+    positives: 이 PR 이 개선한 기술적 효과.
+    """
 
     comments: list[ReviewComment]
     summary: str
     event: str
     positives: list[str]
-    concerns: list[str]
+    must_fix: list[str]
+    suggestions: list[str]
 
 
 @dataclass
@@ -1284,6 +1291,22 @@ def decide_review_event(raw_event: Any, *, has_findings: bool) -> str:
     return "COMMENT"
 
 
+def split_legacy_concerns(items: list[str]) -> tuple[list[str], list[str]]:
+    """구 스키마의 concerns 를 CONCERN_RISK_MARKERS 포함 여부로 나눈다.
+
+    위험 신호(위험/누락/취약/에러 등)가 있으면 must_fix, 없으면 suggestions 로 흡수한다.
+    프롬프트가 새 스키마를 요구하지만 모델이 아직 따라오지 못할 때의 안전망이다.
+    """
+    must_fix: list[str] = []
+    suggestions: list[str] = []
+    for item in items:
+        if any(marker in item for marker in CONCERN_RISK_MARKERS):
+            must_fix.append(item)
+        else:
+            suggestions.append(item)
+    return must_fix, suggestions
+
+
 def validate_mlx_output(
     result: dict[str, Any],
     files: list[PullRequestFile],
@@ -1298,11 +1321,28 @@ def validate_mlx_output(
 
     summary = normalize_text(result.get("summary")) or "자동 리뷰를 완료했습니다."
     positives = sanitize_positive_items(normalize_text_list(result.get("positives"), max_items=10))
-    concerns = sanitize_text_items(normalize_text_list(result.get("concerns"), max_items=10))
+    must_fix = sanitize_text_items(normalize_text_list(result.get("must_fix"), max_items=10))
+    suggestions = sanitize_text_items(normalize_text_list(result.get("suggestions"), max_items=10))
+
+    # 파서가 '레거시 concerns' 로 흘려보낸 구 스키마 항목을 risk marker 기준으로
+    # 두 버킷에 분배한다. 새 스키마 필드가 이미 차 있으면 추가만 한다.
+    legacy_concerns = sanitize_text_items(
+        normalize_text_list(result.get("legacy_concerns") or result.get("concerns"), max_items=10)
+    )
+    if legacy_concerns:
+        extra_must_fix, extra_suggestions = split_legacy_concerns(legacy_concerns)
+        must_fix = merge_distinct_items(must_fix, extra_must_fix, max_items=10)
+        suggestions = merge_distinct_items(suggestions, extra_suggestions, max_items=10)
+
+    # 규칙 기반 라인 코멘트(서명 검증 우회, 비밀값 로그 등)는 전부 must_fix 로 승격한다.
+    # 이 경로로 들어온 코멘트는 보안/기본 계약 파괴라 REQUEST_CHANGES 를 유도해야 한다.
     comment_summaries = summarize_comment_bodies(comments, max_items=3)
-    concerns = merge_distinct_items(concerns, comment_summaries, max_items=3)
-    has_findings = bool(comments or concerns)
-    event = decide_review_event(result.get("event"), has_findings=has_findings)
+    must_fix = merge_distinct_items(must_fix, comment_summaries, max_items=5)
+
+    has_must_fix = bool(comments or must_fix)
+    has_findings = bool(comments or must_fix or suggestions)
+    # REQUEST_CHANGES 는 must_fix 가 있을 때만. suggestions 만 있으면 COMMENT.
+    event = decide_review_event(result.get("event"), has_findings=has_must_fix)
 
     if not has_findings:
         summary = sanitize_summary(summary, has_findings=False)
@@ -1318,7 +1358,8 @@ def validate_mlx_output(
         summary=summary,
         event=event,
         positives=positives,
-        concerns=concerns,
+        must_fix=must_fix,
+        suggestions=suggestions,
     )
 
 
@@ -1342,33 +1383,32 @@ def build_review_payload(
     event: str,
     comments: list[ReviewComment],
     positives: list[str],
-    concerns: list[str],
+    must_fix: list[str],
+    suggestions: list[str],
     *,
     model_name: str | None = None,
 ) -> dict[str, Any]:
-    """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다."""
-    positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
-    concern_items = concerns or [DEFAULT_NO_CONCERNS_TEXT]
-    body_lines = [
-        normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY,
-        "",
-        "### 좋은 점",
-    ]
-    body_lines.extend(f"- {item}" for item in positive_items)
-    body_lines.extend(
-        [
-            "",
-            "### 개선이 필요한 점",
-        ]
-    )
-    body_lines.extend(f"- {item}" for item in concern_items)
-    body_lines.extend(
-        [
-            "",
-            "### 라인 단위 코멘트",
-        ]
-    )
+    """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다.
 
+    섹션 순서는 '반드시 수정할 사항 → 권장 개선사항 → 개선된 점' 이다. 훑을 때
+    가장 먼저 눈에 들어와야 할 차단성 항목을 상단에 둔다. 각 섹션은 내용이 있을
+    때만 출력해서 빈 bullet 플레이스홀더가 노이즈가 되지 않도록 한다.
+    """
+    body_lines: list[str] = [normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY]
+
+    if must_fix:
+        body_lines.extend(["", "### 반드시 수정할 사항"])
+        body_lines.extend(f"- {item}" for item in must_fix)
+
+    if suggestions:
+        body_lines.extend(["", "### 권장 개선사항"])
+        body_lines.extend(f"- {item}" for item in suggestions)
+
+    positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
+    body_lines.extend(["", "### 개선된 점"])
+    body_lines.extend(f"- {item}" for item in positive_items)
+
+    body_lines.extend(["", "### 라인 단위 코멘트"])
     if comments:
         body_lines.append(f"- 자동 리뷰에서 {len(comments)}개의 라인 단위 개선 사항을 남겼습니다.")
     else:
@@ -1491,7 +1531,8 @@ def generate_review_artifacts(
         validated_review.event,
         validated_review.comments,
         validated_review.positives,
-        validated_review.concerns,
+        validated_review.must_fix,
+        validated_review.suggestions,
         model_name=extract_model_name_from_result(mlx_result),
     )
     return ReviewGenerationArtifacts(
