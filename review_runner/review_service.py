@@ -1528,7 +1528,14 @@ def build_review_result(
     payload: dict[str, Any],
     auth_source: str | None,
 ) -> dict[str, Any]:
-    """로그와 후속 처리에서 재사용할 리뷰 결과 요약을 만든다."""
+    """로그와 후속 처리에서 재사용할 리뷰 결과 요약을 만든다.
+
+    Phase 2 이후 ValidatedReview 는 concerns 필드를 갖지 않고 must_fix / suggestions
+    로 분리돼 있다. 호환성을 위해 concern_count = must_fix + suggestions 합으로
+    계속 노출하면서, 심각도별 카운트도 함께 제공한다.
+    """
+    must_fix_count = len(validated_review.must_fix)
+    suggestion_count = len(validated_review.suggestions)
     return {
         "status": "completed",
         "repository": repository,
@@ -1537,7 +1544,9 @@ def build_review_result(
         "event": validated_review.event,
         "comment_count": len(validated_review.comments),
         "positive_count": len(validated_review.positives),
-        "concern_count": len(validated_review.concerns),
+        "must_fix_count": must_fix_count,
+        "suggestion_count": suggestion_count,
+        "concern_count": must_fix_count + suggestion_count,
         "payload": payload,
         "auth_source": auth_source or "personal_access_token",
     }

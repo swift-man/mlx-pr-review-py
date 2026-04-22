@@ -8,6 +8,7 @@ import time
 import types
 import unittest
 from contextlib import redirect_stdout
+from typing import Any
 from unittest import mock
 
 if "certifi" not in sys.modules:
@@ -578,6 +579,56 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_MINOR)
         # Minor 로 폴백됐으니 REQUEST_CHANGES 가 발동하면 안 된다.
         self.assertEqual(validated.event, "COMMENT")
+
+
+class BuildReviewResultTests(unittest.TestCase):
+    def _make_validated_review(self, **overrides: Any) -> review_service.ValidatedReview:
+        defaults = dict(
+            comments=[],
+            summary="요약",
+            event="COMMENT",
+            positives=["개선된 점 예시"],
+            must_fix=[],
+            suggestions=[],
+        )
+        defaults.update(overrides)
+        return review_service.ValidatedReview(**defaults)
+
+    def test_build_review_result_returns_severity_aware_counts(self) -> None:
+        # Phase 2 이후 ValidatedReview 는 concerns 가 없다. 이 경로가 AttributeError
+        # 없이 must_fix / suggestions 기반 카운트를 돌려주는지 고정한다. 이 회귀가
+        # 풀리면 실제 운영에서 review_execution 단계에서 17분짜리 리뷰가 통째로 날아간다.
+        review = self._make_validated_review(
+            must_fix=["signature 검증 우회 위험이 있습니다."],
+            suggestions=["네이밍을 통일하면 좋습니다.", "로그 레벨을 낮추세요."],
+        )
+        result = review_service.build_review_result(
+            repository="owner/repo",
+            pull_number=1,
+            validated_review=review,
+            payload={"body": "...", "event": "COMMENT", "comments": []},
+            auth_source="github_app_installation",
+        )
+        self.assertEqual(result["must_fix_count"], 1)
+        self.assertEqual(result["suggestion_count"], 2)
+        # 하위 호환: concern_count 는 여전히 노출되며 must_fix + suggestions 합.
+        self.assertEqual(result["concern_count"], 3)
+        self.assertEqual(result["auth_source"], "github_app_installation")
+        self.assertEqual(result["status"], "completed")
+
+    def test_build_review_result_handles_empty_buckets(self) -> None:
+        review = self._make_validated_review()
+        result = review_service.build_review_result(
+            repository="owner/repo",
+            pull_number=2,
+            validated_review=review,
+            payload={"body": "...", "event": "COMMENT", "comments": []},
+            auth_source=None,
+        )
+        self.assertEqual(result["must_fix_count"], 0)
+        self.assertEqual(result["suggestion_count"], 0)
+        self.assertEqual(result["concern_count"], 0)
+        self.assertEqual(result["auth_source"], "personal_access_token")
 
 
 class SplitLegacyConcernsTests(unittest.TestCase):
