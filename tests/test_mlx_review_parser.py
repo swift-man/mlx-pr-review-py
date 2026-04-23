@@ -102,12 +102,32 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
             "APPROVE",
         )
 
-    def test_normalize_event_value_downgrades_approve_when_comments_exist(self) -> None:
-        # 라인 코멘트가 있는 상태에서의 APPROVE 는 서비스 계층이 severity 로 다시
-        # 판정하도록 COMMENT 로 낮춘다. 여기서 잘못 APPROVE 를 유지하면 런타임이
-        # 다시 올릴 기회가 사라진다.
+    def test_normalize_event_value_preserves_valid_values_as_is(self) -> None:
+        # 파서는 유효한 3 개 enum 값을 그대로 통과시킨다. 최종 event 는 서비스 계층의
+        # decide_review_event 가 should_request_changes / has_any_finding 플래그만 보고
+        # 결정하므로, 파서의 역할은 '알 수 없는 값 필터링' 으로 한정된다. 라인 코멘트
+        # 유무에 따른 APPROVE → COMMENT 다운그레이드는 dead code 라 제거됐다.
         self.assertEqual(
             mlx_review_parser.normalize_event_value("approve", has_comments=True),
+            "APPROVE",
+        )
+        self.assertEqual(
+            mlx_review_parser.normalize_event_value("COMMENT", has_comments=True),
+            "COMMENT",
+        )
+        self.assertEqual(
+            mlx_review_parser.normalize_event_value("request_changes", has_comments=False),
+            "REQUEST_CHANGES",
+        )
+
+    def test_normalize_event_value_falls_back_for_unknown_values(self) -> None:
+        # 알 수 없는 문자열은 라인 코멘트 유무에 따라 안전한 기본값으로 치환한다.
+        self.assertEqual(
+            mlx_review_parser.normalize_event_value("blocker", has_comments=True),
+            "REQUEST_CHANGES",
+        )
+        self.assertEqual(
+            mlx_review_parser.normalize_event_value("", has_comments=False),
             "COMMENT",
         )
 
