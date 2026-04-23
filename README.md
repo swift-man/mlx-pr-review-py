@@ -455,4 +455,77 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 `MLX_DEVICE=cpu`에서 안정적으로 동작하면 애플리케이션 로직보다는 해당 Mac의 Metal/driver/MLX 조합 문제일 가능성이 큽니다.
 이 저장소의 MLX 클라이언트는 `MLX_DEVICE=cpu|gpu`를 읽으며, warm-up 결과에도 선택된 device가 함께 출력됩니다.
 
+## 15. 7B 모델 전용 품질 보정 레이어 (모델 업그레이드 시 제거 대상)
+
+현재 기본 모델인 `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` 는 PR diff 를 정확히 읽지 못하고 다음 세 가지 실패 패턴을 반복합니다. 이 패턴들을 **프롬프트 가드레일 + 후처리 필터** 로 막고 있으며, 향후 14B 이상 모델로 업그레이드하면 **아래 목록을 순서대로 제거하고 회귀 테스트를 돌려 유지 여부를 결정**하세요.
+
+### 15-1. 보정 대상 실패 패턴
+
+1. **패턴 1 — 역해석**: diff 의 `+` 라인을 "missing" 으로 해석. 예: `"$schema": "./schema.json"` 을 추가하는 PR 에 대해 "`$schema` 필드가 추가되어야 합니다" 라는 must_fix 를 남김.
+2. **패턴 2 — 환각**: 존재하지 않는 사실 단언. 예: 파일에 `$schema` 키가 1개뿐인데 "중복된 `$schema` 키가 있습니다" 라고 지적.
+3. **패턴 3 — 중복 출력**: 같은 문장을 `positives` / `must_fix` / `suggestions` / `comments[]` 네 섹션에 그대로 반복.
+
+회귀 검증용 실제 PR 케이스:
+- `swift-man/MaterialDesignColor` PR #4 (commit `0fc8a67`) — 패턴 1 재현 (tokens/material-colors.json 의 `$schema` 추가)
+- `swift-man/MaterialDesignColor` PR #4 — 패턴 2 재현 (중복 `$schema` 환각)
+- `swift-man/MaterialDesignColor` PR #7 (commit `7c3a0d6`, `40a11fe`) — 패턴 1·3 동시 재현
+- 같은 PR 의 ESM/CJS 이슈 (commit `38c8d92` 로 수정) — 차단성 이슈를 **정확히 잡는지** 확인용 positive control
+
+### 15-2. A 계층 — 프롬프트 가드레일 (`review_runner/mlx_review_prompt.py`)
+
+`SYSTEM_PROMPT_RULES` 내부에 명시된 규칙들로, 모델에게 직접 "이런 패턴을 내지 말라"고 지시.
+
+| 규칙 위치 | 역할 |
+|---------|------|
+| `Anti-hallucination guardrails` 섹션 전체 | 리뷰 생성 전 self-check + 번역 금지 + add-already-exists 금지 + confidence gradient |
+| `Do not restate what the diff already does` 규칙 | narration 금지 (패턴 3 일부) |
+| `~가 추가되었습니다 / 변경되었습니다 / 수정되었습니다 are narration` | 서술형 어미 식별 |
+| `Severity levels for comments[]` + severity enforcement | Major/Minor 남용 억제 |
+
+**제거 기준**: 새 모델로 회귀 PR 목록을 돌려 세 패턴의 발생률이 5% 미만이면 해당 규칙 제거.
+
+### 15-3. B 계층 — 후처리 필터 (`review_runner/review_service.py`)
+
+프롬프트가 실패해도 출력 단에서 걸러내는 규칙 기반 필터. 상수 + `looks_like_*` 함수 쌍으로 구성.
+
+| 상수 / 함수 | 역할 |
+|-----------|------|
+| `LOW_SIGNAL_POSITIVE_MARKERS` (line 45) | "PR diff가 잘 작성되었습니다" 류 저신호 칭찬 |
+| `LOW_SIGNAL_MODEL_CHANGE_MARKERS` (line 51) | "MLX_MODEL 값이 변경" 류 단순 변경 narration |
+| `PROCESS_POLICY_MARKERS` (line 56) | PR 제목/description/AGENTS.md 같은 코드 외 정책 지적 |
+| `POSITIVE_CONCERN_MARKERS` (line 67) | "가독성을 높", "개선되었습니다" 류 positive-shaped concern |
+| `NO_CONCERN_TEXTS` (line 80) | "개선이 필요한 점은 없습니다" 같은 placeholder 차단 |
+| `PROMPT_ECHO_MARKERS` (line 104) | 프롬프트 본문을 finding 으로 재진술 |
+| `DESCRIPTIVE_NARRATION_SUFFIXES` (line 118) | "~되었습니다" 로 끝나는 서술형 concern |
+| `CONCERN_RISK_MARKERS` (line 138) | 서술형 어미 허용 여부 판단용 위험 어휘 whitelist |
+| `looks_like_praise_only_comment` (line 285) | 칭찬만 있는 line comment 차단 |
+| `normalize_severity` (line 509) | 'blocker/high/low/nit' 같은 관용어 severity 정규화 |
+| `looks_like_*` (line 920~1017) | 위 marker 들을 각 지적 유형에 적용 |
+| `split_legacy_concerns` (line 1363) | 구 스키마 `concerns` 를 risk marker 기준으로 `must_fix` / `suggestions` 분배 |
+
+**제거 기준**: 새 모델이 `must_fix` / `suggestions` / severity 를 안정적으로 emit 하고, marker 기반 후처리로 걸러지는 비율이 1% 미만이면 해당 marker·함수 쌍 제거. 제거 후 [tests/test_review_service.py](tests/test_review_service.py) 의 `DescriptiveChangeNarrationTests`, `SplitLegacyConcernsTests` 등 관련 테스트도 함께 삭제.
+
+### 15-4. C 계층 — 구조적 검증 (Phase 4, 구현 예정)
+
+프롬프트·marker 로 못 잡는 패턴 1·2 를 잡기 위한 symbol-based 검증.
+
+| 예정 기능 | 대상 패턴 |
+|---------|---------|
+| `+` 라인 semantic 강화 프롬프트 | 1 |
+| Finding 3요소 템플릿 (문제/영향/제안) | 3 |
+| 4 섹션 중복 제거 후처리 (유사도 기반) | 3 |
+| `verify_finding_against_diff` symbol 검증 (backtick/quoted 식별자 + intent verb) | 1·2 |
+| Major/Minor 태그는 impact 명시 시만 허용 | severity 오남용 |
+
+구현 완료 시 이 표를 해당 함수·프롬프트 블록에 대한 링크로 업데이트하세요.
+
+**제거 기준**: 새 모델이 dedup 없이도 섹션별 유일 응답을 내고, 라인 단위 사실 주장의 실제 일치율이 95% 이상이면 C 계층 제거.
+
+### 15-5. 제거 절차
+
+1. 회귀용 테스트 픽스처 확인: `tests/fixtures/mlx_outputs/` 에 현재 세 패턴에 해당하는 샘플 출력이 저장돼 있는지 확인하고, 없으면 배포 로그에서 수집해 먼저 추가.
+2. 제거 순서: C → B → A (바깥쪽 보정 먼저, 프롬프트는 마지막). 각 단계에서 `python3 -m unittest discover -s tests` 통과 확인.
+3. 실전 회귀: 위 15-1 의 4개 PR 케이스를 새 모델로 돌려 세 패턴이 5% 미만으로 내려갔는지 측정.
+4. ESM/CJS positive control 통과도 함께 확인 (차단 이슈를 여전히 잡는지).
+
 # review.gorani.me
