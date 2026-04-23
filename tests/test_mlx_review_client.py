@@ -134,6 +134,55 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 빈 결과 템플릿도 APPROVE 를 기본 event 로 제시하는지
         self.assertIn('"event":"APPROVE"', system_prompt)
 
+        # 환각 방지 가드레일 4가지가 프롬프트에 그대로 노출되는지 — 7B 모델이 추측성
+        # 지적/중복 제안을 내지 않도록 라인 코멘트 생성 전 자체 점검을 강제하는 규칙.
+        self.assertIn("Anti-hallucination guardrails", system_prompt)
+        self.assertIn("have I actually read the affected lines", system_prompt)
+        self.assertIn("already implemented elsewhere", system_prompt)
+        # Self-check (c) 는 버킷별로 근거 형태가 다름: comments[] 는 line number,
+        # must_fix / suggestions 는 diff 영역 · 파일 경로 · 심볼 중 하나.
+        self.assertIn("can I cite concrete evidence", system_prompt)
+        self.assertIn("For comments[], 'evidence' means a specific line number", system_prompt)
+        self.assertIn(
+            "For must_fix and suggestions, which are file- or diff-wide buckets",
+            system_prompt,
+        )
+        self.assertIn(
+            "'evidence' means a specific diff region, file path, or symbol name",
+            system_prompt,
+        )
+        self.assertIn("Do not suggest 'translate this comment/docstring to Korean'", system_prompt)
+        self.assertIn("U+AC00 to U+D7A3", system_prompt)
+        # 영문 판정 기준이 'entirely ASCII' 에서 'contains no Hangul characters' 로 바뀐 것을
+        # 고정한다. em-dash 나 이모지 같은 비-ASCII 기호가 섞여도 영문 주석으로 판정 가능.
+        self.assertIn(
+            "Treat a comment as English only when it contains no Hangul characters",
+            system_prompt,
+        )
+        self.assertNotIn("Only treat a comment as English when it is entirely ASCII", system_prompt)
+        self.assertIn(
+            "verify that the same string or logic is not already present in the diff or base file",
+            system_prompt,
+        )
+        # Confidence gradient 가 두 단계로 나뉘고, must_fix → suggestions 버킷 이동과
+        # comments[] severity 양쪽을 모두 포함하는지 고정한다.
+        self.assertIn("Confidence gradient:", system_prompt)
+        self.assertIn(
+            "if a finding's validity itself is uncertain, drop it or demote to the lowest tier",
+            system_prompt,
+        )
+        self.assertIn("move from must_fix to suggestions", system_prompt)
+        self.assertIn(
+            "if the finding is valid but its severity is ambiguous, default to 'Minor'",
+            system_prompt,
+        )
+        self.assertIn(
+            "any must_fix entry require concrete code evidence",
+            system_prompt,
+        )
+        # 기존 severity 섹션의 "When in doubt use Minor" 는 gradient 로 흡수돼 빠졌는지 확인.
+        self.assertNotIn("When in doubt use Minor", system_prompt)
+
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)

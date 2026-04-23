@@ -46,8 +46,35 @@ SYSTEM_PROMPT_RULES = (
     "  - Major: bugs, missing exception handling, state inconsistency, concurrency issues, significant missing tests.",
     "  - Minor: readability, duplicated code, naming, small structural improvements.",
     "  - Suggestion: optional alternatives, refactor ideas, style preferences.",
-    "  When in doubt use Minor. The runtime renders severity as a prefix '[Critical]' on GitHub.",
+    # severity 선택 가이드(confidence gradient) 는 Anti-hallucination guardrails 섹션에서
+    # 버킷 demote 규칙과 함께 한 번에 설명하므로 여기서는 렌더링 동작만 남긴다.
+    "  The runtime renders severity as a prefix '[Critical]' on GitHub.",
     "event rule: REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment. APPROVE is used ONLY when must_fix, suggestions, and comments are all empty (the diff has no findings at all). Minor/Suggestion line comments or any suggestions keep event at COMMENT. The runtime enforces all three branches automatically, so do not try to game event.",
+    # 환각 방지 가드레일: 지적을 생성하기 전에 실제 코드를 읽고 근거를 확인하도록
+    # 강제해, 7B 모델의 '추측성 지적' 과 '중복 제안' 을 줄이는 것이 목적이다.
+    "Anti-hallucination guardrails (apply to every finding before emitting):",
+    # (a) 해당 파일의 실제 라인을 읽었는가 (b) 이미 구현돼 있지 않은가 (c) 구체 근거를 댈 수 있는가.
+    # 근거의 형태는 버킷별로 다르다: comments[] 는 라인 코멘트이므로 line number 필수,
+    # must_fix / suggestions 는 전역 버킷이라 특정 diff 영역 · 파일 경로 · 심볼 명 정도의 근거면
+    # 충분하다. 하나라도 '아니오' 면 해당 지적을 drop.
+    "  - Self-check before emitting any must_fix, suggestions, or comments[] entry: (a) have I actually read the affected lines in this diff or base file, (b) is my suggestion already implemented elsewhere in the same diff or base file, (c) can I cite concrete evidence? For comments[], 'evidence' means a specific line number. For must_fix and suggestions, which are file- or diff-wide buckets, 'evidence' means a specific diff region, file path, or symbol name. If any answer is 'no', drop the finding entirely.",
+    # 주석/docstring 을 '한국어로 번역해라' 는 제안을 겉만 보고 내지 마라. 한국어 주석에는
+    # class, return, import 같은 영문 토큰이 자주 섞이므로 영문 토큰 존재만으로 '영문 주석' 이라
+    # 판단할 수 없다. 판정 기준은 한글 코드포인트 존재 여부만 본다: 주석에 Hangul
+    # (U+AC00-U+D7A3) 이 하나라도 있으면 이미 한국어. 반대로 '영문' 은 'ASCII only' 가 아니라
+    # '한글 부재' 로 판정해, em-dash 나 따옴표, 이모지 같은 비-ASCII 기호가 섞여도 정당한
+    # 영문 주석이 번역 대상 판정에서 빠지지 않도록 한다.
+    "  - Do not suggest 'translate this comment/docstring to Korean' based on surface skimming. Korean comments routinely embed English tokens (class, return, import, etc.). If the comment contains even one Hangul character in the U+AC00 to U+D7A3 range, it is already Korean - do not flag it. Treat a comment as English only when it contains no Hangul characters (non-ASCII punctuation or symbols alone do not make it Korean).",
+    # '기능/안내/UI 문자열을 추가하라' 는 제안을 내기 전에, 해당 문자열·로직이 이미
+    # diff 나 기존 파일에 존재하지 않는지 먼저 확인하라. '⚠️', '자동 전환', '리뷰 범위' 같은
+    # UI 텍스트 제안이 전형적으로 '이미 있는데 또 추가하라' 는 환각으로 이어진다.
+    "  - Before proposing that a feature, notice, UI string, or docstring be added, verify that the same string or logic is not already present in the diff or base file. Suggestions that ask for something the code already does are forbidden.",
+    # Confidence gradient 는 두 단계로 나뉜다:
+    # (a) 지적 자체가 valid 한지 애매 → drop 또는 가장 낮은 등급 (comments 는 Suggestion,
+    #     must_fix 는 suggestions 배열로 이동).
+    # (b) 지적은 valid 하지만 severity 가 애매 → comments 는 Minor 로 기본값.
+    # Critical / Major / must_fix 는 반드시 diff 에 보이는 구체 근거가 있을 때만 사용한다.
+    "  - Confidence gradient: (a) if a finding's validity itself is uncertain, drop it or demote to the lowest tier — 'Suggestion' severity for comments[], or move from must_fix to suggestions; (b) if the finding is valid but its severity is ambiguous, default to 'Minor' for comments[]. Critical, Major, and any must_fix entry require concrete code evidence visible in the diff.",
     "Hard bans that apply everywhere:",
     "  - No praise-only line comments.",
     "  - No line comments that merely narrate the diff ('MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다').",
