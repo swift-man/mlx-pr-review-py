@@ -95,6 +95,22 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
         # severity 키가 없어도 None 으로 명시적으로 보존돼야 서비스 계층이 Minor 로 폴백한다.
         self.assertIsNone(normalized["severity"])
 
+    def test_normalize_event_value_accepts_approve_when_no_comments(self) -> None:
+        # 지적이 없을 때 모델이 APPROVE 를 emit 하면 파서가 그대로 보존한다.
+        self.assertEqual(
+            mlx_review_parser.normalize_event_value("APPROVE", has_comments=False),
+            "APPROVE",
+        )
+
+    def test_normalize_event_value_downgrades_approve_when_comments_exist(self) -> None:
+        # 라인 코멘트가 있는 상태에서의 APPROVE 는 서비스 계층이 severity 로 다시
+        # 판정하도록 COMMENT 로 낮춘다. 여기서 잘못 APPROVE 를 유지하면 런타임이
+        # 다시 올릴 기회가 사라진다.
+        self.assertEqual(
+            mlx_review_parser.normalize_event_value("approve", has_comments=True),
+            "COMMENT",
+        )
+
     def test_parse_and_normalize_carries_severity_end_to_end(self) -> None:
         # 모델이 보낸 severity 가 파싱 → 정규화 파이프라인 끝까지 살아남는지 확인.
         # 이 경로가 끊기면 모든 모델 라인 코멘트가 서비스 계층에서 Minor 로 강등된다.

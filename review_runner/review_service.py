@@ -1337,18 +1337,28 @@ def collect_validated_comments(
     return comments, stats
 
 
-def decide_review_event(raw_event: Any, *, should_request_changes: bool) -> str:
+def decide_review_event(
+    raw_event: Any,
+    *,
+    should_request_changes: bool,
+    has_any_finding: bool,
+) -> str:
     """모델이 event 를 어떻게 보냈든 최종 리뷰 이벤트를 일관되게 정한다.
 
-    should_request_changes 가 True 이면 REQUEST_CHANGES 로 강제한다. 호출부에서
-    must_fix 존재 여부 같은 '차단성 있는 findings' 만 이 값에 반영해야 한다.
-    suggestions 만 있는 경우는 False 를 전달해 COMMENT 로 내려가게 한다.
+    3 단계 판정:
+    - should_request_changes=True → REQUEST_CHANGES. must_fix 또는 Critical/Major
+      라인 코멘트가 있으면 이 분기로 간다. 모델이 APPROVE 를 보냈더라도 무시한다.
+    - has_any_finding=False → APPROVE. 지적이 하나도 없을 때만. 모델이 COMMENT 를
+      보냈더라도 승격해 '명시적 승인' 의사를 남긴다.
+    - 나머지(suggestions 또는 Minor 라인 코멘트만 있는 경우) → COMMENT.
+
+    raw_event 가 유효한 문자열이 아니어도 최종 분기는 should_request_changes /
+    has_any_finding 플래그로만 결정되므로 안전하다.
     """
-    event = normalize_text(raw_event).upper()
-    if event not in {"COMMENT", "REQUEST_CHANGES"}:
-        return "REQUEST_CHANGES" if should_request_changes else "COMMENT"
     if should_request_changes:
         return "REQUEST_CHANGES"
+    if not has_any_finding:
+        return "APPROVE"
     return "COMMENT"
 
 
@@ -1411,7 +1421,13 @@ def validate_mlx_output(
     should_request_changes = bool(must_fix or blocking_comments)
     # summary 재작성 등은 '뭐라도 남길 내용이 있는지' 로 판단하므로 has_findings 는 별도.
     has_findings = bool(comments or must_fix or suggestions)
-    event = decide_review_event(result.get("event"), should_request_changes=should_request_changes)
+    # APPROVE 는 '지적이 전혀 없을 때만' 부여한다. suggestions 나 Minor 라인 코멘트가
+    # 있으면 검토는 끝났지만 완전 승인은 아니므로 COMMENT 로 남긴다.
+    event = decide_review_event(
+        result.get("event"),
+        should_request_changes=should_request_changes,
+        has_any_finding=has_findings,
+    )
 
     if not has_findings:
         summary = sanitize_summary(summary, has_findings=False)

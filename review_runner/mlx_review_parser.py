@@ -360,10 +360,20 @@ def extract_section_items(text: str, key: str, item_pattern: re.Pattern[str]) ->
 
 
 def normalize_event_value(raw_event: str, *, has_comments: bool) -> str:
+    """파서 단계에서는 3 가지 이벤트(APPROVE/COMMENT/REQUEST_CHANGES) 를 모두 수용한다.
+
+    실제 승격·다운그레이드 규칙(must_fix / Critical·Major 라인 코멘트 기반) 은
+    review_service.decide_review_event 가 최종 확정한다. 파서는 알 수 없는 값을
+    안전한 기본값으로만 치환한다.
+    """
     event = raw_event.strip().upper()
-    if event not in {"COMMENT", "REQUEST_CHANGES"}:
+    if event not in {"APPROVE", "COMMENT", "REQUEST_CHANGES"}:
         return "REQUEST_CHANGES" if has_comments else "COMMENT"
-    if not has_comments:
+    if has_comments and event == "APPROVE":
+        # 라인 코멘트가 달린 상태에서의 APPROVE 는 드문 경우라 서비스 계층이
+        # severity 기반으로 다시 판정하도록 COMMENT 로 낮춘다.
+        return "COMMENT"
+    if not has_comments and event == "REQUEST_CHANGES":
         return "COMMENT"
     return event
 

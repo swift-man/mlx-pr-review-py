@@ -226,9 +226,11 @@ class ReviewNormalizationTests(unittest.TestCase):
 
         # 긍정 어투("가독성을 높였습니다") 로 concerns 에 실려온 항목은 legacy_concerns 경로로
         # 통과하더라도 sanitize_text_items 가 looks_like_positive_only_concern 으로 drop 한다.
+        # 결과적으로 must_fix / suggestions / comments 가 모두 비어 '지적 없음' 상태가 되므로
+        # 최종 event 는 APPROVE 로 승격된다 (Phase 3: APPROVE 지원).
         self.assertEqual(validated.must_fix, [])
         self.assertEqual(validated.suggestions, [])
-        self.assertEqual(validated.event, "COMMENT")
+        self.assertEqual(validated.event, "APPROVE")
         self.assertEqual(
             validated.positives,
             ["dataclass를 도입해 필드 계약이 한눈에 드러나고 초기화 보일러플레이트가 줄었습니다."],
@@ -552,6 +554,82 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         for raw, expected in cases.items():
             with self.subTest(raw=raw):
                 self.assertEqual(review_service.normalize_severity(raw), expected)
+
+    def test_no_findings_at_all_results_in_approve_event(self) -> None:
+        # must_fix / suggestions / comments 모두 비어 있으면 명시적 승인(APPROVE) 으로
+        # 올려야 한다. 모델이 COMMENT 로 emit 해도 런타임이 APPROVE 로 승격한다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "이 PR 은 안정적으로 보입니다.",
+                "event": "COMMENT",  # 의도적으로 낮은 값 - 런타임이 올려야 함
+                "positives": ["캐시 계약을 분명히 한 부분이 돋보입니다."],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.event, "APPROVE")
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.suggestions, [])
+        self.assertEqual(validated.comments, [])
+
+    def test_suggestions_only_stays_at_comment_not_approve(self) -> None:
+        # suggestions 가 있으면 검토는 끝났지만 완전 승인은 아니므로 COMMENT 로 남긴다.
+        # APPROVE 로 튀지 않는지가 핵심 — '권장 개선이 있는 PR' 도 APPROVE 로 찍히면
+        # 리뷰어 신호가 왜곡된다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "구조를 정리했습니다.",
+                "event": "APPROVE",  # 모델이 과하게 emit 해도 런타임이 다운그레이드
+                "positives": [],
+                "must_fix": [],
+                "suggestions": ["네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다."],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.event, "COMMENT")
+        self.assertTrue(validated.suggestions)
+
+    def test_minor_line_comment_alone_stays_at_comment_not_approve(self) -> None:
+        # Minor 라인 코멘트가 하나라도 있으면 APPROVE 가 아니라 COMMENT. 라인 코멘트가
+        # 비어 있어야 APPROVE 조건이 충족된다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "네이밍 정리.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Minor",
+                        "body": "네이밍을 통일하면 일관성이 좋아집니다.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.event, "COMMENT")
+        self.assertEqual(len(validated.comments), 1)
+
+    def test_must_fix_beats_model_approve_emission(self) -> None:
+        # 모델이 APPROVE 를 보내도 must_fix 가 있으면 REQUEST_CHANGES 로 강제된다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "보안 체크를 확인해야 합니다.",
+                "event": "APPROVE",  # 모델이 잘못 보낸 경우
+                "positives": [],
+                "must_fix": ["signature 검증이 제거되어 인증 우회 위험이 있습니다."],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
 
     def test_unknown_severity_value_from_model_falls_back_to_minor(self) -> None:
         # 모델이 매핑에 없는 비표준 등급(p0, urgent 등) 을 보내도 Minor 로 안전 폴백.
