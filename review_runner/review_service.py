@@ -1338,22 +1338,20 @@ def collect_validated_comments(
 
 
 def decide_review_event(
-    raw_event: Any,
     *,
     should_request_changes: bool,
     has_any_finding: bool,
 ) -> str:
-    """모델이 event 를 어떻게 보냈든 최종 리뷰 이벤트를 일관되게 정한다.
+    """최종 리뷰 event 를 두 플래그만으로 결정한다.
 
     3 단계 판정:
     - should_request_changes=True → REQUEST_CHANGES. must_fix 또는 Critical/Major
-      라인 코멘트가 있으면 이 분기로 간다. 모델이 APPROVE 를 보냈더라도 무시한다.
-    - has_any_finding=False → APPROVE. 지적이 하나도 없을 때만. 모델이 COMMENT 를
-      보냈더라도 승격해 '명시적 승인' 의사를 남긴다.
+      라인 코멘트가 있으면 이 분기로 간다.
+    - has_any_finding=False → APPROVE. 지적이 하나도 없을 때만. '명시적 승인' 의사.
     - 나머지(suggestions 또는 Minor 라인 코멘트만 있는 경우) → COMMENT.
 
-    raw_event 가 유효한 문자열이 아니어도 최종 분기는 should_request_changes /
-    has_any_finding 플래그로만 결정되므로 안전하다.
+    모델이 event 를 어떻게 emit 하든 결과는 이 두 플래그로만 결정되므로 raw_event
+    인자는 받지 않는다. 필요하다면 호출부에서 로깅 목적으로 모델 원본 값을 따로 보관.
     """
     if should_request_changes:
         return "REQUEST_CHANGES"
@@ -1424,7 +1422,6 @@ def validate_mlx_output(
     # APPROVE 는 '지적이 전혀 없을 때만' 부여한다. suggestions 나 Minor 라인 코멘트가
     # 있으면 검토는 끝났지만 완전 승인은 아니므로 COMMENT 로 남긴다.
     event = decide_review_event(
-        result.get("event"),
         should_request_changes=should_request_changes,
         has_any_finding=has_findings,
     )
