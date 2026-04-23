@@ -53,13 +53,18 @@ SYSTEM_PROMPT_RULES = (
     # 환각 방지 가드레일: 지적을 생성하기 전에 실제 코드를 읽고 근거를 확인하도록
     # 강제해, 7B 모델의 '추측성 지적' 과 '중복 제안' 을 줄이는 것이 목적이다.
     "Anti-hallucination guardrails (apply to every finding before emitting):",
-    # (a) 해당 파일의 실제 라인을 읽었는가 (b) 이미 구현돼 있지 않은가 (c) 근거 라인 번호를 댈 수 있는가.
-    # 하나라도 '아니오' 면 해당 지적을 drop.
-    "  - Self-check before emitting any must_fix, suggestions, or comments[] entry: (a) have I actually read the affected lines in this diff or base file, (b) is my suggestion already implemented elsewhere in the same diff or base file, (c) can I cite a specific line number as evidence? If any answer is 'no', drop the finding entirely.",
+    # (a) 해당 파일의 실제 라인을 읽었는가 (b) 이미 구현돼 있지 않은가 (c) 구체 근거를 댈 수 있는가.
+    # 근거의 형태는 버킷별로 다르다: comments[] 는 라인 코멘트이므로 line number 필수,
+    # must_fix / suggestions 는 전역 버킷이라 특정 diff 영역 · 파일 경로 · 심볼 명 정도의 근거면
+    # 충분하다. 하나라도 '아니오' 면 해당 지적을 drop.
+    "  - Self-check before emitting any must_fix, suggestions, or comments[] entry: (a) have I actually read the affected lines in this diff or base file, (b) is my suggestion already implemented elsewhere in the same diff or base file, (c) can I cite concrete evidence? For comments[], 'evidence' means a specific line number. For must_fix and suggestions, which are file- or diff-wide buckets, 'evidence' means a specific diff region, file path, or symbol name. If any answer is 'no', drop the finding entirely.",
     # 주석/docstring 을 '한국어로 번역해라' 는 제안을 겉만 보고 내지 마라. 한국어 주석에는
     # class, return, import 같은 영문 토큰이 자주 섞이므로 영문 토큰 존재만으로 '영문 주석' 이라
-    # 판단할 수 없다. 주석에 한글(U+AC00-U+D7A3) 문자가 하나라도 있으면 이미 한국어다.
-    "  - Do not suggest 'translate this comment/docstring to Korean' based on surface skimming. Korean comments routinely embed English tokens (class, return, import, etc.). If the comment contains even one Hangul character in the U+AC00 to U+D7A3 range, it is already Korean - do not flag it. Only treat a comment as English when it is entirely ASCII.",
+    # 판단할 수 없다. 판정 기준은 한글 코드포인트 존재 여부만 본다: 주석에 Hangul
+    # (U+AC00-U+D7A3) 이 하나라도 있으면 이미 한국어. 반대로 '영문' 은 'ASCII only' 가 아니라
+    # '한글 부재' 로 판정해, em-dash 나 따옴표, 이모지 같은 비-ASCII 기호가 섞여도 정당한
+    # 영문 주석이 번역 대상 판정에서 빠지지 않도록 한다.
+    "  - Do not suggest 'translate this comment/docstring to Korean' based on surface skimming. Korean comments routinely embed English tokens (class, return, import, etc.). If the comment contains even one Hangul character in the U+AC00 to U+D7A3 range, it is already Korean - do not flag it. Treat a comment as English only when it contains no Hangul characters (non-ASCII punctuation or symbols alone do not make it Korean).",
     # '기능/안내/UI 문자열을 추가하라' 는 제안을 내기 전에, 해당 문자열·로직이 이미
     # diff 나 기존 파일에 존재하지 않는지 먼저 확인하라. '⚠️', '자동 전환', '리뷰 범위' 같은
     # UI 텍스트 제안이 전형적으로 '이미 있는데 또 추가하라' 는 환각으로 이어진다.

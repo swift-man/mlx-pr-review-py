@@ -139,9 +139,27 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("Anti-hallucination guardrails", system_prompt)
         self.assertIn("have I actually read the affected lines", system_prompt)
         self.assertIn("already implemented elsewhere", system_prompt)
-        self.assertIn("cite a specific line number as evidence", system_prompt)
+        # Self-check (c) 는 버킷별로 근거 형태가 다름: comments[] 는 line number,
+        # must_fix / suggestions 는 diff 영역 · 파일 경로 · 심볼 중 하나.
+        self.assertIn("can I cite concrete evidence", system_prompt)
+        self.assertIn("For comments[], 'evidence' means a specific line number", system_prompt)
+        self.assertIn(
+            "For must_fix and suggestions, which are file- or diff-wide buckets",
+            system_prompt,
+        )
+        self.assertIn(
+            "'evidence' means a specific diff region, file path, or symbol name",
+            system_prompt,
+        )
         self.assertIn("Do not suggest 'translate this comment/docstring to Korean'", system_prompt)
         self.assertIn("U+AC00 to U+D7A3", system_prompt)
+        # 영문 판정 기준이 'entirely ASCII' 에서 'contains no Hangul characters' 로 바뀐 것을
+        # 고정한다. em-dash 나 이모지 같은 비-ASCII 기호가 섞여도 영문 주석으로 판정 가능.
+        self.assertIn(
+            "Treat a comment as English only when it contains no Hangul characters",
+            system_prompt,
+        )
+        self.assertNotIn("Only treat a comment as English when it is entirely ASCII", system_prompt)
         self.assertIn(
             "verify that the same string or logic is not already present in the diff or base file",
             system_prompt,
