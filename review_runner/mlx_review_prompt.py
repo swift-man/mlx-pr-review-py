@@ -46,7 +46,9 @@ SYSTEM_PROMPT_RULES = (
     "  - Major: bugs, missing exception handling, state inconsistency, concurrency issues, significant missing tests.",
     "  - Minor: readability, duplicated code, naming, small structural improvements.",
     "  - Suggestion: optional alternatives, refactor ideas, style preferences.",
-    "  When in doubt use Minor. The runtime renders severity as a prefix '[Critical]' on GitHub.",
+    # severity 선택 가이드(confidence gradient) 는 Anti-hallucination guardrails 섹션에서
+    # 버킷 demote 규칙과 함께 한 번에 설명하므로 여기서는 렌더링 동작만 남긴다.
+    "  The runtime renders severity as a prefix '[Critical]' on GitHub.",
     "event rule: REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment. APPROVE is used ONLY when must_fix, suggestions, and comments are all empty (the diff has no findings at all). Minor/Suggestion line comments or any suggestions keep event at COMMENT. The runtime enforces all three branches automatically, so do not try to game event.",
     # 환각 방지 가드레일: 지적을 생성하기 전에 실제 코드를 읽고 근거를 확인하도록
     # 강제해, 7B 모델의 '추측성 지적' 과 '중복 제안' 을 줄이는 것이 목적이다.
@@ -62,9 +64,12 @@ SYSTEM_PROMPT_RULES = (
     # diff 나 기존 파일에 존재하지 않는지 먼저 확인하라. '⚠️', '자동 전환', '리뷰 범위' 같은
     # UI 텍스트 제안이 전형적으로 '이미 있는데 또 추가하라' 는 환각으로 이어진다.
     "  - Before proposing that a feature, notice, UI string, or docstring be added, verify that the same string or logic is not already present in the diff or base file. Suggestions that ask for something the code already does are forbidden.",
-    # 확신이 낮으면 severity 를 'Suggestion' 으로 낮추거나 지적을 아예 생략하라.
-    # Critical/Major/Minor 는 구체적 코드 근거가 있을 때만 허용.
-    "  - Low-confidence findings must be downgraded to severity 'Suggestion' or dropped entirely. Critical, Major, and Minor require concrete code evidence; when in doubt, drop the finding rather than guess.",
+    # Confidence gradient 는 두 단계로 나뉜다:
+    # (a) 지적 자체가 valid 한지 애매 → drop 또는 가장 낮은 등급 (comments 는 Suggestion,
+    #     must_fix 는 suggestions 배열로 이동).
+    # (b) 지적은 valid 하지만 severity 가 애매 → comments 는 Minor 로 기본값.
+    # Critical / Major / must_fix 는 반드시 diff 에 보이는 구체 근거가 있을 때만 사용한다.
+    "  - Confidence gradient: (a) if a finding's validity itself is uncertain, drop it or demote to the lowest tier — 'Suggestion' severity for comments[], or move from must_fix to suggestions; (b) if the finding is valid but its severity is ambiguous, default to 'Minor' for comments[]. Critical, Major, and any must_fix entry require concrete code evidence visible in the diff.",
     "Hard bans that apply everywhere:",
     "  - No praise-only line comments.",
     "  - No line comments that merely narrate the diff ('MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다').",

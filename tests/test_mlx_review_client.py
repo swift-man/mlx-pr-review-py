@@ -146,10 +146,24 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
             "verify that the same string or logic is not already present in the diff or base file",
             system_prompt,
         )
+        # Confidence gradient 가 두 단계로 나뉘고, must_fix → suggestions 버킷 이동과
+        # comments[] severity 양쪽을 모두 포함하는지 고정한다.
+        self.assertIn("Confidence gradient:", system_prompt)
         self.assertIn(
-            "Low-confidence findings must be downgraded to severity 'Suggestion' or dropped entirely",
+            "if a finding's validity itself is uncertain, drop it or demote to the lowest tier",
             system_prompt,
         )
+        self.assertIn("move from must_fix to suggestions", system_prompt)
+        self.assertIn(
+            "if the finding is valid but its severity is ambiguous, default to 'Minor'",
+            system_prompt,
+        )
+        self.assertIn(
+            "any must_fix entry require concrete code evidence",
+            system_prompt,
+        )
+        # 기존 severity 섹션의 "When in doubt use Minor" 는 gradient 로 흡수돼 빠졌는지 확인.
+        self.assertNotIn("When in doubt use Minor", system_prompt)
 
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
