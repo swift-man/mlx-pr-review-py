@@ -19,7 +19,7 @@ SYSTEM_PROMPT_RULES = (
     "Use only these top-level keys: summary, event, positives, must_fix, suggestions, comments.",
     "positives, must_fix, suggestions must be JSON arrays of strings. comments must be a JSON array of {path, line, body} objects.",
     "Write every natural-language string in Korean. File paths, symbols, API names may stay in English when translation would be incorrect.",
-    "event must be \"COMMENT\" or \"REQUEST_CHANGES\". The runtime rewrites event based on must_fix, so do not obsess over it.",
+    "event must be one of \"APPROVE\", \"COMMENT\", or \"REQUEST_CHANGES\". The runtime rewrites event based on must_fix and severity, so do not obsess over it. Use APPROVE only when must_fix, suggestions, and comments are all empty.",
     "Review priority (tackle higher items first):",
     "  1. Bugs, missing exception handling, incorrect error paths.",
     "  2. Data loss, inconsistent state, broken invariants.",
@@ -47,7 +47,7 @@ SYSTEM_PROMPT_RULES = (
     "  - Minor: readability, duplicated code, naming, small structural improvements.",
     "  - Suggestion: optional alternatives, refactor ideas, style preferences.",
     "  When in doubt use Minor. The runtime renders severity as a prefix '[Critical]' on GitHub.",
-    "event rule: REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment. Minor and Suggestion line comments alone keep event at COMMENT. The runtime enforces this automatically, so do not try to game event.",
+    "event rule: REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment. APPROVE is used ONLY when must_fix, suggestions, and comments are all empty (the diff has no findings at all). Minor/Suggestion line comments or any suggestions keep event at COMMENT. The runtime enforces all three branches automatically, so do not try to game event.",
     "Hard bans that apply everywhere:",
     "  - No praise-only line comments.",
     "  - No line comments that merely narrate the diff ('MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다').",
@@ -77,7 +77,9 @@ RESPONSE_SHAPE_TEMPLATE = (
 )
 
 EMPTY_RESULT_TEMPLATE = (
-    '{"summary":"...","event":"COMMENT","positives":["..."],'
+    # 지적이 없을 때는 APPROVE 를 쓴다. 런타임도 동일하게 판정하므로 모델이 먼저
+    # APPROVE 를 emit 하면 그대로 통과, COMMENT 를 emit 해도 런타임이 APPROVE 로 올려준다.
+    '{"summary":"...","event":"APPROVE","positives":["..."],'
     '"must_fix":[],"suggestions":[],"comments":[]}'
 )
 

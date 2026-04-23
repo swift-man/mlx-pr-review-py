@@ -116,12 +116,23 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("Minor", system_prompt)
         self.assertIn("Suggestion", system_prompt)
         self.assertIn('"severity":"Major"', system_prompt)
-        # event 강제 규칙이 must_fix 와 라인 코멘트 두 경로를 모두 명시적으로 포함하는지.
+        # event 강제 규칙이 세 분기(REQUEST_CHANGES / APPROVE / COMMENT) 를 모두 노출하는지.
         self.assertIn(
             "REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment",
             system_prompt,
         )
-        self.assertIn("Minor and Suggestion line comments alone keep event at COMMENT", system_prompt)
+        self.assertIn(
+            "APPROVE is used ONLY when must_fix, suggestions, and comments are all empty",
+            system_prompt,
+        )
+        self.assertIn(
+            "Minor/Suggestion line comments or any suggestions keep event at COMMENT",
+            system_prompt,
+        )
+        # event enum 자체에 APPROVE 가 포함돼 있는지
+        self.assertIn('"APPROVE"', system_prompt)
+        # 빈 결과 템플릿도 APPROVE 를 기본 event 로 제시하는지
+        self.assertIn('"event":"APPROVE"', system_prompt)
 
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
