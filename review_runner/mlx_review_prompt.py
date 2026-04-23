@@ -48,6 +48,23 @@ SYSTEM_PROMPT_RULES = (
     "  - Suggestion: optional alternatives, refactor ideas, style preferences.",
     "  When in doubt use Minor. The runtime renders severity as a prefix '[Critical]' on GitHub.",
     "event rule: REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment. APPROVE is used ONLY when must_fix, suggestions, and comments are all empty (the diff has no findings at all). Minor/Suggestion line comments or any suggestions keep event at COMMENT. The runtime enforces all three branches automatically, so do not try to game event.",
+    # 환각 방지 가드레일: 지적을 생성하기 전에 실제 코드를 읽고 근거를 확인하도록
+    # 강제해, 7B 모델의 '추측성 지적' 과 '중복 제안' 을 줄이는 것이 목적이다.
+    "Anti-hallucination guardrails (apply to every finding before emitting):",
+    # (a) 해당 파일의 실제 라인을 읽었는가 (b) 이미 구현돼 있지 않은가 (c) 근거 라인 번호를 댈 수 있는가.
+    # 하나라도 '아니오' 면 해당 지적을 drop.
+    "  - Self-check before emitting any must_fix, suggestions, or comments[] entry: (a) have I actually read the affected lines in this diff or base file, (b) is my suggestion already implemented elsewhere in the same diff or base file, (c) can I cite a specific line number as evidence? If any answer is 'no', drop the finding entirely.",
+    # 주석/docstring 을 '한국어로 번역해라' 는 제안을 겉만 보고 내지 마라. 한국어 주석에는
+    # class, return, import 같은 영문 토큰이 자주 섞이므로 영문 토큰 존재만으로 '영문 주석' 이라
+    # 판단할 수 없다. 주석에 한글(U+AC00-U+D7A3) 문자가 하나라도 있으면 이미 한국어다.
+    "  - Do not suggest 'translate this comment/docstring to Korean' based on surface skimming. Korean comments routinely embed English tokens (class, return, import, etc.). If the comment contains even one Hangul character in the U+AC00 to U+D7A3 range, it is already Korean - do not flag it. Only treat a comment as English when it is entirely ASCII.",
+    # '기능/안내/UI 문자열을 추가하라' 는 제안을 내기 전에, 해당 문자열·로직이 이미
+    # diff 나 기존 파일에 존재하지 않는지 먼저 확인하라. '⚠️', '자동 전환', '리뷰 범위' 같은
+    # UI 텍스트 제안이 전형적으로 '이미 있는데 또 추가하라' 는 환각으로 이어진다.
+    "  - Before proposing that a feature, notice, UI string, or docstring be added, verify that the same string or logic is not already present in the diff or base file. Suggestions that ask for something the code already does are forbidden.",
+    # 확신이 낮으면 severity 를 'Suggestion' 으로 낮추거나 지적을 아예 생략하라.
+    # Critical/Major/Minor 는 구체적 코드 근거가 있을 때만 허용.
+    "  - Low-confidence findings must be downgraded to severity 'Suggestion' or dropped entirely. Critical, Major, and Minor require concrete code evidence; when in doubt, drop the finding rather than guess.",
     "Hard bans that apply everywhere:",
     "  - No praise-only line comments.",
     "  - No line comments that merely narrate the diff ('MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다').",

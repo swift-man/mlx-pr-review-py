@@ -134,6 +134,23 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 빈 결과 템플릿도 APPROVE 를 기본 event 로 제시하는지
         self.assertIn('"event":"APPROVE"', system_prompt)
 
+        # 환각 방지 가드레일 4가지가 프롬프트에 그대로 노출되는지 — 7B 모델이 추측성
+        # 지적/중복 제안을 내지 않도록 라인 코멘트 생성 전 자체 점검을 강제하는 규칙.
+        self.assertIn("Anti-hallucination guardrails", system_prompt)
+        self.assertIn("have I actually read the affected lines", system_prompt)
+        self.assertIn("already implemented elsewhere", system_prompt)
+        self.assertIn("cite a specific line number as evidence", system_prompt)
+        self.assertIn("Do not suggest 'translate this comment/docstring to Korean'", system_prompt)
+        self.assertIn("U+AC00 to U+D7A3", system_prompt)
+        self.assertIn(
+            "verify that the same string or logic is not already present in the diff or base file",
+            system_prompt,
+        )
+        self.assertIn(
+            "Low-confidence findings must be downgraded to severity 'Suggestion' or dropped entirely",
+            system_prompt,
+        )
+
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)
