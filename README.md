@@ -457,7 +457,7 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 
 ## 15. 7B 모델 전용 품질 보정 레이어 (모델 업그레이드 시 제거 대상)
 
-현재 기본 모델인 `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` 는 PR diff 를 정확히 읽지 못하고 다음 세 가지 실패 패턴을 반복합니다. 이 패턴들을 **프롬프트 가드레일 + 후처리 필터** 로 막고 있으며, 향후 14B 이상 모델로 업그레이드하면 **아래 목록을 순서대로 제거하고 회귀 테스트를 돌려 유지 여부를 결정**하세요.
+현재 기본 모델인 `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` 는 PR diff 를 정확히 읽지 못하고 다음 세 가지 실패 패턴을 반복합니다. 이 패턴들을 **프롬프트 가드레일 + 후처리 필터** 로 막고 있으며, 향후 14B 이상 모델로 업그레이드하면 **§15-5 에 명시된 역순(C → B → A)으로 제거하고 회귀 테스트를 돌려 유지 여부를 결정**하세요. 문서 배치 순서(A → B → C)는 설명의 논리 흐름이고, 실제 제거 순서는 바깥 계층부터입니다.
 
 > 📌 **위치 탐색 안내**: 아래 표의 심볼명이 현재 파일에서 어디 있는지는 `rg <symbol> review_runner/` (또는 ripgrep 이 없으면 `git grep <symbol> review_runner/`) 로 즉시 찾을 수 있습니다. 라인 번호는 코드 변경에 따라 drift 하므로 이 문서에서는 심볼명만 유지합니다.
 
@@ -488,7 +488,7 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 1. 세 패턴(역해석 / 환각 / 중복 출력) 이 **한 건도 재현되지 않음**.
 2. Critical / Major 등급이 **영향(impact) 서술 없이 남발되지 않음**. 위 표에 `severity enforcement` 가 A 계층 책임으로 들어가 있으므로 이 조건이 빠지면 severity 오남용을 감지할 도구가 사라진다.
 
-샘플이 부족하다 판단되면 각 PR 을 반복 실행해 샘플을 확보하되 판정 기준은 여전히 "재현 0 건" 및 "오남용 0 건".
+샘플 확장 시 주의: 기본 `MLX_TEMPERATURE=0.0` 에서는 같은 입력이 항상 같은 출력을 내므로 **단순 반복 실행은 샘플 다양성을 늘리지 못한다**. 샘플을 늘리려면 (1) `MLX_TEMPERATURE` 를 올려 비결정 샘플링을 활성화하거나, (2) 서로 다른 PR / commit fixture 를 15-1 목록에 추가하는 방향으로 간다. 어느 쪽이든 판정 기준은 여전히 "재현 0 건" 및 "오남용 0 건".
 
 ### 15-3. B 계층 — 후처리 필터 (`review_runner/review_service.py`)
 
@@ -502,18 +502,20 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 | `POSITIVE_CONCERN_MARKERS` | "가독성을 높", "개선되었습니다" 류 positive-shaped concern |
 | `NO_CONCERN_TEXTS` | "개선이 필요한 점은 없습니다" 같은 placeholder 차단 |
 | `PROMPT_ECHO_MARKERS` | 프롬프트 본문을 finding 으로 재진술 |
-| `DESCRIPTIVE_NARRATION_SUFFIXES` | "~되었습니다" 로 끝나는 서술형 concern |
+| `DESCRIPTIVE_NARRATION_SUFFIXES` | "~되었습니다" 로 끝나는 서술형 `must_fix` / `suggestions` 항목 |
 | `CONCERN_RISK_MARKERS` | 서술형 어미 허용 여부 판단용 위험 어휘 whitelist |
 | `looks_like_praise_only_comment` | 칭찬만 있는 line comment 차단 |
-| `normalize_severity` | 'blocker/high/low/nit' 같은 관용어 severity 정규화 |
 | `looks_like_prompt_echo` / `looks_like_diff_stat_dump` / `looks_like_generic_positive` / `looks_like_generic_model_change_comment` / `looks_like_process_policy_comment` / `looks_like_descriptive_change_narration` / `looks_like_positive_only_concern` / `looks_like_identifier_localization_comment` / `looks_like_no_findings_summary` | 위 marker 들을 각 지적 유형에 적용하는 판정 함수들 |
 | `split_legacy_concerns` | 구 스키마 `concerns` 를 risk marker 기준으로 `must_fix` / `suggestions` 분배 |
 
-**제거 기준**: 회귀 PR 4 개 케이스를 **후처리 필터를 비활성화한 상태** 로 새 모델에 돌렸을 때, **원본 모델 출력** 에서 해당 marker 가 겨냥하는 패턴이 한 건도 나타나지 않으면 해당 marker·함수 쌍 제거. 예를 들어 `LOW_SIGNAL_POSITIVE_MARKERS` 의 제거는 원본 출력의 positives 배열에 "PR diff 가 잘 작성되었습니다" 류 저신호 칭찬이 없는지로 판정, `DESCRIPTIVE_NARRATION_SUFFIXES` 는 concerns/must_fix 에 "~되었습니다" 서술형 어미가 없는지로 판정.
+> ⚠️ **`normalize_severity` 는 B 계층 marker filter 와 분리**: `normalize_severity` 는 'blocker/high/low/nit' 같은 관용어를 canonical severity enum 으로 정규화하는 **호환 레이어** 이지, 실패 패턴을 걸러내는 필터가 아닙니다. 아래 B 계층 제거 기준으로 판단하지 말고, **새 모델이 항상 Canonical severity(Critical/Major/Minor/Suggestion)만 emit 한다고 확인된 뒤에만** 제거하세요. 조기 제거 시 관용어가 전부 Minor 로 폴백돼 event 라우팅이 왜곡됩니다.
 
-비활성화는 **두 곳을 모두 bypass** 해야 B 계층이 완전히 꺼진다 (한쪽만 우회하면 라인 코멘트 경로가 계속 필터링됨):
-1. `validate_mlx_output` 내부의 `sanitize_text_items` / `sanitize_positive_items` — must_fix / suggestions / positives 필터링
+**제거 기준**: 회귀 PR 4 개 케이스를 **후처리 필터를 비활성화한 상태** 로 새 모델에 돌렸을 때, **원본 모델 출력** 에서 해당 marker 가 겨냥하는 패턴이 한 건도 나타나지 않으면 해당 marker·함수 쌍 제거. 예를 들어 `LOW_SIGNAL_POSITIVE_MARKERS` 의 제거는 원본 출력의 positives 배열에 "PR diff 가 잘 작성되었습니다" 류 저신호 칭찬이 없는지로 판정, `DESCRIPTIVE_NARRATION_SUFFIXES` 는 `must_fix` / `suggestions` 에 "~되었습니다" 서술형 어미가 없는지로 판정.
+
+비활성화는 **세 곳을 모두 bypass** 해야 B 계층이 완전히 꺼진다. 한 곳이라도 빠지면 해당 경로가 계속 필터링돼 판정이 낙관적으로 왜곡된다:
+1. `validate_mlx_output` 내부의 `sanitize_text_items` / `sanitize_positive_items` — `must_fix` / `suggestions` / `positives` 필터링
 2. `collect_validated_comments` 내부의 `looks_like_praise_only_comment` — `comments[]` 라인 코멘트 필터링
+3. `validate_mlx_output` 내부의 `sanitize_summary` — `summary` 경로에서 `looks_like_prompt_echo` / `looks_like_diff_stat_dump` / `looks_like_generic_model_change_comment` / `looks_like_no_findings_summary` 필터링
 
 제거 후 [tests/test_review_service.py](tests/test_review_service.py) 의 `DescriptiveChangeNarrationTests`, `SplitLegacyConcernsTests` 등 관련 테스트도 함께 삭제.
 
@@ -537,12 +539,13 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 
 1. 회귀용 테스트 픽스처 확인: `tests/fixtures/mlx_outputs/` 에 현재 세 패턴에 해당하는 샘플 출력이 저장돼 있는지 확인하고, 없으면 배포 로그에서 수집해 먼저 추가.
 2. 제거 순서: C → B → A (바깥쪽 보정 먼저, 프롬프트는 마지막). 각 단계에서 `python3 -m unittest discover -s tests` 통과 확인.
-3. B 계층 (후처리 필터) 판정은 **필터 비활성 원본 출력** 을 기준으로 한다. **두 곳** 을 모두 bypass 해야 완전 비활성:
-   - `validate_mlx_output` 내부의 `sanitize_text_items` / `sanitize_positive_items` (must_fix / suggestions / positives 경로)
+3. B 계층 (후처리 필터) 판정은 **필터 비활성 원본 출력** 을 기준으로 한다. **세 곳** 을 모두 bypass 해야 완전 비활성:
+   - `validate_mlx_output` 내부의 `sanitize_text_items` / `sanitize_positive_items` (`must_fix` / `suggestions` / `positives` 경로)
    - `collect_validated_comments` 내부의 `looks_like_praise_only_comment` (`comments[]` 라인 코멘트 경로)
+   - `validate_mlx_output` 내부의 `sanitize_summary` (`summary` 경로)
 
-   한쪽만 우회하면 라인 코멘트가 계속 걸러져 판정이 왜곡된다. 테스트 픽스처용으로 raw JSON 을 저장해 육안 비교 가능.
-4. 실전 회귀: 위 15-1 의 4 개 PR 케이스를 새 모델로 돌려 세 패턴이 **한 건도 재현되지 않는지** 확인. 샘플이 부족하다 판단되면 각 PR 을 반복 실행해 수를 늘리되 판정 기준은 여전히 "재현 0 건".
+   한 곳이라도 빠지면 해당 경로가 계속 필터링돼 판정이 낙관적으로 왜곡된다. 테스트 픽스처용으로 raw JSON 을 저장해 육안 비교 가능.
+4. 실전 회귀: 위 15-1 의 4 개 PR 케이스를 새 모델로 돌려 세 패턴이 **한 건도 재현되지 않는지** 확인. 기본 `MLX_TEMPERATURE=0.0` 에서는 반복 실행이 같은 출력만 내므로, 샘플을 늘리려면 비결정 샘플링(`MLX_TEMPERATURE` 상향)을 켜거나 15-1 에 새 PR/commit fixture 를 추가한다. 어느 쪽이든 판정 기준은 "재현 0 건".
 5. ESM/CJS positive control 통과도 함께 확인 (차단 이슈를 여전히 잡는지).
 
 > 🛠️ **향후 개선 후보**: 위 bypass 가 매번 코드 수정이라 번거로우므로, `MLX_BYPASS_FILTERS=1` 환경변수로 두 경로를 한 번에 끄는 스위치를 별도 PR 로 도입하면 이 절차가 "환경변수 설정 → 재실행" 한 줄로 축소될 수 있다.
