@@ -459,7 +459,7 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 
 현재 기본 모델인 `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` 는 PR diff 를 정확히 읽지 못하고 다음 세 가지 실패 패턴을 반복합니다. 이 패턴들을 **프롬프트 가드레일 + 후처리 필터** 로 막고 있으며, 향후 14B 이상 모델로 업그레이드하면 **§15-5 에 명시된 역순(C → B → A)으로 제거하고 회귀 테스트를 돌려 유지 여부를 결정**하세요. 문서 배치 순서(A → B → C)는 설명의 논리 흐름이고, 실제 제거 순서는 바깥 계층부터입니다.
 
-> 📌 **위치 탐색 안내**: 아래 표의 심볼명이 현재 파일에서 어디 있는지는 `rg <symbol> review_runner/` (또는 ripgrep 이 없으면 `git grep <symbol> review_runner/`) 로 즉시 찾을 수 있습니다. 라인 번호는 코드 변경에 따라 drift 하므로 이 문서에서는 심볼명만 유지합니다.
+> 📌 **위치 탐색 안내**: 아래 표의 심볼명이 `review_runner/` 디렉터리 내 어디에 있는지는 `rg <symbol> review_runner/` (또는 ripgrep 이 없으면 `git grep <symbol> review_runner/`) 로 즉시 찾을 수 있습니다. 라인 번호는 코드 변경에 따라 drift 하므로 이 문서에서는 심볼명만 유지합니다.
 
 ### 15-1. 보정 대상 실패 패턴
 
@@ -548,6 +548,6 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 4. 실전 회귀: 위 15-1 의 4 개 PR 케이스를 새 모델로 돌려 세 패턴이 **한 건도 재현되지 않는지** 확인. 기본 `MLX_TEMPERATURE=0.0` 에서는 반복 실행이 같은 출력만 내므로, 샘플을 늘리려면 비결정 샘플링(`MLX_TEMPERATURE` 상향)을 켜거나 15-1 에 새 PR/commit fixture 를 추가한다. 어느 쪽이든 판정 기준은 "재현 0 건".
 5. ESM/CJS positive control 통과도 함께 확인 (차단 이슈를 여전히 잡는지).
 
-> 🛠️ **향후 개선 후보**: 위 bypass 가 매번 코드 수정이라 번거로우므로, `MLX_BYPASS_FILTERS=1` 환경변수로 두 경로를 한 번에 끄는 스위치를 별도 PR 로 도입하면 이 절차가 "환경변수 설정 → 재실행" 한 줄로 축소될 수 있다.
+> 🛠️ **향후 개선 후보**: 위 bypass 가 매번 코드 수정이라 번거로우므로, `MLX_BYPASS_FILTERS=1` 환경변수로 세 경로(`sanitize_text_items` / `looks_like_praise_only_comment` / `sanitize_summary`) 를 한 번에 끄는 스위치를 별도 PR 로 도입하면 이 절차가 "환경변수 설정 → 재실행" 한 줄로 축소될 수 있다.
 
 # review.gorani.me
