@@ -423,8 +423,12 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                     [self._make_pr_file()],
                 )
                 self.assertEqual(validated.event, "REQUEST_CHANGES")
-                # 차단 등급 라인 코멘트 요약은 must_fix 쪽으로 흘러야 상단 섹션에 노출된다.
-                self.assertTrue(validated.must_fix)
+                # 이전에는 차단 등급 라인 코멘트 요약이 must_fix 로 승격됐으나,
+                # dedupe_across_sections 도입으로 원본 라인 코멘트와 동일 내용이면
+                # must_fix 에서 제거된다. event 결정은 blocking_comments 가 담당하므로
+                # must_fix 가 비어도 REQUEST_CHANGES 는 유지된다.
+                self.assertEqual(len(validated.comments), 1)
+                self.assertEqual(validated.comments[0].severity, severity)
 
     def test_minor_comment_alone_stays_at_comment_level(self) -> None:
         # Minor/Suggestion 만 있는 경우에는 REQUEST_CHANGES 가 발동하면 안 된다.
@@ -448,7 +452,10 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         )
         self.assertEqual(validated.event, "COMMENT")
         self.assertEqual(validated.must_fix, [])
-        self.assertTrue(validated.suggestions)
+        # dedupe_across_sections 가 suggestions 의 comment summary 를 원본 라인 코멘트와
+        # 중복으로 판정해 제거하므로, suggestions 가 비어 있어도 정상 — 라인 코멘트는 보존됨.
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, "Minor")
 
     def test_rule_based_secret_logging_comment_gets_critical_severity(self) -> None:
         # 비밀값 로그 감지는 직접 Critical 을 붙이므로 모델이 아무것도 안 보내도
@@ -535,9 +542,10 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(
             validated.comments[0].severity, review_service.SEVERITY_CRITICAL
         )
-        # Critical 이 살아남으면 event 는 REQUEST_CHANGES 로 승격되고 요약은 must_fix 로 간다.
+        # Critical 이 살아남으면 event 는 REQUEST_CHANGES 로 승격된다. (요약이 must_fix 로
+        # 들어가더라도 dedupe_across_sections 가 원본 라인 코멘트와 동일 내용이라 제거하므로
+        # must_fix 는 비어 있는 것이 정상 — blocking_comments 가 event 를 결정한다.)
         self.assertEqual(validated.event, "REQUEST_CHANGES")
-        self.assertTrue(validated.must_fix)
 
     def test_normalize_severity_accepts_common_synonyms(self) -> None:
         # 코드 리뷰 관용어도 4단계로 안전하게 흡수한다.
@@ -707,6 +715,141 @@ class BuildReviewResultTests(unittest.TestCase):
         self.assertEqual(result["suggestion_count"], 0)
         self.assertEqual(result["concern_count"], 0)
         self.assertEqual(result["auth_source"], "personal_access_token")
+
+
+class DedupeAcrossSectionsTests(unittest.TestCase):
+    def test_identical_finding_in_must_fix_and_comment_is_deduped_to_comment(self) -> None:
+        # 같은 finding 이 must_fix 와 comments[] 에 동시에 있으면 라인 anchor 쪽을 보존.
+        same_text = "signature 검증이 제거되어 인증 우회 위험이 있습니다."
+        must_fix, suggestions, comments, positives = review_service.dedupe_across_sections(
+            must_fix=[same_text],
+            suggestions=[],
+            comments=[
+                review_service.ReviewComment(
+                    path="a.py",
+                    line=1,
+                    body=same_text,
+                    severity=review_service.SEVERITY_CRITICAL,
+                )
+            ],
+            positives=[],
+        )
+        self.assertEqual(must_fix, [])
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0].body, same_text)
+
+    def test_similar_wording_across_sections_is_deduped(self) -> None:
+        # 유사도 기반이라 문장이 미세하게 달라도 같은 finding 으로 판정해 하위 섹션에서 drop.
+        must_fix, suggestions, comments, positives = review_service.dedupe_across_sections(
+            must_fix=["npm 릴리즈 워크플로우는 새로운 패키지의 출시를 자동화하는 데 도움이 될 것입니다."],
+            suggestions=[],
+            comments=[
+                review_service.ReviewComment(
+                    path=".github/workflows/npm-publish.yml",
+                    line=1,
+                    body="npm 릴리즈 워크플로우는 새로운 패키지의 출시를 자동화하는 데 도움이 될 것입니다.",
+                    severity=review_service.SEVERITY_MAJOR,
+                )
+            ],
+            positives=["npm 릴리즈 워크플로우가 추가되었습니다."],
+        )
+        # 우선순위: comments > must_fix > positives. 라인 코멘트만 보존.
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(must_fix, [])
+        # positives 는 동사형이 달라 (추가되었습니다 vs 도움이 될 것입니다) Jaccard 가
+        # 임계치에 못 미칠 수 있으므로 보존 여부에 대한 assert 를 걸지 않는다.
+
+    def test_distinct_findings_are_all_preserved(self) -> None:
+        must_fix, suggestions, comments, positives = review_service.dedupe_across_sections(
+            must_fix=["signature 검증이 제거되어 인증 우회 위험이 있습니다."],
+            suggestions=["네이밍을 payload_meta 로 통일하면 좋습니다."],
+            comments=[
+                review_service.ReviewComment(
+                    path="a.py",
+                    line=1,
+                    body="SQL 인젝션에 취약한 쿼리 문자열 조합입니다.",
+                    severity=review_service.SEVERITY_MAJOR,
+                )
+            ],
+            positives=["dataclass 를 도입해 계약이 명확해졌습니다."],
+        )
+        # 서로 다른 주제는 dedup 대상이 아님. 전부 보존.
+        self.assertEqual(len(must_fix), 1)
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(len(positives), 1)
+
+    def test_empty_or_whitespace_text_does_not_crash_dedup(self) -> None:
+        # 매우 짧은 문장은 토큰이 거의 없어 판정 불가 → 보존.
+        must_fix, suggestions, comments, positives = review_service.dedupe_across_sections(
+            must_fix=["a"],
+            suggestions=["b"],
+            comments=[],
+            positives=[""],
+        )
+        self.assertEqual(must_fix, ["a"])
+        self.assertEqual(suggestions, ["b"])
+
+
+class EnforceSeverityNeedsRiskLanguageTests(unittest.TestCase):
+    def test_major_without_risk_markers_is_downgraded(self) -> None:
+        # 패턴 4 핵심 케이스: description 재진술에 Major 가 붙으면 Suggestion 으로 강등.
+        result = review_service.enforce_severity_needs_risk_language(
+            review_service.SEVERITY_MAJOR,
+            "npm 릴리즈 워크플로우는 새로운 패키지의 출시를 자동화하는 데 도움이 될 것입니다.",
+        )
+        self.assertEqual(result, review_service.SEVERITY_SUGGESTION)
+
+    def test_critical_with_risk_marker_preserves_severity(self) -> None:
+        # body 에 '위험' 이 있으면 정당한 지적으로 보고 Critical 유지.
+        result = review_service.enforce_severity_needs_risk_language(
+            review_service.SEVERITY_CRITICAL,
+            "signature 검증이 제거되어 인증 우회 위험이 있습니다.",
+        )
+        self.assertEqual(result, review_service.SEVERITY_CRITICAL)
+
+    def test_minor_and_suggestion_are_not_touched(self) -> None:
+        # 낮은 등급은 애초에 REQUEST_CHANGES 를 유발하지 않아 강등 대상 아님.
+        for sev in (review_service.SEVERITY_MINOR, review_service.SEVERITY_SUGGESTION):
+            with self.subTest(sev=sev):
+                result = review_service.enforce_severity_needs_risk_language(
+                    sev, "네이밍을 payload_meta 로 통일하면 좋습니다."
+                )
+                self.assertEqual(result, sev)
+
+    def test_description_style_major_line_comment_is_downgraded_in_pipeline(self) -> None:
+        # 실제 패턴 4 재현: Major 라벨 붙은 description 재진술 라인 코멘트가
+        # validate_mlx_output 을 통과하면 Suggestion 으로 자동 강등된다.
+        pr_file = review_service.PullRequestFile(
+            filename=".github/workflows/npm-publish.yml",
+            status="added",
+            patch="@@ -0,0 +1,1 @@\n+on: push\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "npm 릴리즈 자동화.",
+                "event": "COMMENT",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": ".github/workflows/npm-publish.yml",
+                        "line": 1,
+                        "severity": "Major",
+                        "body": "npm 릴리즈 워크플로우는 새로운 패키지의 출시를 자동화하는 데 도움이 될 것입니다.",
+                    }
+                ],
+            },
+            [pr_file],
+        )
+        self.assertEqual(len(validated.comments), 1)
+        # Major → Suggestion 강등. REQUEST_CHANGES 가 과발동하지 않음.
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_SUGGESTION)
+        self.assertEqual(validated.event, "COMMENT")
 
 
 class SplitLegacyConcernsTests(unittest.TestCase):

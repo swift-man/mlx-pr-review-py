@@ -1322,6 +1322,9 @@ def collect_validated_comments(
         # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
         # 잘못된 Critical 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
         severity = normalize_severity(raw.get("severity"))
+        # 패턴 4 방어: Critical/Major 태그인데 body 에 위험 어휘가 전혀 없으면
+        # description 재진술일 가능성이 높으므로 Suggestion 으로 강등한다.
+        severity = enforce_severity_needs_risk_language(severity, body)
         comments.append(ReviewComment(path=path, line=line, body=body, severity=severity))
         stats.accepted_model_comments += 1
 
@@ -1358,6 +1361,84 @@ def decide_review_event(
     if not has_any_finding:
         return "APPROVE"
     return "COMMENT"
+
+
+def _tokenize_for_dedup(text: str) -> set[str]:
+    """중복 판정용 토큰 집합을 만든다. 구두점·대소문자·공백 차이를 흡수한다."""
+    normalized = normalize_text(text).lower()
+    # 한글/영문/숫자만 남기고 나머지는 공백으로 치환 — 구두점·backtick·따옴표 등 흡수.
+    stripped = re.sub(r"[^\w가-힣]+", " ", normalized, flags=re.UNICODE)
+    return {token for token in stripped.split() if len(token) > 1}
+
+
+def _jaccard_similarity(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+# 토큰 Jaccard 가 이 임계값을 넘으면 '같은 finding 이 다른 섹션에 중복' 으로 판정한다.
+# 0.7 은 의도적으로 보수적 — 같은 의도의 문장도 단어 하나만 바꾸면 0.6 대로 떨어지므로
+# false positive 위험을 줄이는 쪽을 택한다. 운영 관찰 후 상향 조정 가능.
+DEDUP_SIMILARITY_THRESHOLD = 0.7
+
+
+def dedupe_across_sections(
+    must_fix: list[str],
+    suggestions: list[str],
+    comments: list[ReviewComment],
+    positives: list[str],
+) -> tuple[list[str], list[str], list[ReviewComment], list[str]]:
+    """7B 모델이 같은 문장을 여러 섹션에 반복 출력하는 패턴 4 를 후처리로 제거한다.
+
+    우선순위(높을수록 보존): comments[] > must_fix > suggestions > positives.
+    라인 코멘트를 가장 높은 우선순위로 두는 이유 — 라인 anchor 가 top-level
+    텍스트보다 실제 리뷰 UX 에서 가치가 크다. 또한 요약이 must_fix 에 추가된
+    뒤 dedup 을 돌리면 요약 원본(comment body) 을 자연히 보존하게 된다.
+
+    낮은 우선순위 섹션의 항목이 높은 우선순위 섹션의 항목과 Jaccard 유사도
+    >= DEDUP_SIMILARITY_THRESHOLD 이면 drop 한다. 같은 섹션 안에서는 sanitize_*
+    단계가 이미 완전 중복을 제거한 상태라 별도로 처리하지 않는다.
+    """
+    kept_tokens: list[set[str]] = []
+
+    def is_new(text: str) -> bool:
+        tokens = _tokenize_for_dedup(text)
+        if not tokens:
+            return True  # 토큰이 거의 없는 매우 짧은 문장은 판정 보류 — 원본 유지.
+        for prev in kept_tokens:
+            if _jaccard_similarity(tokens, prev) >= DEDUP_SIMILARITY_THRESHOLD:
+                return False
+        kept_tokens.append(tokens)
+        return True
+
+    # 높은 우선순위부터 소비 → kept_tokens 에 누적 → 이후 섹션이 중복 검사에 참조.
+    deduped_comments: list[ReviewComment] = []
+    for comment in comments:
+        if is_new(comment.body):
+            deduped_comments.append(comment)
+    deduped_must_fix = [item for item in must_fix if is_new(item)]
+    deduped_suggestions = [item for item in suggestions if is_new(item)]
+    deduped_positives = [item for item in positives if is_new(item)]
+
+    return deduped_must_fix, deduped_suggestions, deduped_comments, deduped_positives
+
+
+def enforce_severity_needs_risk_language(
+    severity: str, body: str
+) -> str:
+    """Critical/Major 등급인데 body 에 위험 어휘가 없으면 Suggestion 으로 내린다.
+
+    패턴 4 의 핵심: "도움이 될 것입니다", "추가되었습니다" 같은 description 이
+    Major / Critical 로 붙어 REQUEST_CHANGES 가 과발동하는 현상을 막는다. body 에
+    CONCERN_RISK_MARKERS (위험/누락/우회/취약 등) 중 하나라도 포함되면 원래 severity
+    를 유지해 정당한 지적을 보존한다.
+    """
+    if severity not in (SEVERITY_CRITICAL, SEVERITY_MAJOR):
+        return severity
+    if any(marker in body for marker in CONCERN_RISK_MARKERS):
+        return severity
+    return SEVERITY_SUGGESTION
 
 
 def split_legacy_concerns(items: list[str]) -> tuple[list[str], list[str]]:
@@ -1413,6 +1494,16 @@ def validate_mlx_output(
     suggestion_summaries = summarize_comment_bodies(non_blocking_comments, max_items=3)
     must_fix = merge_distinct_items(must_fix, must_fix_summaries, max_items=5)
     suggestions = merge_distinct_items(suggestions, suggestion_summaries, max_items=5)
+
+    # 패턴 4 방어: 같은 finding 이 여러 섹션에 그대로 반복되는 환각을 후처리로 제거.
+    # 우선순위는 comments[] > must_fix > suggestions > positives. 요약 merge 이후
+    # 돌려야 '요약 vs 원본 comment body' 중복이 comment 쪽을 보존하며 정리된다.
+    must_fix, suggestions, comments, positives = dedupe_across_sections(
+        must_fix, suggestions, comments, positives
+    )
+    # dedup 이 라인 코멘트를 걸러내면 blocking_comments 가 실제 남은 코멘트와
+    # 어긋날 수 있어 event 판정 전에 재계산.
+    blocking_comments = [c for c in comments if c.severity in BLOCKING_SEVERITIES]
 
     # 차단성 신호(must_fix 또는 Critical/Major 라인 코멘트) 가 있을 때만
     # REQUEST_CHANGES 로 승격한다. 순수 Minor/Suggestion 코멘트만 있으면 COMMENT 유지.
