@@ -505,7 +505,7 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 | `looks_like_prompt_echo` / `looks_like_diff_stat_dump` / `looks_like_generic_positive` / `looks_like_generic_model_change_comment` / `looks_like_process_policy_comment` / `looks_like_descriptive_change_narration` / `looks_like_positive_only_concern` / `looks_like_identifier_localization_comment` / `looks_like_no_findings_summary` | 위 marker 들을 각 지적 유형에 적용하는 판정 함수들 |
 | `split_legacy_concerns` | 구 스키마 `concerns` 를 risk marker 기준으로 `must_fix` / `suggestions` 분배 |
 
-**제거 기준**: 새 모델이 `must_fix` / `suggestions` / severity 를 안정적으로 emit 하고, 회귀 PR 4 개 케이스에서 **해당 필터가 drop 한 항목이 0 건** 이면 해당 marker·함수 쌍 제거. 제거 후 [tests/test_review_service.py](tests/test_review_service.py) 의 `DescriptiveChangeNarrationTests`, `SplitLegacyConcernsTests` 등 관련 테스트도 함께 삭제.
+**제거 기준**: 회귀 PR 4 개 케이스를 **후처리 필터를 비활성화한 상태** (예: `validate_mlx_output` 내부의 `sanitize_text_items` / `sanitize_positive_items` 호출을 임시로 bypass) 로 새 모델에 돌렸을 때, **원본 모델 출력** 에서 해당 marker 가 겨냥하는 패턴이 한 건도 나타나지 않으면 해당 marker·함수 쌍 제거. 예를 들어 `LOW_SIGNAL_POSITIVE_MARKERS` 의 제거는 원본 출력의 positives 배열에 "PR diff 가 잘 작성되었습니다" 류 저신호 칭찬이 없는지로 판정, `DESCRIPTIVE_NARRATION_SUFFIXES` 는 concerns/must_fix 에 "~되었습니다" 서술형 어미가 없는지로 판정. 제거 후 [tests/test_review_service.py](tests/test_review_service.py) 의 `DescriptiveChangeNarrationTests`, `SplitLegacyConcernsTests` 등 관련 테스트도 함께 삭제.
 
 ### 15-4. C 계층 — 구조적 검증 (Phase 4, 구현 예정)
 
@@ -527,7 +527,8 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 
 1. 회귀용 테스트 픽스처 확인: `tests/fixtures/mlx_outputs/` 에 현재 세 패턴에 해당하는 샘플 출력이 저장돼 있는지 확인하고, 없으면 배포 로그에서 수집해 먼저 추가.
 2. 제거 순서: C → B → A (바깥쪽 보정 먼저, 프롬프트는 마지막). 각 단계에서 `python3 -m unittest discover -s tests` 통과 확인.
-3. 실전 회귀: 위 15-1 의 4 개 PR 케이스를 새 모델로 돌려 세 패턴이 **한 건도 재현되지 않는지** 확인. 샘플이 부족하다 판단되면 각 PR 을 반복 실행해 수를 늘리되 판정 기준은 여전히 "재현 0 건".
-4. ESM/CJS positive control 통과도 함께 확인 (차단 이슈를 여전히 잡는지).
+3. B 계층 (후처리 필터) 판정은 **필터 비활성 원본 출력** 을 기준으로 한다. `validate_mlx_output` 내부의 `sanitize_*` 호출을 임시로 bypass 하거나, 테스트 픽스처용으로 raw JSON 을 저장해 육안 비교. 필터가 걸러내던 패턴이 원본 출력에서 더 이상 등장하지 않으면 해당 marker·함수 제거 가능.
+4. 실전 회귀: 위 15-1 의 4 개 PR 케이스를 새 모델로 돌려 세 패턴이 **한 건도 재현되지 않는지** 확인. 샘플이 부족하다 판단되면 각 PR 을 반복 실행해 수를 늘리되 판정 기준은 여전히 "재현 0 건".
+5. ESM/CJS positive control 통과도 함께 확인 (차단 이슈를 여전히 잡는지).
 
 # review.gorani.me
