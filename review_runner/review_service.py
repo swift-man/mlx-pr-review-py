@@ -73,6 +73,10 @@ POSITIVE_CONCERN_MARKERS = (
     "효율적으로 관리",
     "안정적으로 관리",
     "도움이 됩니다",
+    # '도움이 될 것입니다' 류 future-positive 표현. 패턴 4 (예: 'npm 릴리즈 워크플로우는
+    # 새로운 패키지의 출시를 자동화하는 데 도움이 될 것입니다') 의 Major 라인 코멘트가
+    # 이 marker 로 looks_like_praise_only_comment 에서 자동 drop 된다.
+    "도움이 될",
     "좋습니다",
     "적절합니다",
     "개선되었습니다",
@@ -1321,6 +1325,8 @@ def collect_validated_comments(
         seen_comment_keys.add(key)
         # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
         # 잘못된 Critical 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
+        # 패턴 4 (description 재진술의 Major 태그) 는 looks_like_praise_only_comment
+        # 가 이미 위에서 코멘트를 drop 하므로 별도 severity 강등 단계는 두지 않는다.
         severity = normalize_severity(raw.get("severity"))
         comments.append(ReviewComment(path=path, line=line, body=body, severity=severity))
         stats.accepted_model_comments += 1
@@ -1358,6 +1364,80 @@ def decide_review_event(
     if not has_any_finding:
         return "APPROVE"
     return "COMMENT"
+
+
+def _tokenize_for_dedup(text: str) -> set[str]:
+    """중복 판정용 토큰 집합을 만든다. 구두점·대소문자·공백 차이를 흡수한다.
+
+    Python 3 의 ``re`` 는 기본적으로 ``\\w`` 를 유니코드(한글 포함)로 매칭하므로
+    별도로 한글 범위를 추가할 필요가 없고, ``re.findall(r"\\w{2,}", ...)`` 한 번이면
+    길이 2 이상의 단어 토큰을 곧장 뽑을 수 있어 substitute → split → filter 의 3 단계
+    파이프라인을 한 단계로 줄인다.
+    """
+    return set(re.findall(r"\w{2,}", normalize_text(text).lower()))
+
+
+def _jaccard_similarity(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+# 토큰 Jaccard 가 이 임계값을 넘으면 '같은 finding 이 다른 섹션에 중복' 으로 판정한다.
+# 0.7 은 의도적으로 보수적 — 같은 의도의 문장도 단어 하나만 바꾸면 0.6 대로 떨어지므로
+# false positive 위험을 줄이는 쪽을 택한다. 운영 관찰 후 상향 조정 가능.
+DEDUP_SIMILARITY_THRESHOLD = 0.7
+
+
+def dedupe_across_sections(
+    must_fix: list[str],
+    suggestions: list[str],
+    comments: list[ReviewComment],
+    positives: list[str],
+) -> tuple[list[str], list[str], list[ReviewComment], list[str]]:
+    """7B 모델이 같은 문장을 여러 섹션에 반복 출력하는 패턴 4 를 후처리로 제거한다.
+
+    우선순위(높을수록 보존): comments[] > must_fix > suggestions > positives.
+    라인 코멘트를 가장 높은 우선순위로 두는 이유 — 라인 anchor 가 top-level
+    텍스트보다 실제 리뷰 UX 에서 가치가 크다. 또한 요약이 must_fix 에 추가된
+    뒤 dedup 을 돌리면 요약 원본(comment body) 을 자연히 보존하게 된다.
+
+    낮은 우선순위 섹션의 항목이 높은 우선순위 섹션의 항목과 Jaccard 유사도
+    >= DEDUP_SIMILARITY_THRESHOLD 이면 drop 한다.
+
+    중요: ``comments`` 배열 내부에서는 본문 유사도로 항목을 제거하지 않는다.
+    같은 보안 패턴이나 누락 케이스가 서로 다른 ``(path, line)`` 에 동시에
+    검출될 수 있고, 이때 첫 번째 anchor 만 남기면 작성자가 나머지 위치의
+    실제 문제를 놓치게 된다. ``collect_validated_comments`` 가 이미 동일한
+    ``(path, line, body)`` 조합을 dedupe 한 상태라 여기서는 모두 보존하고,
+    각 코멘트의 토큰만 ``kept_tokens`` 에 누적해 다른 섹션과의 cross-section
+    dedup 에 참조용으로만 쓴다.
+    """
+    kept_tokens: list[set[str]] = []
+
+    def is_new(text: str) -> bool:
+        tokens = _tokenize_for_dedup(text)
+        if not tokens:
+            return True  # 토큰이 거의 없는 매우 짧은 문장은 판정 보류 — 원본 유지.
+        for prev in kept_tokens:
+            if _jaccard_similarity(tokens, prev) >= DEDUP_SIMILARITY_THRESHOLD:
+                return False
+        kept_tokens.append(tokens)
+        return True
+
+    # comments[] 는 모두 보존하고 토큰만 누적해 다른 섹션의 중복 판정에 참조한다.
+    for comment in comments:
+        tokens = _tokenize_for_dedup(comment.body)
+        if tokens:
+            kept_tokens.append(tokens)
+
+    # top-level 섹션은 우선순위 순서대로 소비. comments 의 토큰이 이미 등록돼
+    # 있으므로 must_fix 의 동일 본문은 자연히 drop, 그 다음 suggestions, positives.
+    deduped_must_fix = [item for item in must_fix if is_new(item)]
+    deduped_suggestions = [item for item in suggestions if is_new(item)]
+    deduped_positives = [item for item in positives if is_new(item)]
+
+    return deduped_must_fix, deduped_suggestions, list(comments), deduped_positives
 
 
 def split_legacy_concerns(items: list[str]) -> tuple[list[str], list[str]]:
@@ -1413,6 +1493,14 @@ def validate_mlx_output(
     suggestion_summaries = summarize_comment_bodies(non_blocking_comments, max_items=3)
     must_fix = merge_distinct_items(must_fix, must_fix_summaries, max_items=5)
     suggestions = merge_distinct_items(suggestions, suggestion_summaries, max_items=5)
+
+    # 패턴 4 방어: 같은 finding 이 여러 섹션에 그대로 반복되는 환각을 후처리로 제거.
+    # 우선순위는 comments[] > must_fix > suggestions > positives. dedup 은 comments
+    # 자체는 변경하지 않고 (라인 anchor 보존을 위해 다른 path/line 의 동일 본문도 유지)
+    # top-level 섹션의 중복만 제거하므로 blocking_comments 는 재계산 불필요.
+    must_fix, suggestions, comments, positives = dedupe_across_sections(
+        must_fix, suggestions, comments, positives
+    )
 
     # 차단성 신호(must_fix 또는 Critical/Major 라인 코멘트) 가 있을 때만
     # REQUEST_CHANGES 로 승격한다. 순수 Minor/Suggestion 코멘트만 있으면 COMMENT 유지.
