@@ -791,45 +791,19 @@ class DedupeAcrossSectionsTests(unittest.TestCase):
         self.assertEqual(suggestions, ["b"])
 
 
-class EnforceSeverityForDescriptiveNarrationTests(unittest.TestCase):
-    def test_major_with_descriptive_narration_suffix_is_downgraded(self) -> None:
-        # '~되었습니다' 로 끝나는 변경 narration 이 Major 로 붙은 경우 Suggestion 으로 강등.
-        result = review_service.enforce_severity_for_descriptive_narration(
-            review_service.SEVERITY_MAJOR,
-            "캐시 키 필드가 추가되었습니다.",
-        )
-        self.assertEqual(result, review_service.SEVERITY_SUGGESTION)
+class DescriptionPatternEndToEndTests(unittest.TestCase):
+    """패턴 4 (description 재진술 라인 코멘트) 전체 파이프라인 회귀 방지.
 
-    def test_critical_with_korean_risk_words_preserves_severity(self) -> None:
-        # 한국어 위험 어휘가 있는 정당한 지적은 Critical 유지.
-        result = review_service.enforce_severity_for_descriptive_narration(
-            review_service.SEVERITY_CRITICAL,
-            "signature 검증이 제거되어 인증 우회 위험이 있습니다.",
-        )
-        self.assertEqual(result, review_service.SEVERITY_CRITICAL)
-
-    def test_major_with_english_exception_name_is_preserved(self) -> None:
-        # 영문 예외명을 쓴 정당한 Major 가 'risk marker 부재' 만으로 잘못 강등되던
-        # 회귀를 막는다 (Codex 지적). narration / 긍정형 매처에 걸리지 않으면 보존.
-        result = review_service.enforce_severity_for_descriptive_narration(
-            review_service.SEVERITY_MAJOR,
-            "None 반환 시 AttributeError 가 발생해 요청이 500 으로 끝납니다.",
-        )
-        self.assertEqual(result, review_service.SEVERITY_MAJOR)
-
-    def test_minor_and_suggestion_are_not_touched(self) -> None:
-        # 낮은 등급은 애초에 REQUEST_CHANGES 를 유발하지 않아 강등 대상 아님.
-        for sev in (review_service.SEVERITY_MINOR, review_service.SEVERITY_SUGGESTION):
-            with self.subTest(sev=sev):
-                result = review_service.enforce_severity_for_descriptive_narration(
-                    sev, "네이밍을 payload_meta 로 통일하면 좋습니다."
-                )
-                self.assertEqual(result, sev)
+    별도의 severity 강등 함수 없이도 looks_like_praise_only_comment (POSITIVE_CONCERN_
+    MARKERS / DESCRIPTIVE_NARRATION_SUFFIXES 등을 모두 사용) 가
+    collect_validated_comments 단에서 코멘트를 drop 하므로, '도움이 될 것입니다' 류
+    Major 라인 코멘트는 자동으로 사라진다.
+    """
 
     def test_description_style_major_line_comment_is_dropped_at_praise_filter(self) -> None:
-        # 실제 패턴 4 재현: '도움이 될 것입니다' 류는 POSITIVE_CONCERN_MARKERS 에 'X 도움이 될'
-        # 이 추가돼 looks_like_praise_only_comment 가 잡고, collect_validated_comments 단에서
-        # 코멘트 자체가 dropped → 결과적으로 라인 코멘트 0 건, event 도 COMMENT 로 정착.
+        # 실제 패턴 4 재현: '도움이 될 것입니다' 가 POSITIVE_CONCERN_MARKERS 의 '도움이 될'
+        # 에 걸려 looks_like_positive_only_concern → looks_like_praise_only_comment 가
+        # True → collect_validated_comments 가 코멘트를 drop. 결과적으로 라인 코멘트 0건.
         pr_file = review_service.PullRequestFile(
             filename=".github/workflows/npm-publish.yml",
             status="added",
@@ -861,6 +835,40 @@ class EnforceSeverityForDescriptiveNarrationTests(unittest.TestCase):
         # 사례가 정반대로 깨끗하게 정리됨.
         self.assertEqual(validated.comments, [])
         self.assertEqual(validated.event, "APPROVE")
+
+    def test_major_with_english_exception_name_is_preserved(self) -> None:
+        # narration / 긍정 매처에 걸리지 않는 정당한 Major (영문 예외명 사용) 는
+        # 그대로 보존돼 REQUEST_CHANGES 를 정상 발동한다. 이전에 risk marker 부재
+        # 만으로 강등하던 로직이 false positive 를 만들었던 것을 회귀 테스트로 고정.
+        pr_file = review_service.PullRequestFile(
+            filename="api/handler.py",
+            status="modified",
+            patch="@@ -10,1 +10,1 @@\n-    return data\n+    return data.value\n",
+            additions=1,
+            deletions=1,
+            right_side_lines={10},
+        )
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "REQUEST_CHANGES",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "api/handler.py",
+                        "line": 10,
+                        "severity": "Major",
+                        "body": "None 반환 시 AttributeError 가 발생해 요청이 500 으로 끝납니다.",
+                    }
+                ],
+            },
+            [pr_file],
+        )
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
 
 
 class SplitLegacyConcernsTests(unittest.TestCase):

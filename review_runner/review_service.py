@@ -1325,10 +1325,9 @@ def collect_validated_comments(
         seen_comment_keys.add(key)
         # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
         # 잘못된 Critical 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
+        # 패턴 4 (description 재진술의 Major 태그) 는 looks_like_praise_only_comment
+        # 가 이미 위에서 코멘트를 drop 하므로 별도 severity 강등 단계는 두지 않는다.
         severity = normalize_severity(raw.get("severity"))
-        # 패턴 4 방어: Critical/Major 태그가 붙었지만 본문이 저신호 narration / 긍정
-        # 서술 패턴이면 Suggestion 으로 강등. 영문 예외명을 쓴 정당한 Major 는 보존.
-        severity = enforce_severity_for_descriptive_narration(severity, body)
         comments.append(ReviewComment(path=path, line=line, body=body, severity=severity))
         stats.accepted_model_comments += 1
 
@@ -1441,36 +1440,6 @@ def dedupe_across_sections(
     return deduped_must_fix, deduped_suggestions, list(comments), deduped_positives
 
 
-def enforce_severity_for_descriptive_narration(
-    severity: str, body: str
-) -> str:
-    """Critical/Major 라인 코멘트가 description 재진술이면 Suggestion 으로 강등한다.
-
-    패턴 4 (description 에 Major 태그) 를 막되, '한국어 risk 어휘 부재' 만으로
-    강등하지는 않는다. 후자 방식은 'None 반환 시 AttributeError 가 발생합니다'
-    같이 영문 예외명을 쓴 정당한 Major 까지 강등시켜 REQUEST_CHANGES 를 막는
-    부작용이 있다.
-
-    대신 이미 검증된 저신호 패턴 매처가 True 일 때만 강등한다:
-    - looks_like_descriptive_change_narration: '~되었습니다' 류 변경 narration
-    - looks_like_positive_only_concern: '도움이 됩니다' 등 긍정 칭찬 형
-    - looks_like_generic_positive: 'PR diff 가 잘 작성' 류 일반 칭찬
-
-    이 매처들은 looks_like_praise_only_comment 에서 이미 일부 사용되어 라인
-    코멘트가 collect_validated_comments 에서 drop 되기도 하지만, narration
-    suffix 매처는 그쪽에서 안 부르므로 여기서 별도로 한 번 더 본다.
-    """
-    if severity not in (SEVERITY_CRITICAL, SEVERITY_MAJOR):
-        return severity
-    if (
-        looks_like_descriptive_change_narration(body)
-        or looks_like_positive_only_concern(body)
-        or looks_like_generic_positive(body)
-    ):
-        return SEVERITY_SUGGESTION
-    return severity
-
-
 def split_legacy_concerns(items: list[str]) -> tuple[list[str], list[str]]:
     """구 스키마의 concerns 를 CONCERN_RISK_MARKERS 포함 여부로 나눈다.
 
@@ -1526,14 +1495,12 @@ def validate_mlx_output(
     suggestions = merge_distinct_items(suggestions, suggestion_summaries, max_items=5)
 
     # 패턴 4 방어: 같은 finding 이 여러 섹션에 그대로 반복되는 환각을 후처리로 제거.
-    # 우선순위는 comments[] > must_fix > suggestions > positives. 요약 merge 이후
-    # 돌려야 '요약 vs 원본 comment body' 중복이 comment 쪽을 보존하며 정리된다.
+    # 우선순위는 comments[] > must_fix > suggestions > positives. dedup 은 comments
+    # 자체는 변경하지 않고 (라인 anchor 보존을 위해 다른 path/line 의 동일 본문도 유지)
+    # top-level 섹션의 중복만 제거하므로 blocking_comments 는 재계산 불필요.
     must_fix, suggestions, comments, positives = dedupe_across_sections(
         must_fix, suggestions, comments, positives
     )
-    # dedup 이 라인 코멘트를 걸러내면 blocking_comments 가 실제 남은 코멘트와
-    # 어긋날 수 있어 event 판정 전에 재계산.
-    blocking_comments = [c for c in comments if c.severity in BLOCKING_SEVERITIES]
 
     # 차단성 신호(must_fix 또는 Critical/Major 라인 코멘트) 가 있을 때만
     # REQUEST_CHANGES 로 승격한다. 순수 Minor/Suggestion 코멘트만 있으면 COMMENT 유지.
