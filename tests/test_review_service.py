@@ -791,35 +791,45 @@ class DedupeAcrossSectionsTests(unittest.TestCase):
         self.assertEqual(suggestions, ["b"])
 
 
-class EnforceSeverityNeedsRiskLanguageTests(unittest.TestCase):
-    def test_major_without_risk_markers_is_downgraded(self) -> None:
-        # 패턴 4 핵심 케이스: description 재진술에 Major 가 붙으면 Suggestion 으로 강등.
-        result = review_service.enforce_severity_needs_risk_language(
+class EnforceSeverityForDescriptiveNarrationTests(unittest.TestCase):
+    def test_major_with_descriptive_narration_suffix_is_downgraded(self) -> None:
+        # '~되었습니다' 로 끝나는 변경 narration 이 Major 로 붙은 경우 Suggestion 으로 강등.
+        result = review_service.enforce_severity_for_descriptive_narration(
             review_service.SEVERITY_MAJOR,
-            "npm 릴리즈 워크플로우는 새로운 패키지의 출시를 자동화하는 데 도움이 될 것입니다.",
+            "캐시 키 필드가 추가되었습니다.",
         )
         self.assertEqual(result, review_service.SEVERITY_SUGGESTION)
 
-    def test_critical_with_risk_marker_preserves_severity(self) -> None:
-        # body 에 '위험' 이 있으면 정당한 지적으로 보고 Critical 유지.
-        result = review_service.enforce_severity_needs_risk_language(
+    def test_critical_with_korean_risk_words_preserves_severity(self) -> None:
+        # 한국어 위험 어휘가 있는 정당한 지적은 Critical 유지.
+        result = review_service.enforce_severity_for_descriptive_narration(
             review_service.SEVERITY_CRITICAL,
             "signature 검증이 제거되어 인증 우회 위험이 있습니다.",
         )
         self.assertEqual(result, review_service.SEVERITY_CRITICAL)
 
+    def test_major_with_english_exception_name_is_preserved(self) -> None:
+        # 영문 예외명을 쓴 정당한 Major 가 'risk marker 부재' 만으로 잘못 강등되던
+        # 회귀를 막는다 (Codex 지적). narration / 긍정형 매처에 걸리지 않으면 보존.
+        result = review_service.enforce_severity_for_descriptive_narration(
+            review_service.SEVERITY_MAJOR,
+            "None 반환 시 AttributeError 가 발생해 요청이 500 으로 끝납니다.",
+        )
+        self.assertEqual(result, review_service.SEVERITY_MAJOR)
+
     def test_minor_and_suggestion_are_not_touched(self) -> None:
         # 낮은 등급은 애초에 REQUEST_CHANGES 를 유발하지 않아 강등 대상 아님.
         for sev in (review_service.SEVERITY_MINOR, review_service.SEVERITY_SUGGESTION):
             with self.subTest(sev=sev):
-                result = review_service.enforce_severity_needs_risk_language(
+                result = review_service.enforce_severity_for_descriptive_narration(
                     sev, "네이밍을 payload_meta 로 통일하면 좋습니다."
                 )
                 self.assertEqual(result, sev)
 
-    def test_description_style_major_line_comment_is_downgraded_in_pipeline(self) -> None:
-        # 실제 패턴 4 재현: Major 라벨 붙은 description 재진술 라인 코멘트가
-        # validate_mlx_output 을 통과하면 Suggestion 으로 자동 강등된다.
+    def test_description_style_major_line_comment_is_dropped_at_praise_filter(self) -> None:
+        # 실제 패턴 4 재현: '도움이 될 것입니다' 류는 POSITIVE_CONCERN_MARKERS 에 'X 도움이 될'
+        # 이 추가돼 looks_like_praise_only_comment 가 잡고, collect_validated_comments 단에서
+        # 코멘트 자체가 dropped → 결과적으로 라인 코멘트 0 건, event 도 COMMENT 로 정착.
         pr_file = review_service.PullRequestFile(
             filename=".github/workflows/npm-publish.yml",
             status="added",
@@ -846,10 +856,11 @@ class EnforceSeverityNeedsRiskLanguageTests(unittest.TestCase):
             },
             [pr_file],
         )
-        self.assertEqual(len(validated.comments), 1)
-        # Major → Suggestion 강등. REQUEST_CHANGES 가 과발동하지 않음.
-        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_SUGGESTION)
-        self.assertEqual(validated.event, "COMMENT")
+        # 코멘트가 전부 drop 되고 must_fix / suggestions 도 비어 있으면 APPROVE 까지
+        # 자동 승격 (Phase 2 의 APPROVE 로직). REQUEST_CHANGES 가 과발동하던 패턴 4
+        # 사례가 정반대로 깨끗하게 정리됨.
+        self.assertEqual(validated.comments, [])
+        self.assertEqual(validated.event, "APPROVE")
 
 
 class SplitLegacyConcernsTests(unittest.TestCase):

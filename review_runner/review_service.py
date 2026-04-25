@@ -73,6 +73,10 @@ POSITIVE_CONCERN_MARKERS = (
     "효율적으로 관리",
     "안정적으로 관리",
     "도움이 됩니다",
+    # '도움이 될 것입니다' 류 future-positive 표현. 패턴 4 (예: 'npm 릴리즈 워크플로우는
+    # 새로운 패키지의 출시를 자동화하는 데 도움이 될 것입니다') 의 Major 라인 코멘트가
+    # 이 marker 로 looks_like_praise_only_comment 에서 자동 drop 된다.
+    "도움이 될",
     "좋습니다",
     "적절합니다",
     "개선되었습니다",
@@ -1322,9 +1326,9 @@ def collect_validated_comments(
         # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
         # 잘못된 Critical 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
         severity = normalize_severity(raw.get("severity"))
-        # 패턴 4 방어: Critical/Major 태그인데 body 에 위험 어휘가 전혀 없으면
-        # description 재진술일 가능성이 높으므로 Suggestion 으로 강등한다.
-        severity = enforce_severity_needs_risk_language(severity, body)
+        # 패턴 4 방어: Critical/Major 태그가 붙었지만 본문이 저신호 narration / 긍정
+        # 서술 패턴이면 Suggestion 으로 강등. 영문 예외명을 쓴 정당한 Major 는 보존.
+        severity = enforce_severity_for_descriptive_narration(severity, body)
         comments.append(ReviewComment(path=path, line=line, body=body, severity=severity))
         stats.accepted_model_comments += 1
 
@@ -1364,10 +1368,13 @@ def decide_review_event(
 
 
 def _tokenize_for_dedup(text: str) -> set[str]:
-    """중복 판정용 토큰 집합을 만든다. 구두점·대소문자·공백 차이를 흡수한다."""
+    """중복 판정용 토큰 집합을 만든다. 구두점·대소문자·공백 차이를 흡수한다.
+
+    Python 3 의 ``re`` 는 기본적으로 ``\\w`` 를 유니코드(한글 포함)로 매칭하므로
+    별도로 한글 범위를 추가할 필요가 없다.
+    """
     normalized = normalize_text(text).lower()
-    # 한글/영문/숫자만 남기고 나머지는 공백으로 치환 — 구두점·backtick·따옴표 등 흡수.
-    stripped = re.sub(r"[^\w가-힣]+", " ", normalized, flags=re.UNICODE)
+    stripped = re.sub(r"[^\w]+", " ", normalized)
     return {token for token in stripped.split() if len(token) > 1}
 
 
@@ -1397,8 +1404,15 @@ def dedupe_across_sections(
     뒤 dedup 을 돌리면 요약 원본(comment body) 을 자연히 보존하게 된다.
 
     낮은 우선순위 섹션의 항목이 높은 우선순위 섹션의 항목과 Jaccard 유사도
-    >= DEDUP_SIMILARITY_THRESHOLD 이면 drop 한다. 같은 섹션 안에서는 sanitize_*
-    단계가 이미 완전 중복을 제거한 상태라 별도로 처리하지 않는다.
+    >= DEDUP_SIMILARITY_THRESHOLD 이면 drop 한다.
+
+    중요: ``comments`` 배열 내부에서는 본문 유사도로 항목을 제거하지 않는다.
+    같은 보안 패턴이나 누락 케이스가 서로 다른 ``(path, line)`` 에 동시에
+    검출될 수 있고, 이때 첫 번째 anchor 만 남기면 작성자가 나머지 위치의
+    실제 문제를 놓치게 된다. ``collect_validated_comments`` 가 이미 동일한
+    ``(path, line, body)`` 조합을 dedupe 한 상태라 여기서는 모두 보존하고,
+    각 코멘트의 토큰만 ``kept_tokens`` 에 누적해 다른 섹션과의 cross-section
+    dedup 에 참조용으로만 쓴다.
     """
     kept_tokens: list[set[str]] = []
 
@@ -1412,33 +1426,49 @@ def dedupe_across_sections(
         kept_tokens.append(tokens)
         return True
 
-    # 높은 우선순위부터 소비 → kept_tokens 에 누적 → 이후 섹션이 중복 검사에 참조.
-    deduped_comments: list[ReviewComment] = []
+    # comments[] 는 모두 보존하고 토큰만 누적해 다른 섹션의 중복 판정에 참조한다.
     for comment in comments:
-        if is_new(comment.body):
-            deduped_comments.append(comment)
+        tokens = _tokenize_for_dedup(comment.body)
+        if tokens:
+            kept_tokens.append(tokens)
+
+    # top-level 섹션은 우선순위 순서대로 소비. comments 의 토큰이 이미 등록돼
+    # 있으므로 must_fix 의 동일 본문은 자연히 drop, 그 다음 suggestions, positives.
     deduped_must_fix = [item for item in must_fix if is_new(item)]
     deduped_suggestions = [item for item in suggestions if is_new(item)]
     deduped_positives = [item for item in positives if is_new(item)]
 
-    return deduped_must_fix, deduped_suggestions, deduped_comments, deduped_positives
+    return deduped_must_fix, deduped_suggestions, list(comments), deduped_positives
 
 
-def enforce_severity_needs_risk_language(
+def enforce_severity_for_descriptive_narration(
     severity: str, body: str
 ) -> str:
-    """Critical/Major 등급인데 body 에 위험 어휘가 없으면 Suggestion 으로 내린다.
+    """Critical/Major 라인 코멘트가 description 재진술이면 Suggestion 으로 강등한다.
 
-    패턴 4 의 핵심: "도움이 될 것입니다", "추가되었습니다" 같은 description 이
-    Major / Critical 로 붙어 REQUEST_CHANGES 가 과발동하는 현상을 막는다. body 에
-    CONCERN_RISK_MARKERS (위험/누락/우회/취약 등) 중 하나라도 포함되면 원래 severity
-    를 유지해 정당한 지적을 보존한다.
+    패턴 4 (description 에 Major 태그) 를 막되, '한국어 risk 어휘 부재' 만으로
+    강등하지는 않는다. 후자 방식은 'None 반환 시 AttributeError 가 발생합니다'
+    같이 영문 예외명을 쓴 정당한 Major 까지 강등시켜 REQUEST_CHANGES 를 막는
+    부작용이 있다.
+
+    대신 이미 검증된 저신호 패턴 매처가 True 일 때만 강등한다:
+    - looks_like_descriptive_change_narration: '~되었습니다' 류 변경 narration
+    - looks_like_positive_only_concern: '도움이 됩니다' 등 긍정 칭찬 형
+    - looks_like_generic_positive: 'PR diff 가 잘 작성' 류 일반 칭찬
+
+    이 매처들은 looks_like_praise_only_comment 에서 이미 일부 사용되어 라인
+    코멘트가 collect_validated_comments 에서 drop 되기도 하지만, narration
+    suffix 매처는 그쪽에서 안 부르므로 여기서 별도로 한 번 더 본다.
     """
     if severity not in (SEVERITY_CRITICAL, SEVERITY_MAJOR):
         return severity
-    if any(marker in body for marker in CONCERN_RISK_MARKERS):
-        return severity
-    return SEVERITY_SUGGESTION
+    if (
+        looks_like_descriptive_change_narration(body)
+        or looks_like_positive_only_concern(body)
+        or looks_like_generic_positive(body)
+    ):
+        return SEVERITY_SUGGESTION
+    return severity
 
 
 def split_legacy_concerns(items: list[str]) -> tuple[list[str], list[str]]:
