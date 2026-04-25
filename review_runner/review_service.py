@@ -1370,11 +1370,11 @@ def _tokenize_for_dedup(text: str) -> set[str]:
     """중복 판정용 토큰 집합을 만든다. 구두점·대소문자·공백 차이를 흡수한다.
 
     Python 3 의 ``re`` 는 기본적으로 ``\\w`` 를 유니코드(한글 포함)로 매칭하므로
-    별도로 한글 범위를 추가할 필요가 없다.
+    별도로 한글 범위를 추가할 필요가 없고, ``re.findall(r"\\w{2,}", ...)`` 한 번이면
+    길이 2 이상의 단어 토큰을 곧장 뽑을 수 있어 substitute → split → filter 의 3 단계
+    파이프라인을 한 단계로 줄인다.
     """
-    normalized = normalize_text(text).lower()
-    stripped = re.sub(r"[^\w]+", " ", normalized)
-    return {token for token in stripped.split() if len(token) > 1}
+    return set(re.findall(r"\w{2,}", normalize_text(text).lower()))
 
 
 def _jaccard_similarity(a: set[str], b: set[str]) -> float:
