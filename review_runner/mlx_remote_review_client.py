@@ -74,13 +74,16 @@ def _get_optional_env_int(name: str) -> int | None:
 
 
 def _generate_url() -> str:
-    """MLX_GENERATE_URL 을 반환하기 전에 스킴/호스트를 강제 검증한다.
+    """MLX_GENERATE_URL 을 반환하기 전에 스킴/호스트/포트를 강제 검증한다.
 
     - ``file://`` / ``ftp://`` / ``data:`` 같은 위험 스킴은 RuntimeError — urllib 가
       로컬 파일을 열어 위장된 응답을 받는 SSRF 류 사고 차단.
     - ``http://:8002/path`` 처럼 hostname 이 비어 있는 형태도 거부 — netloc 만 있고
       hostname 이 비면 ``hmac`` / TLS 검증 등이 의도와 다르게 동작할 수 있다 (CodeRabbit
       Round 2 nitpick).
+    - ``http://gpu:bad/`` 같은 잘못된 포트는 ``parsed.port`` 접근 시점에 ValueError 가
+      나서 호출자가 추적하기 어려운 형태로 누수된다. 명시적으로 1-65535 범위 밖이거나
+      파싱 실패면 RuntimeError 로 통일 (CodeRabbit Round 3 Minor).
     """
     raw_url = os.environ.get("MLX_GENERATE_URL", "")
     url = raw_url.strip() or DEFAULT_GENERATE_URL
@@ -91,6 +94,14 @@ def _generate_url() -> str:
         )
     if not parsed.hostname:
         raise RuntimeError(f"MLX_GENERATE_URL must include a host, got: {url}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(f"MLX_GENERATE_URL contains invalid port: {url}") from exc
+    if port is not None and not (1 <= port <= 65535):
+        raise RuntimeError(
+            f"MLX_GENERATE_URL port must be in 1..65535, got: {port}"
+        )
     return url
 
 

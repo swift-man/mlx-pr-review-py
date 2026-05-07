@@ -87,6 +87,22 @@ class GenerateUrlTests(unittest.TestCase):
                 client._generate_url()
             self.assertIn("host", str(ctx.exception))
 
+    def test_invalid_port_rejected(self) -> None:
+        # http://gpu:bad/path — port 가 정수 아님. urlparse 가 .port 접근 시점에
+        # ValueError 던지는데 그 누수를 막기 위해 RuntimeError 로 통일 (CodeRabbit
+        # Round 3 Minor).
+        with mock.patch.dict(os.environ, _isolated_env(MLX_GENERATE_URL="http://gpu:bad/v1/generate")):
+            with self.assertRaises(RuntimeError) as ctx:
+                client._generate_url()
+            self.assertIn("port", str(ctx.exception))
+
+    def test_port_zero_rejected(self) -> None:
+        # 0 은 유효하지 않은 포트 — urlparse 는 통과시키지만 우리는 거부.
+        with mock.patch.dict(os.environ, _isolated_env(MLX_GENERATE_URL="http://gpu:0/v1/generate")):
+            with self.assertRaises(RuntimeError) as ctx:
+                client._generate_url()
+            self.assertIn("port", str(ctx.exception))
+
 
 class SanitizeUrlForLoggingTests(unittest.TestCase):
     """리뷰 metadata 에 노출할 URL 에서 secrets / query 를 제거 (CodeRabbit Round 2 Major)."""
