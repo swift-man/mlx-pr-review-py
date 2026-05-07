@@ -1125,6 +1125,29 @@ def run_mlx_inprocess(prompt: str) -> dict[str, Any]:
     return review_payload(payload)
 
 
+def run_mlx_remote(prompt: str) -> dict[str, Any]:
+    """원격 mlx-final-py /v1/generate 를 호출해 같은 모델 인스턴스를 공유한다."""
+    from review_runner.mlx_remote_review_client import review_payload
+
+    try:
+        payload = json.loads(prompt)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("MLX prompt payload must be valid JSON") from exc
+    return review_payload(payload)
+
+
+def configured_mlx_backend() -> str:
+    """MLX_REVIEW_BACKEND 가 명시되면 우선, 없으면 MLX_GENERATE_URL 유무로 추정."""
+    backend = (os.environ.get("MLX_REVIEW_BACKEND") or "").strip().lower()
+    if backend in {"remote", "local"}:
+        return backend
+    if backend:
+        raise RuntimeError("MLX_REVIEW_BACKEND must be one of: local, remote")
+    if os.environ.get("MLX_GENERATE_URL"):
+        return "remote"
+    return "local"
+
+
 def current_mlx_device_setting() -> str:
     """현재 프로세스에 적용된 MLX 장치 설정을 auto/cpu/gpu 중 하나로 정규화한다."""
     raw_value = os.environ.get("MLX_DEVICE")
@@ -1234,6 +1257,7 @@ def run_mlx_subprocess(command: list[str], prompt: str, *, log_prefix: str = "")
 
 def run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
     """MLX 리뷰 실행은 한 번에 하나씩 처리해 모델 중복 로드와 메모리 급증을 막는다."""
+    backend = configured_mlx_backend()
     command = configured_mlx_review_command()
     lock_acquired = _MLX_RUN_LOCK.acquire(blocking=False)
     if not lock_acquired:
@@ -1241,6 +1265,8 @@ def run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
         _MLX_RUN_LOCK.acquire()
 
     try:
+        if backend == "remote":
+            return run_mlx_remote(prompt)
         if uses_inprocess_mlx_client(command):
             return run_mlx_inprocess(prompt)
         return run_mlx_subprocess(command, prompt, log_prefix=log_prefix)
