@@ -74,6 +74,8 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
 
         # 역할 프라이밍
         self.assertIn("senior software engineer acting as a strict, evidence-driven", system_prompt)
+        self.assertIn("accuracy, not finding many issues", system_prompt)
+        self.assertIn("False positives are worse", system_prompt)
 
         # 우선순위 리스트 (1~6번이 명시되는지)
         self.assertIn("Review priority", system_prompt)
@@ -84,9 +86,11 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 새 스키마 키 계약
         self.assertIn("summary, event, positives, must_fix, suggestions, comments", system_prompt)
         self.assertIn("positives, must_fix, suggestions must be JSON arrays of strings", system_prompt)
+        self.assertIn("{path, line, severity, confidence, body}", system_prompt)
 
         # 핵심 원칙
         self.assertIn("Never speculate", system_prompt)
+        self.assertIn("emit no finding", system_prompt)
         self.assertIn("Reject vague phrasing", system_prompt)
         self.assertIn("'~가 추가되었습니다'", system_prompt)
         self.assertIn("Prefer empty arrays over padding", system_prompt)
@@ -116,6 +120,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("Minor", system_prompt)
         self.assertIn("Suggestion", system_prompt)
         self.assertIn('"severity":"Major"', system_prompt)
+        self.assertIn('"confidence":0.92', system_prompt)
         # event 강제 규칙이 세 분기(REQUEST_CHANGES / APPROVE / COMMENT) 를 모두 노출하는지.
         self.assertIn(
             "REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment",
@@ -138,19 +143,11 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 지적/중복 제안을 내지 않도록 라인 코멘트 생성 전 자체 점검을 강제하는 규칙.
         self.assertIn("Anti-hallucination guardrails", system_prompt)
         self.assertIn("have I actually read the affected lines", system_prompt)
-        self.assertIn("already implemented elsewhere", system_prompt)
-        # Self-check (c) 는 버킷별로 근거 형태가 다름: comments[] 는 line number,
-        # must_fix / suggestions 는 diff 영역 · 파일 경로 · 심볼 중 하나.
-        self.assertIn("can I cite concrete evidence", system_prompt)
-        self.assertIn("For comments[], 'evidence' means a specific line number", system_prompt)
-        self.assertIn(
-            "For must_fix and suggestions, which are file- or diff-wide buckets",
-            system_prompt,
-        )
-        self.assertIn(
-            "'evidence' means a specific diff region, file path, or symbol name",
-            system_prompt,
-        )
+        self.assertIn("already implemented nearby or elsewhere", system_prompt)
+        self.assertIn("code flow rather than variable names", system_prompt)
+        self.assertIn("below 0.8, omit the finding", system_prompt)
+        self.assertIn("missing or low confidence", system_prompt)
+        self.assertIn("Evidence, Problem, Impact, and Fix", system_prompt)
         self.assertIn("Do not suggest 'translate this comment/docstring to Korean'", system_prompt)
         self.assertIn("U+AC00 to U+D7A3", system_prompt)
         # 영문 판정 기준이 'entirely ASCII' 에서 'contains no Hangul characters' 로 바뀐 것을
@@ -186,6 +183,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)
+        self.assertIn("Evidence, Problem, Impact, Fix 와 confidence", user_prompt)
         self.assertIn("must_fix, suggestions, comments 가 비어 있어도 괜찮습니다", user_prompt)
         self.assertIn("diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요", user_prompt)
 

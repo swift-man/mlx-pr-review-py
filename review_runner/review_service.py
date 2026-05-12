@@ -505,6 +505,7 @@ SEVERITY_MAJOR = "Major"
 SEVERITY_MINOR = "Minor"
 SEVERITY_SUGGESTION = "Suggestion"
 ALL_SEVERITIES = (SEVERITY_CRITICAL, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
+MIN_MODEL_COMMENT_CONFIDENCE = 0.8
 # Critical / Major 는 머지 전 반드시 봐야 하는 차단성 등급이라 event 를 REQUEST_CHANGES
 # 로 승격시킨다. Minor / Suggestion 은 개선 제안이라 COMMENT 로 남는다.
 BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_MAJOR})
@@ -540,12 +541,30 @@ def normalize_severity(value: Any) -> str:
     return mapping.get(cleaned, SEVERITY_MINOR)
 
 
+def normalize_confidence(value: Any) -> float | None:
+    """모델이 보낸 confidence 를 0.0~1.0 실수로 정규화한다.
+
+    bool 은 Python 에서 int 의 하위 타입이라 명시적으로 거부한다. confidence 가 없거나
+    범위를 벗어나면 모델 코멘트는 게시하지 않는다.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= confidence <= 1.0):
+        return None
+    return confidence
+
+
 @dataclass
 class ReviewComment:
     path: str
     line: int
     body: str
     severity: str = SEVERITY_MINOR
+    confidence: float = 1.0
     side: str = "RIGHT"
 
 
@@ -1344,6 +1363,14 @@ def collect_validated_comments(
             increment_reason(stats.dropped_model_comment_reasons, "invalid_right_side_line")
             continue
 
+        confidence = normalize_confidence(raw.get("confidence"))
+        if confidence is None:
+            increment_reason(stats.dropped_model_comment_reasons, "missing_or_invalid_confidence")
+            continue
+        if confidence < MIN_MODEL_COMMENT_CONFIDENCE:
+            increment_reason(stats.dropped_model_comment_reasons, "low_confidence")
+            continue
+
         key = (path, line, body)
         if key in seen_comment_keys:
             increment_reason(stats.dropped_model_comment_reasons, "duplicate_model_comment")
@@ -1354,7 +1381,7 @@ def collect_validated_comments(
         # 패턴 4 (description 재진술의 Major 태그) 는 looks_like_praise_only_comment
         # 가 이미 위에서 코멘트를 drop 하므로 별도 severity 강등 단계는 두지 않는다.
         severity = normalize_severity(raw.get("severity"))
-        comments.append(ReviewComment(path=path, line=line, body=body, severity=severity))
+        comments.append(ReviewComment(path=path, line=line, body=body, severity=severity, confidence=confidence))
         stats.accepted_model_comments += 1
 
     for comment in detect_rule_based_comments(files):
@@ -1632,7 +1659,7 @@ def build_review_payload(
                 "side": comment.side,
                 # GitHub 라인 코멘트 본문 맨 앞에 '[Critical]' 같은 등급 태그를 붙여
                 # 훑는 사람이 심각도를 즉시 구분할 수 있게 한다.
-                "body": f"[{comment.severity}] {comment.body}",
+                "body": f"[{comment.severity}] {comment.body}\n\nConfidence: {comment.confidence:.2f}",
             }
             for comment in comments
         ],

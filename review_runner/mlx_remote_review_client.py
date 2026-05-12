@@ -88,16 +88,17 @@ def _generate_url() -> str:
     raw_url = os.environ.get("MLX_GENERATE_URL", "")
     url = raw_url.strip() or DEFAULT_GENERATE_URL
     parsed = urlparse(url)
+    safe_url = _sanitize_url_for_logging(url) or "(invalid URL)"
     if parsed.scheme not in ALLOWED_URL_SCHEMES:
         raise RuntimeError(
             f"MLX_GENERATE_URL must use http or https scheme, got: {parsed.scheme or '(empty)'}"
         )
     if not parsed.hostname:
-        raise RuntimeError(f"MLX_GENERATE_URL must include a host, got: {url}")
+        raise RuntimeError(f"MLX_GENERATE_URL must include a host, got: {safe_url}")
     try:
         port = parsed.port
     except ValueError as exc:
-        raise RuntimeError(f"MLX_GENERATE_URL contains invalid port: {url}") from exc
+        raise RuntimeError(f"MLX_GENERATE_URL contains invalid port: {safe_url}") from exc
     if port is not None and not (1 <= port <= 65535):
         raise RuntimeError(
             f"MLX_GENERATE_URL port must be in 1..65535, got: {port}"
@@ -117,8 +118,12 @@ def _sanitize_url_for_logging(url: str) -> str:
     except ValueError:
         return ""
     host = parsed.hostname or ""
-    if parsed.port:
-        netloc = f"{host}:{parsed.port}"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port:
+        netloc = f"{host}:{port}"
     else:
         netloc = host
     if not netloc:
@@ -208,14 +213,15 @@ def _post_generate(messages: list[dict[str, str]]) -> dict[str, Any]:
             raise RuntimeError(
                 f"MLX generate endpoint returned HTTP {exc.code}: {detail or exc.reason}"
             ) from exc
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             if attempt == 0:
                 # 짧은 backoff. mlx-final-py 가 final-reply 처리로 잠깐 응답을 못
                 # 받는 경우가 흔하므로 1 초만 쉬고 한 번 더 친다.
                 time.sleep(1.0)
                 continue
+            reason = getattr(exc, "reason", exc)
             raise RuntimeError(
-                f"Failed to reach MLX generate endpoint at {sanitized} after retry: {exc.reason}"
+                f"Failed to reach MLX generate endpoint at {sanitized} after retry: {reason}"
             ) from exc
 
     if response_body is None:

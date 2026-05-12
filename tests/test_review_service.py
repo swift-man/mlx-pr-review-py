@@ -22,10 +22,48 @@ if "jwt" not in sys.modules:
 from review_runner import mlx_review_parser, review_service
 
 
+def _mlx_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "MLX_REVIEW_BACKEND": "",
+        "MLX_GENERATE_URL": "",
+    }
+    env.update(overrides)
+    return env
+
+
 class RunMlxTests(unittest.TestCase):
+    def test_configured_mlx_backend_defaults_to_local(self) -> None:
+        with mock.patch.dict(os.environ, _mlx_env(), clear=False):
+            self.assertEqual(review_service.configured_mlx_backend(), "local")
+
+    def test_configured_mlx_backend_accepts_explicit_remote(self) -> None:
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_BACKEND="remote"), clear=False):
+            self.assertEqual(review_service.configured_mlx_backend(), "remote")
+
+    def test_configured_mlx_backend_accepts_explicit_local(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            _mlx_env(MLX_REVIEW_BACKEND="local", MLX_GENERATE_URL="http://127.0.0.1:8002/v1/generate"),
+            clear=False,
+        ):
+            self.assertEqual(review_service.configured_mlx_backend(), "local")
+
+    def test_configured_mlx_backend_uses_generate_url_as_remote_hint(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            _mlx_env(MLX_GENERATE_URL="http://127.0.0.1:8002/v1/generate"),
+            clear=False,
+        ):
+            self.assertEqual(review_service.configured_mlx_backend(), "remote")
+
+    def test_configured_mlx_backend_rejects_invalid_value(self) -> None:
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_BACKEND="sidecar"), clear=False):
+            with self.assertRaisesRegex(RuntimeError, "local, remote"):
+                review_service.configured_mlx_backend()
+
     def test_run_mlx_uses_inprocess_client_by_default(self) -> None:
         expected = {"summary": "ok"}
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(), clear=False):
             os.environ.pop("MLX_REVIEW_CMD", None)
             with mock.patch("review_runner.mlx_review_client.review_payload", return_value=expected) as review_payload:
                 with mock.patch("review_runner.review_service.subprocess.run") as subprocess_run:
@@ -38,7 +76,7 @@ class RunMlxTests(unittest.TestCase):
     def test_run_mlx_uses_inprocess_client_for_explicit_default_command(self) -> None:
         expected = {"summary": "ok"}
         command = f'"{sys.executable}" -m review_runner.mlx_review_client'
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": command}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD=command), clear=False):
             with mock.patch("review_runner.mlx_review_client.review_payload", return_value=expected) as review_payload:
                 with mock.patch("review_runner.review_service.subprocess.run") as subprocess_run:
                     result = review_service.run_mlx('{"repository":"demo"}')
@@ -51,7 +89,7 @@ class RunMlxTests(unittest.TestCase):
         completed = subprocess_result(
             stdout='{"summary":"ok","event":"COMMENT","positives":[],"concerns":[],"comments":[]}'
         )
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json"), clear=False):
             with mock.patch("review_runner.review_service.subprocess.run", return_value=completed) as subprocess_run:
                 with mock.patch("review_runner.mlx_review_client.review_payload") as review_payload:
                     result = review_service.run_mlx('{"repository":"demo"}')
@@ -60,9 +98,26 @@ class RunMlxTests(unittest.TestCase):
         subprocess_run.assert_called_once()
         review_payload.assert_not_called()
 
+    def test_run_mlx_uses_remote_client_when_configured(self) -> None:
+        expected = {"summary": "remote"}
+        with mock.patch.dict(
+            os.environ,
+            _mlx_env(MLX_REVIEW_BACKEND="remote", MLX_REVIEW_CMD="custom-client --json"),
+            clear=False,
+        ):
+            with mock.patch("review_runner.mlx_remote_review_client.review_payload", return_value=expected) as remote_payload:
+                with mock.patch("review_runner.review_service.subprocess.run") as subprocess_run:
+                    with mock.patch("review_runner.mlx_review_client.review_payload") as local_payload:
+                        result = review_service.run_mlx('{"repository":"demo"}')
+
+        self.assertEqual(result, expected)
+        remote_payload.assert_called_once_with({"repository": "demo"})
+        subprocess_run.assert_not_called()
+        local_payload.assert_not_called()
+
     def test_run_mlx_surfaces_native_abort_hint_for_sigabrt_subprocess(self) -> None:
         completed = subprocess_result(stdout="", stderr="abort() called", returncode=-signal.SIGABRT)
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json"), clear=False):
             with mock.patch("review_runner.review_service.subprocess.run", return_value=completed):
                 with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
                     review_service.run_mlx('{"repository":"demo"}')
@@ -76,7 +131,7 @@ class RunMlxTests(unittest.TestCase):
         recovered = subprocess_result(
             stdout='{"summary":"ok","event":"COMMENT","positives":[],"concerns":[],"comments":[]}'
         )
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json"), clear=False):
             with mock.patch(
                 "review_runner.review_service.subprocess.run",
                 side_effect=[failed, recovered],
@@ -96,7 +151,7 @@ class RunMlxTests(unittest.TestCase):
             stderr="[METAL] Command buffer execution failed: Insufficient Memory",
             returncode=-signal.SIGABRT,
         )
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json", "MLX_DEVICE": "gpu"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json", MLX_DEVICE="gpu"), clear=False):
             with mock.patch("review_runner.review_service.subprocess.run", return_value=completed) as subprocess_run:
                 with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
                     review_service.run_mlx('{"repository":"demo"}')
@@ -128,7 +183,7 @@ class RunMlxTests(unittest.TestCase):
                 active_calls -= 1
             return {"summary": payload["id"]}
 
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(), clear=False):
             os.environ.pop("MLX_REVIEW_CMD", None)
             with mock.patch("review_runner.mlx_review_client.review_payload", side_effect=fake_review_payload):
                 results: list[dict[str, str]] = []
@@ -327,6 +382,7 @@ class ReviewNormalizationTests(unittest.TestCase):
                         {
                             "path": "fortune/service.py",
                             "line": 12,
+                            "confidence": 0.91,
                             "body": "캐시 생성 경로가 바뀌었으니 정상 흐름과 만료 흐름을 함께 검증하는 테스트를 추가해두는 편이 안전합니다.",
                         },
                         {
@@ -390,6 +446,18 @@ class NormalizeSeverityTests(unittest.TestCase):
                 self.assertEqual(review_service.normalize_severity(raw), review_service.SEVERITY_MINOR)
 
 
+class NormalizeConfidenceTests(unittest.TestCase):
+    def test_accepts_numeric_confidence_values(self) -> None:
+        self.assertEqual(review_service.normalize_confidence(0.8), 0.8)
+        self.assertEqual(review_service.normalize_confidence("0.93"), 0.93)
+        self.assertEqual(review_service.normalize_confidence(1), 1.0)
+
+    def test_rejects_missing_bool_and_out_of_range_values(self) -> None:
+        for raw in (None, True, False, "high", -0.1, 1.1):
+            with self.subTest(raw=raw):
+                self.assertIsNone(review_service.normalize_confidence(raw))
+
+
 class SeverityRoutingAndRenderingTests(unittest.TestCase):
     def _make_pr_file(self) -> "review_service.PullRequestFile":
         return review_service.PullRequestFile(
@@ -416,6 +484,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                                 "path": "fortune/service.py",
                                 "line": 1,
                                 "severity": severity,
+                                "confidence": 0.9,
                                 "body": "이 라인의 위험 요소를 반드시 처리해야 합니다.",
                             }
                         ],
@@ -444,6 +513,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "Minor",
+                        "confidence": 0.9,
                         "body": "네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
                     }
                 ],
@@ -456,6 +526,51 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         # 중복으로 판정해 제거하므로, suggestions 가 비어 있어도 정상 — 라인 코멘트는 보존됨.
         self.assertEqual(len(validated.comments), 1)
         self.assertEqual(validated.comments[0].severity, "Minor")
+
+    def test_model_comment_missing_confidence_is_dropped(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "검토.",
+                "event": "REQUEST_CHANGES",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "body": "Evidence: x = 1. Problem: 근거가 부족합니다. Impact: 잘못된 리뷰가 남습니다. Fix: 제거하세요.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.comments, [])
+        self.assertEqual(validated.event, "APPROVE")
+
+    def test_model_comment_below_confidence_threshold_is_dropped(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "검토.",
+                "event": "REQUEST_CHANGES",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.79,
+                        "body": "Evidence: x = 1. Problem: 확신이 낮습니다. Impact: false positive 입니다. Fix: 제거하세요.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.comments, [])
+        self.assertEqual(validated.event, "APPROVE")
 
     def test_rule_based_secret_logging_comment_gets_critical_severity(self) -> None:
         # 비밀값 로그 감지는 직접 Critical 을 붙이므로 모델이 아무것도 안 보내도
@@ -509,8 +624,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(
             rendered_bodies,
             [
-                "[Critical] 서명 검증이 제거돼 인증 우회 위험이 있습니다.",
-                "[Minor] 네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+                "[Critical] 서명 검증이 제거돼 인증 우회 위험이 있습니다.\n\nConfidence: 1.00",
+                "[Minor] 네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.\n\nConfidence: 1.00",
             ],
         )
 
@@ -530,6 +645,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "Critical",
+                        "confidence": 0.95,
                         "body": "서명 검증이 비활성화돼 인증 우회 위험이 있습니다.",
                     }
                 ],
@@ -615,6 +731,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "Minor",
+                        "confidence": 0.9,
                         "body": "네이밍을 통일하면 일관성이 좋아집니다.",
                     }
                 ],
@@ -655,6 +772,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "p0",
+                        "confidence": 0.9,
                         "body": "이 라인은 살짝 아쉽습니다.",
                     }
                 ],
@@ -860,6 +978,7 @@ class DescriptionPatternEndToEndTests(unittest.TestCase):
                         "path": "api/handler.py",
                         "line": 10,
                         "severity": "Major",
+                        "confidence": 0.9,
                         "body": "None 반환 시 AttributeError 가 발생해 요청이 500 으로 끝납니다.",
                     }
                 ],
