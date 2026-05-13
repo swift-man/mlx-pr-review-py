@@ -87,6 +87,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("summary, event, positives, must_fix, suggestions, comments", system_prompt)
         self.assertIn("must_fix and suggestions must be empty arrays", system_prompt)
         self.assertIn("{path, line, severity, confidence, body}", system_prompt)
+        self.assertIn("numeric fields such as comments[].line and comments[].confidence must not be quoted", system_prompt)
 
         # 핵심 원칙
         self.assertIn("Never speculate", system_prompt)

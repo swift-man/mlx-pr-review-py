@@ -383,12 +383,12 @@ class ReviewNormalizationTests(unittest.TestCase):
                             "path": "fortune/service.py",
                             "line": 12,
                             "confidence": 0.91,
-                            "body": "캐시 생성 경로가 바뀌었으니 정상 흐름과 만료 흐름을 함께 검증하는 테스트를 추가해두는 편이 안전합니다.",
+                            "body": "Evidence: cache_entry = build_cache_entry(). Problem: 캐시 생성 경로 변경에 대한 검증이 필요합니다. Impact: 만료 흐름 회귀를 놓칠 수 있습니다. Fix: 정상 흐름과 만료 흐름 테스트를 추가하세요.",
                         },
                         {
                             "path": "missing.py",
                             "line": 12,
-                            "body": "이 파일은 PR에 없습니다.",
+                            "body": "Evidence: missing.py. Problem: PR에 없는 파일입니다. Impact: GitHub 라인 코멘트 등록이 실패합니다. Fix: 실제 diff 파일만 사용하세요.",
                         },
                         {
                             "path": "fortune/service.py",
@@ -485,7 +485,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                                 "line": 1,
                                 "severity": severity,
                                 "confidence": 0.9,
-                                "body": "이 라인의 위험 요소를 반드시 처리해야 합니다.",
+                                "body": "Evidence: x = 1. Problem: 위험한 상태 전이가 검증 없이 남습니다. Impact: 현재 코드에서 잘못된 리뷰 이벤트가 발생합니다. Fix: 해당 상태 전이를 검증하거나 코멘트를 제거하세요.",
                             }
                         ],
                     },
@@ -514,7 +514,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "Minor",
                         "confidence": 0.9,
-                        "body": "네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
                     }
                 ],
             },
@@ -571,6 +571,62 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         )
         self.assertEqual(validated.comments, [])
         self.assertEqual(validated.event, "APPROVE")
+
+    def test_model_comment_without_required_sections_is_dropped(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": "이 줄은 문제가 있으니 수정해야 합니다.",
+                    }
+                ]
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(
+            stats.dropped_model_comment_reasons,
+            {"missing_required_finding_sections": 1},
+        )
+
+    def test_non_object_model_comment_is_dropped_without_crashing(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {"comments": ["이 값은 dict가 아닙니다."]},
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(stats.dropped_model_comment_reasons, {"non_object_comment": 1})
+
+    def test_model_comment_rejects_bool_zero_and_float_lines(self) -> None:
+        valid_body = (
+            "Evidence: x = 1. Problem: 잘못된 라인 타입입니다. "
+            "Impact: GitHub 라인 코멘트가 엉뚱한 줄에 붙을 수 있습니다. Fix: 정수 라인만 허용하세요."
+        )
+        for raw_line in (True, False, 0, 1.5):
+            with self.subTest(raw_line=raw_line):
+                comments, stats = review_service.collect_validated_comments(
+                    {
+                        "comments": [
+                            {
+                                "path": "fortune/service.py",
+                                "line": raw_line,
+                                "severity": "Major",
+                                "confidence": 0.95,
+                                "body": valid_body,
+                            }
+                        ]
+                    },
+                    [self._make_pr_file()],
+                )
+
+                self.assertEqual(comments, [])
+                self.assertEqual(stats.dropped_model_comment_reasons, {"invalid_line_type": 1})
 
     def test_rule_based_secret_logging_comment_gets_critical_severity(self) -> None:
         # 비밀값 로그 감지는 직접 Critical 을 붙이므로 모델이 아무것도 안 보내도
@@ -646,7 +702,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "Critical",
                         "confidence": 0.95,
-                        "body": "서명 검증이 비활성화돼 인증 우회 위험이 있습니다.",
+                        "body": "Evidence: 서명 검증 분기가 제거되었습니다. Problem: 인증 우회 경로가 생깁니다. Impact: 서명 없는 요청이 처리될 수 있습니다. Fix: 서명 검증을 복구하세요.",
                     }
                 ],
             }
@@ -731,7 +787,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "Minor",
                         "confidence": 0.9,
-                        "body": "네이밍을 통일하면 일관성이 좋아집니다.",
+                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
                     }
                 ],
             },
@@ -774,7 +830,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "p0",
                         "confidence": 0.9,
-                        "body": "이 라인은 살짝 아쉽습니다.",
+                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
                     }
                 ],
             },
@@ -980,7 +1036,7 @@ class DescriptionPatternEndToEndTests(unittest.TestCase):
                         "line": 10,
                         "severity": "Major",
                         "confidence": 0.9,
-                        "body": "None 반환 시 AttributeError 가 발생해 요청이 500 으로 끝납니다.",
+                        "body": "Evidence: return data.value. Problem: None 반환 시 AttributeError 가 발생합니다. Impact: 요청이 500 으로 끝납니다. Fix: None 분기를 먼저 처리하세요.",
                     }
                 ],
             },

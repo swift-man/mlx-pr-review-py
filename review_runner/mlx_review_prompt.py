@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 DEFAULT_MAX_FINDINGS = 10
+MIN_COMMENT_CONFIDENCE = 0.8
 
 
 # 시스템 프롬프트: 역할 프라이밍 + 우선순위 + 원칙 + 스키마 계약.
@@ -16,7 +17,7 @@ SYSTEM_PROMPT_RULES = (
     "Your primary goal is accuracy, not finding many issues. False positives are worse than missed optional suggestions.",
     "Your only task is to produce exactly one JSON object for a Korean-speaking reviewer.",
     "Return exactly one JSON object and nothing else. Never wrap the answer in markdown fences.",
-    "Use strict JSON syntax with double-quoted keys and string values. No trailing commas, single quotes, comments, or unquoted enum values.",
+    "Use strict JSON syntax: object keys and string values must be double-quoted, while numeric fields such as comments[].line and comments[].confidence must not be quoted. No trailing commas, single quotes, comments, or unquoted enum values.",
     "Use only these top-level keys: summary, event, positives, must_fix, suggestions, comments.",
     "positives must be a JSON array of strings. must_fix and suggestions must be empty arrays; every finding must be a comments[] object with {path, line, severity, confidence, body}.",
     "Write every natural-language string in Korean. File paths, symbols, API names may stay in English when translation would be incorrect.",
@@ -41,7 +42,7 @@ SYSTEM_PROMPT_RULES = (
     "  - positives: things THIS PR actually improves, stated as 'changed construct -> technical role -> concrete effect'. Neutral observations ('기존 API 계약을 유지합니다') do not belong here - drop them or fold into summary.",
     "  - must_fix: always return []. The runtime ignores model top-level findings because they lack path, line, and confidence evidence.",
     "  - suggestions: always return []. Optional findings still belong in comments[] with severity 'Suggestion' and confidence.",
-    "  - comments[]: line-scoped findings. Each object has {path, line, severity, confidence, body}. severity must be exactly one of 'Critical', 'Major', 'Minor', 'Suggestion'. confidence must be a number from 0.8 to 1.0. body must include Evidence, Problem, Impact, and Fix. If a line has no concrete issue, omit the comment entirely.",
+    f"  - comments[]: line-scoped findings. Each object has {{path, line, severity, confidence, body}}. severity must be exactly one of 'Critical', 'Major', 'Minor', 'Suggestion'. confidence must be a number from {MIN_COMMENT_CONFIDENCE:.1f} to 1.0. body must include Evidence, Problem, Impact, and Fix. If a line has no concrete issue, omit the comment entirely.",
     "Severity levels for comments[]:",
     "  - Critical: only crashes, data loss, security issues, or a core flow that must break in the current code.",
     "  - Major: only actual user-visible bugs that can happen in the current code.",
@@ -60,7 +61,7 @@ SYSTEM_PROMPT_RULES = (
     # 충분하다. 하나라도 '아니오' 면 해당 지적을 drop.
     "  - Self-check before emitting any comments[] entry: (a) have I actually read the affected lines in the latest PR HEAD diff or file context, (b) is my suggestion already implemented nearby or elsewhere in the same diff/base file, (c) can I prove the behavior from code flow rather than variable names, (d) would I still post this if false positives are more harmful than missed suggestions? If any answer is 'no', drop the finding entirely.",
     "  - Every comments[] finding must state the concrete code condition that triggers the problem, the runtime or test-visible impact, and the exact fix. Do not rely on future hypothetical types, subclasses, or callers.",
-    "  - confidence must represent proof strength from code evidence. If confidence would be below 0.8, omit the finding. Runtime drops model comments with missing or low confidence.",
+    f"  - confidence must represent proof strength from code evidence. If confidence would be below {MIN_COMMENT_CONFIDENCE:.1f}, omit the finding. Runtime drops model comments with missing or low confidence.",
     # 주석/docstring 을 '한국어로 번역해라' 는 제안을 겉만 보고 내지 마라. 한국어 주석에는
     # class, return, import 같은 영문 토큰이 자주 섞이므로 영문 토큰 존재만으로 '영문 주석' 이라
     # 판단할 수 없다. 판정 기준은 한글 코드포인트 존재 여부만 본다: 주석에 Hangul

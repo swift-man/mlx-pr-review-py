@@ -97,6 +97,25 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
         self.assertIsNone(normalized["severity"])
         self.assertNotIn("confidence", normalized)
 
+    def test_normalize_comment_rejects_bool_and_float_lines(self) -> None:
+        for raw_line in (True, False, 12.9):
+            with self.subTest(raw_line=raw_line):
+                normalized, reason = mlx_review_parser.normalize_comment(
+                    {"path": "a.py", "line": raw_line, "body": "본문"}
+                )
+
+                self.assertIsNone(normalized)
+                self.assertEqual(reason, "invalid_line")
+
+    def test_normalize_comment_accepts_digit_string_line(self) -> None:
+        normalized, reason = mlx_review_parser.normalize_comment(
+            {"path": "a.py", "line": " 12 ", "body": "본문"}
+        )
+
+        self.assertIsNone(reason)
+        assert normalized is not None
+        self.assertEqual(normalized["line"], 12)
+
     def test_normalize_event_value_accepts_approve_when_no_comments(self) -> None:
         # 지적이 없을 때 모델이 APPROVE 를 emit 하면 파서가 그대로 보존한다.
         self.assertEqual(
@@ -132,6 +151,18 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
             mlx_review_parser.normalize_event_value("", has_comments=False),
             "COMMENT",
         )
+
+    def test_parse_and_normalize_repairs_unquoted_approve_event(self) -> None:
+        raw_output = (
+            '{"summary":"테스트 요약","event":APPROVE,'
+            '"positives":[],"must_fix":[],"suggestions":[],"comments":[]}'
+        )
+
+        normalized, metadata = mlx_review_parser.parse_and_normalize_model_output(raw_output)
+
+        self.assertEqual(metadata["parse_mode"], "repaired_json")
+        self.assertEqual(normalized["event"], "APPROVE")
+        self.assertEqual(normalized["comments"], [])
 
     def test_parse_and_normalize_carries_severity_end_to_end(self) -> None:
         # 모델이 보낸 severity 가 파싱 → 정규화 파이프라인 끝까지 살아남는지 확인.

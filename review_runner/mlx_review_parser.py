@@ -18,7 +18,7 @@ MAX_SALVAGE_ITEMS = 5
 
 TRAILING_COMMA_RE = re.compile(r",(?=\s*[}\]])")
 BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
-UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(COMMENT|REQUEST_CHANGES)(\s*[,}])')
+UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(APPROVE|COMMENT|REQUEST_CHANGES)(\s*[,}])')
 SUMMARY_STOP_RE = re.compile(
     r'(?i)(?:\bpositive(?:s)?\d*\s*:|["\']?positives["\']?\s*:|\bconcern(?:s)?\d*\s*:|["\']?concerns["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:)'
 )
@@ -485,9 +485,15 @@ def normalize_comment(raw_comment: dict[str, Any]) -> tuple[dict[str, Any] | Non
         return None, "invalid_body"
 
     line = raw_comment.get("line")
-    try:
-        line_number = int(line)
-    except (TypeError, ValueError):
+    if isinstance(line, bool):
+        return None, "invalid_line"
+    if isinstance(line, int):
+        line_number = line
+    elif isinstance(line, str) and line.strip().isdigit():
+        line_number = int(line.strip())
+    else:
+        return None, "invalid_line"
+    if line_number <= 0:
         return None, "invalid_line"
 
     # severity / confidence 는 review_service 가 정규화하므로 여기서는 원본 값을

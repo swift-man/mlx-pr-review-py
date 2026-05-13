@@ -506,6 +506,7 @@ SEVERITY_MINOR = "Minor"
 SEVERITY_SUGGESTION = "Suggestion"
 ALL_SEVERITIES = (SEVERITY_CRITICAL, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
 MIN_MODEL_COMMENT_CONFIDENCE = 0.8
+REQUIRED_MODEL_COMMENT_SECTIONS = ("evidence", "problem", "impact", "fix")
 # Critical / Major 는 머지 전 반드시 봐야 하는 차단성 등급이라 event 를 REQUEST_CHANGES
 # 로 승격시킨다. Minor / Suggestion 은 개선 제안이라 COMMENT 로 남는다.
 BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_MAJOR})
@@ -556,6 +557,12 @@ def normalize_confidence(value: Any) -> float | None:
     if not (0.0 <= confidence <= 1.0):
         return None
     return confidence
+
+
+def has_required_finding_sections(body: str) -> bool:
+    """모델 라인 코멘트가 근거/문제/영향/수정 템플릿을 모두 포함하는지 확인한다."""
+    normalized = body.lower()
+    return all(re.search(rf"\b{re.escape(section)}\s*:", normalized) for section in REQUIRED_MODEL_COMMENT_SECTIONS)
 
 
 @dataclass
@@ -1085,7 +1092,7 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
                 "정확성, 보안, 안정성, 성능, 변경된 동작에 대한 누락 테스트를 우선하세요.",
                 "스타일-only 코멘트나 칭찬-only 코멘트는 금지합니다.",
                 "각 코멘트에는 severity, confidence, Evidence, Problem, Impact, Fix를 포함하세요.",
-                "confidence가 0.8 미만이면 코멘트를 작성하지 마세요.",
+                f"confidence가 {MIN_MODEL_COMMENT_CONFIDENCE:.2f} 미만이면 코멘트를 작성하지 마세요.",
             ],
             "summary_rules": [
                 "summary는 전체 변경을 한두 문장으로 요약하세요.",
@@ -1340,13 +1347,16 @@ def collect_validated_comments(
     stats = CommentValidationStats(raw_model_comments=len(raw_comments) if isinstance(raw_comments, list) else 0)
 
     for raw in raw_comments if isinstance(raw_comments, list) else []:
+        if not isinstance(raw, dict):
+            increment_reason(stats.dropped_model_comment_reasons, "non_object_comment")
+            continue
         path = raw.get("path")
         line = raw.get("line")
         body = normalize_text(raw.get("body"))
         if not path:
             increment_reason(stats.dropped_model_comment_reasons, "missing_path")
             continue
-        if not isinstance(line, int):
+        if not isinstance(line, int) or isinstance(line, bool) or line <= 0:
             increment_reason(stats.dropped_model_comment_reasons, "invalid_line_type")
             continue
         if not body:
@@ -1354,6 +1364,9 @@ def collect_validated_comments(
             continue
         if looks_like_praise_only_comment(body):
             increment_reason(stats.dropped_model_comment_reasons, "style_or_praise_only")
+            continue
+        if not has_required_finding_sections(body):
+            increment_reason(stats.dropped_model_comment_reasons, "missing_required_finding_sections")
             continue
 
         pr_file = file_index.get(path)
