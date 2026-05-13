@@ -18,7 +18,7 @@ MAX_SALVAGE_ITEMS = 5
 
 TRAILING_COMMA_RE = re.compile(r",(?=\s*[}\]])")
 BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
-UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(COMMENT|REQUEST_CHANGES)(\s*[,}])')
+UNQUOTED_EVENT_RE = re.compile(r'("event"\s*:\s*)(APPROVE|COMMENT|REQUEST_CHANGES)(\s*[,}])')
 SUMMARY_STOP_RE = re.compile(
     r'(?i)(?:\bpositive(?:s)?\d*\s*:|["\']?positives["\']?\s*:|\bconcern(?:s)?\d*\s*:|["\']?concerns["\']?\s*:|["\']?must_fix["\']?\s*:|["\']?suggestions["\']?\s*:|["\']?comments["\']?\s*:|["\']?event["\']?\s*:)'
 )
@@ -485,23 +485,28 @@ def normalize_comment(raw_comment: dict[str, Any]) -> tuple[dict[str, Any] | Non
         return None, "invalid_body"
 
     line = raw_comment.get("line")
-    try:
-        line_number = int(line)
-    except (TypeError, ValueError):
+    if isinstance(line, bool):
+        return None, "invalid_line"
+    if isinstance(line, int):
+        line_number = line
+    elif isinstance(line, str) and line.strip().isdigit():
+        line_number = int(line.strip())
+    else:
+        return None, "invalid_line"
+    if line_number <= 0:
         return None, "invalid_line"
 
-    # severity 는 review_service.normalize_severity 가 정규화하므로 여기서는 원본 값을
-    # 그대로 흘려보낸다. 키 자체가 없더라도 raw_comment.get 은 None 을 반환하고, 서비스
-    # 계층이 안전하게 Minor 로 폴백한다.
-    return (
-        {
-            "path": path,
-            "line": line_number,
-            "body": body,
-            "severity": raw_comment.get("severity"),
-        },
-        None,
-    )
+    # severity / confidence 는 review_service 가 정규화하므로 여기서는 원본 값을
+    # 그대로 흘려보낸다. 키 자체가 없더라도 서비스 계층이 안전하게 처리한다.
+    normalized = {
+        "path": path,
+        "line": line_number,
+        "body": body,
+        "severity": raw_comment.get("severity"),
+    }
+    if "confidence" in raw_comment:
+        normalized["confidence"] = raw_comment.get("confidence")
+    return normalized, None
 
 
 def normalize_response(raw_response: dict[str, Any], *, max_findings: int) -> tuple[dict[str, Any], dict[str, Any]]:

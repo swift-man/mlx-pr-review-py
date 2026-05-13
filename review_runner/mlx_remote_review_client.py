@@ -88,16 +88,17 @@ def _generate_url() -> str:
     raw_url = os.environ.get("MLX_GENERATE_URL", "")
     url = raw_url.strip() or DEFAULT_GENERATE_URL
     parsed = urlparse(url)
+    safe_url = _sanitize_url_for_logging(url) or "(invalid URL)"
     if parsed.scheme not in ALLOWED_URL_SCHEMES:
         raise RuntimeError(
             f"MLX_GENERATE_URL must use http or https scheme, got: {parsed.scheme or '(empty)'}"
         )
     if not parsed.hostname:
-        raise RuntimeError(f"MLX_GENERATE_URL must include a host, got: {url}")
+        raise RuntimeError(f"MLX_GENERATE_URL must include a host, got: {safe_url}")
     try:
         port = parsed.port
     except ValueError as exc:
-        raise RuntimeError(f"MLX_GENERATE_URL contains invalid port: {url}") from exc
+        raise RuntimeError(f"MLX_GENERATE_URL contains invalid port: {safe_url}") from exc
     if port is not None and not (1 <= port <= 65535):
         raise RuntimeError(
             f"MLX_GENERATE_URL port must be in 1..65535, got: {port}"
@@ -117,8 +118,12 @@ def _sanitize_url_for_logging(url: str) -> str:
     except ValueError:
         return ""
     host = parsed.hostname or ""
-    if parsed.port:
-        netloc = f"{host}:{parsed.port}"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port:
+        netloc = f"{host}:{port}"
     else:
         netloc = host
     if not netloc:
@@ -180,7 +185,9 @@ def _post_generate(messages: list[dict[str, str]]) -> dict[str, Any]:
     가능성을 낮춘다.
 
     재시도 정책:
-    - URLError (connection refused / DNS / 타임아웃 등): 1회 retry. 가장 흔한 시나리오는
+    - TimeoutError: 즉시 실패. 서버가 요청을 받았지만 생성이 timeout 을 넘긴 경우라
+      같은 긴 요청을 바로 다시 보내면 webhook 시간이 두 배로 늘어난다.
+    - URLError (connection refused / DNS 등): 1회 retry. 가장 흔한 시나리오는
       mlx-final-py 가 final-reply 처리 중 응답 못 받는 경우.
     - HTTP 5xx (502 Bad Gateway / 503 Service Unavailable / 504): 1회 retry — 원격 모델
       서버 배포/과부하로 인한 일시 장애 가능성 (gemini Round 3 Major).
@@ -199,6 +206,11 @@ def _post_generate(messages: list[dict[str, str]]) -> dict[str, Any]:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 response_body = response.read().decode("utf-8")
             break
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "MLX generate endpoint timed out "
+                f"after {timeout:.1f}s while waiting for {sanitized}"
+            ) from exc
         except urllib.error.HTTPError as exc:
             detail = _read_error_body(exc)
             if exc.code >= 500 and attempt == 0:
@@ -209,6 +221,11 @@ def _post_generate(messages: list[dict[str, str]]) -> dict[str, Any]:
                 f"MLX generate endpoint returned HTTP {exc.code}: {detail or exc.reason}"
             ) from exc
         except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise RuntimeError(
+                    "MLX generate endpoint timed out "
+                    f"after {timeout:.1f}s while waiting for {sanitized}"
+                ) from exc
             if attempt == 0:
                 # 짧은 backoff. mlx-final-py 가 final-reply 처리로 잠깐 응답을 못
                 # 받는 경우가 흔하므로 1 초만 쉬고 한 번 더 친다.
@@ -216,6 +233,15 @@ def _post_generate(messages: list[dict[str, str]]) -> dict[str, Any]:
                 continue
             raise RuntimeError(
                 f"Failed to reach MLX generate endpoint at {sanitized} after retry: {exc.reason}"
+            ) from exc
+        except OSError as exc:
+            if attempt == 0:
+                # 짧은 backoff. mlx-final-py 가 final-reply 처리로 잠깐 응답을 못
+                # 받는 경우가 흔하므로 1 초만 쉬고 한 번 더 친다.
+                time.sleep(1.0)
+                continue
+            raise RuntimeError(
+                f"Failed to reach MLX generate endpoint at {sanitized} after retry: {exc}"
             ) from exc
 
     if response_body is None:

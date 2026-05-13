@@ -37,7 +37,7 @@ export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
 # export MLX_GENERATE_URL=http://127.0.0.1:8002/v1/generate
 # Bearer 인증을 사용한다면 mlx-final-py 와 같은 토큰을 export.
 # export MLX_GENERATE_AUTH_TOKEN=replace-me
-# 응답 timeout (초). 큰 PR diff 면 길게 잡아둔다 (default 600).
+# 응답 timeout (초). 초과하면 같은 장기 생성 요청을 다시 보내지 않고 timeout 으로 실패 처리한다 (default 600).
 # export MLX_GENERATE_TIMEOUT=600
 
 export SSL_CERT_FILE="$CERT_PATH"

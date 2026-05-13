@@ -96,6 +96,18 @@ class GenerateUrlTests(unittest.TestCase):
                 client._generate_url()
             self.assertIn("port", str(ctx.exception))
 
+    def test_invalid_port_error_sanitizes_url(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            _isolated_env(MLX_GENERATE_URL="http://user:secret@gpu:bad/v1/generate?token=abc"),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                client._generate_url()
+        msg = str(ctx.exception)
+        self.assertIn("http://gpu/v1/generate", msg)
+        self.assertNotIn("user:secret", msg)
+        self.assertNotIn("token=abc", msg)
+
     def test_port_zero_rejected(self) -> None:
         # 0 은 유효하지 않은 포트 — urlparse 는 통과시키지만 우리는 거부.
         with mock.patch.dict(os.environ, _isolated_env(MLX_GENERATE_URL="http://gpu:0/v1/generate")):
@@ -121,6 +133,10 @@ class SanitizeUrlForLoggingTests(unittest.TestCase):
 
     def test_returns_empty_for_missing_host(self) -> None:
         self.assertEqual(client._sanitize_url_for_logging("http://"), "")
+
+    def test_invalid_port_does_not_prevent_sanitizing(self) -> None:
+        result = client._sanitize_url_for_logging("http://user:secret@gpu:bad/v1/generate?token=x")
+        self.assertEqual(result, "http://gpu/v1/generate")
 
 
 class AuthHeaderTests(unittest.TestCase):
@@ -246,6 +262,40 @@ class PostGenerateTests(unittest.TestCase):
         self.assertNotIn("user:pw", msg)
         self.assertNotIn("token=abc", msg)
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_read_timeout_raises_without_retry_with_sanitized_url(self) -> None:
+        response = mock.MagicMock()
+        response.read.side_effect = TimeoutError("timed out")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        urlopen = mock.MagicMock(return_value=response)
+
+        with self._patch_env(MLX_GENERATE_URL="http://user:pw@gpu/v1/generate?token=abc"), \
+             mock.patch("urllib.request.urlopen", urlopen), \
+             mock.patch("time.sleep") as sleeper:
+            with self.assertRaises(RuntimeError) as ctx:
+                client._post_generate(self.messages)
+
+        msg = str(ctx.exception)
+        self.assertIn("timed out after", msg)
+        self.assertIn("http://gpu/v1/generate", msg)
+        self.assertNotIn("user:pw", msg)
+        self.assertNotIn("token=abc", msg)
+        self.assertEqual(urlopen.call_count, 1)
+        sleeper.assert_not_called()
+
+    def test_url_error_wrapping_timeout_raises_without_retry(self) -> None:
+        urlopen = mock.MagicMock(side_effect=urllib.error.URLError(TimeoutError("timed out")))
+
+        with self._patch_env(MLX_GENERATE_TIMEOUT="9"), \
+             mock.patch("urllib.request.urlopen", urlopen), \
+             mock.patch("time.sleep") as sleeper:
+            with self.assertRaises(RuntimeError) as ctx:
+                client._post_generate(self.messages)
+
+        self.assertIn("timed out after 9.0s", str(ctx.exception))
+        self.assertEqual(urlopen.call_count, 1)
+        sleeper.assert_not_called()
 
     def test_non_json_body_rejected(self) -> None:
         response = mock.MagicMock()

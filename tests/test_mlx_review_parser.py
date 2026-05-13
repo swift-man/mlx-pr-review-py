@@ -80,11 +80,12 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
         # 파서는 severity 를 정규화하지 않고 raw 값을 그대로 흘려보낸다.
         # 정규화는 review_service.normalize_severity 에서 처리한다.
         normalized, reason = mlx_review_parser.normalize_comment(
-            {"path": "a.py", "line": 1, "body": "본문", "severity": "Critical"}
+            {"path": "a.py", "line": 1, "body": "본문", "severity": "Critical", "confidence": 0.91}
         )
         self.assertIsNone(reason)
         assert normalized is not None
         self.assertEqual(normalized["severity"], "Critical")
+        self.assertEqual(normalized["confidence"], 0.91)
 
     def test_normalize_comment_returns_none_severity_when_key_missing(self) -> None:
         normalized, reason = mlx_review_parser.normalize_comment(
@@ -94,6 +95,26 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
         assert normalized is not None
         # severity 키가 없어도 None 으로 명시적으로 보존돼야 서비스 계층이 Minor 로 폴백한다.
         self.assertIsNone(normalized["severity"])
+        self.assertNotIn("confidence", normalized)
+
+    def test_normalize_comment_rejects_bool_and_float_lines(self) -> None:
+        for raw_line in (True, False, 12.9):
+            with self.subTest(raw_line=raw_line):
+                normalized, reason = mlx_review_parser.normalize_comment(
+                    {"path": "a.py", "line": raw_line, "body": "본문"}
+                )
+
+                self.assertIsNone(normalized)
+                self.assertEqual(reason, "invalid_line")
+
+    def test_normalize_comment_accepts_digit_string_line(self) -> None:
+        normalized, reason = mlx_review_parser.normalize_comment(
+            {"path": "a.py", "line": " 12 ", "body": "본문"}
+        )
+
+        self.assertIsNone(reason)
+        assert normalized is not None
+        self.assertEqual(normalized["line"], 12)
 
     def test_normalize_event_value_accepts_approve_when_no_comments(self) -> None:
         # 지적이 없을 때 모델이 APPROVE 를 emit 하면 파서가 그대로 보존한다.
@@ -131,6 +152,18 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
             "COMMENT",
         )
 
+    def test_parse_and_normalize_repairs_unquoted_approve_event(self) -> None:
+        raw_output = (
+            '{"summary":"테스트 요약","event":APPROVE,'
+            '"positives":[],"must_fix":[],"suggestions":[],"comments":[]}'
+        )
+
+        normalized, metadata = mlx_review_parser.parse_and_normalize_model_output(raw_output)
+
+        self.assertEqual(metadata["parse_mode"], "repaired_json")
+        self.assertEqual(normalized["event"], "APPROVE")
+        self.assertEqual(normalized["comments"], [])
+
     def test_parse_and_normalize_carries_severity_end_to_end(self) -> None:
         # 모델이 보낸 severity 가 파싱 → 정규화 파이프라인 끝까지 살아남는지 확인.
         # 이 경로가 끊기면 모든 모델 라인 코멘트가 서비스 계층에서 Minor 로 강등된다.
@@ -146,6 +179,7 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 10,
                         "severity": "Critical",
+                        "confidence": 0.95,
                         "body": "서명 검증이 제거되어 인증 우회 위험이 있습니다.",
                     }
                 ],
@@ -154,6 +188,7 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
         normalized, _metadata = mlx_review_parser.parse_and_normalize_model_output(raw_output)
         self.assertEqual(len(normalized["comments"]), 1)
         self.assertEqual(normalized["comments"][0]["severity"], "Critical")
+        self.assertEqual(normalized["comments"][0]["confidence"], 0.95)
 
 
 if __name__ == "__main__":

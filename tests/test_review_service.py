@@ -22,10 +22,48 @@ if "jwt" not in sys.modules:
 from review_runner import mlx_review_parser, review_service
 
 
+def _mlx_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "MLX_REVIEW_BACKEND": "",
+        "MLX_GENERATE_URL": "",
+    }
+    env.update(overrides)
+    return env
+
+
 class RunMlxTests(unittest.TestCase):
+    def test_configured_mlx_backend_defaults_to_local(self) -> None:
+        with mock.patch.dict(os.environ, _mlx_env(), clear=False):
+            self.assertEqual(review_service.configured_mlx_backend(), "local")
+
+    def test_configured_mlx_backend_accepts_explicit_remote(self) -> None:
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_BACKEND="remote"), clear=False):
+            self.assertEqual(review_service.configured_mlx_backend(), "remote")
+
+    def test_configured_mlx_backend_accepts_explicit_local(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            _mlx_env(MLX_REVIEW_BACKEND="local", MLX_GENERATE_URL="http://127.0.0.1:8002/v1/generate"),
+            clear=False,
+        ):
+            self.assertEqual(review_service.configured_mlx_backend(), "local")
+
+    def test_configured_mlx_backend_uses_generate_url_as_remote_hint(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            _mlx_env(MLX_GENERATE_URL="http://127.0.0.1:8002/v1/generate"),
+            clear=False,
+        ):
+            self.assertEqual(review_service.configured_mlx_backend(), "remote")
+
+    def test_configured_mlx_backend_rejects_invalid_value(self) -> None:
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_BACKEND="sidecar"), clear=False):
+            with self.assertRaisesRegex(RuntimeError, "local, remote"):
+                review_service.configured_mlx_backend()
+
     def test_run_mlx_uses_inprocess_client_by_default(self) -> None:
         expected = {"summary": "ok"}
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(), clear=False):
             os.environ.pop("MLX_REVIEW_CMD", None)
             with mock.patch("review_runner.mlx_review_client.review_payload", return_value=expected) as review_payload:
                 with mock.patch("review_runner.review_service.subprocess.run") as subprocess_run:
@@ -38,7 +76,7 @@ class RunMlxTests(unittest.TestCase):
     def test_run_mlx_uses_inprocess_client_for_explicit_default_command(self) -> None:
         expected = {"summary": "ok"}
         command = f'"{sys.executable}" -m review_runner.mlx_review_client'
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": command}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD=command), clear=False):
             with mock.patch("review_runner.mlx_review_client.review_payload", return_value=expected) as review_payload:
                 with mock.patch("review_runner.review_service.subprocess.run") as subprocess_run:
                     result = review_service.run_mlx('{"repository":"demo"}')
@@ -51,7 +89,7 @@ class RunMlxTests(unittest.TestCase):
         completed = subprocess_result(
             stdout='{"summary":"ok","event":"COMMENT","positives":[],"concerns":[],"comments":[]}'
         )
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json"), clear=False):
             with mock.patch("review_runner.review_service.subprocess.run", return_value=completed) as subprocess_run:
                 with mock.patch("review_runner.mlx_review_client.review_payload") as review_payload:
                     result = review_service.run_mlx('{"repository":"demo"}')
@@ -60,9 +98,26 @@ class RunMlxTests(unittest.TestCase):
         subprocess_run.assert_called_once()
         review_payload.assert_not_called()
 
+    def test_run_mlx_uses_remote_client_when_configured(self) -> None:
+        expected = {"summary": "remote"}
+        with mock.patch.dict(
+            os.environ,
+            _mlx_env(MLX_REVIEW_BACKEND="remote", MLX_REVIEW_CMD="custom-client --json"),
+            clear=False,
+        ):
+            with mock.patch("review_runner.mlx_remote_review_client.review_payload", return_value=expected) as remote_payload:
+                with mock.patch("review_runner.review_service.subprocess.run") as subprocess_run:
+                    with mock.patch("review_runner.mlx_review_client.review_payload") as local_payload:
+                        result = review_service.run_mlx('{"repository":"demo"}')
+
+        self.assertEqual(result, expected)
+        remote_payload.assert_called_once_with({"repository": "demo"})
+        subprocess_run.assert_not_called()
+        local_payload.assert_not_called()
+
     def test_run_mlx_surfaces_native_abort_hint_for_sigabrt_subprocess(self) -> None:
         completed = subprocess_result(stdout="", stderr="abort() called", returncode=-signal.SIGABRT)
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json"), clear=False):
             with mock.patch("review_runner.review_service.subprocess.run", return_value=completed):
                 with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
                     review_service.run_mlx('{"repository":"demo"}')
@@ -76,7 +131,7 @@ class RunMlxTests(unittest.TestCase):
         recovered = subprocess_result(
             stdout='{"summary":"ok","event":"COMMENT","positives":[],"concerns":[],"comments":[]}'
         )
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json"), clear=False):
             with mock.patch(
                 "review_runner.review_service.subprocess.run",
                 side_effect=[failed, recovered],
@@ -96,7 +151,7 @@ class RunMlxTests(unittest.TestCase):
             stderr="[METAL] Command buffer execution failed: Insufficient Memory",
             returncode=-signal.SIGABRT,
         )
-        with mock.patch.dict(os.environ, {"MLX_REVIEW_CMD": "custom-client --json", "MLX_DEVICE": "gpu"}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(MLX_REVIEW_CMD="custom-client --json", MLX_DEVICE="gpu"), clear=False):
             with mock.patch("review_runner.review_service.subprocess.run", return_value=completed) as subprocess_run:
                 with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE=cpu"):
                     review_service.run_mlx('{"repository":"demo"}')
@@ -128,7 +183,7 @@ class RunMlxTests(unittest.TestCase):
                 active_calls -= 1
             return {"summary": payload["id"]}
 
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, _mlx_env(), clear=False):
             os.environ.pop("MLX_REVIEW_CMD", None)
             with mock.patch("review_runner.mlx_review_client.review_payload", side_effect=fake_review_payload):
                 results: list[dict[str, str]] = []
@@ -327,12 +382,13 @@ class ReviewNormalizationTests(unittest.TestCase):
                         {
                             "path": "fortune/service.py",
                             "line": 12,
-                            "body": "캐시 생성 경로가 바뀌었으니 정상 흐름과 만료 흐름을 함께 검증하는 테스트를 추가해두는 편이 안전합니다.",
+                            "confidence": 0.91,
+                            "body": "Evidence: cache_entry = build_cache_entry(). Problem: 캐시 생성 경로 변경에 대한 검증이 필요합니다. Impact: 만료 흐름 회귀를 놓칠 수 있습니다. Fix: 정상 흐름과 만료 흐름 테스트를 추가하세요.",
                         },
                         {
                             "path": "missing.py",
                             "line": 12,
-                            "body": "이 파일은 PR에 없습니다.",
+                            "body": "Evidence: missing.py. Problem: PR에 없는 파일입니다. Impact: GitHub 라인 코멘트 등록이 실패합니다. Fix: 실제 diff 파일만 사용하세요.",
                         },
                         {
                             "path": "fortune/service.py",
@@ -390,6 +446,18 @@ class NormalizeSeverityTests(unittest.TestCase):
                 self.assertEqual(review_service.normalize_severity(raw), review_service.SEVERITY_MINOR)
 
 
+class NormalizeConfidenceTests(unittest.TestCase):
+    def test_accepts_numeric_confidence_values(self) -> None:
+        self.assertEqual(review_service.normalize_confidence(0.8), 0.8)
+        self.assertEqual(review_service.normalize_confidence("0.93"), 0.93)
+        self.assertEqual(review_service.normalize_confidence(1), 1.0)
+
+    def test_rejects_missing_bool_and_out_of_range_values(self) -> None:
+        for raw in (None, True, False, "high", -0.1, 1.1):
+            with self.subTest(raw=raw):
+                self.assertIsNone(review_service.normalize_confidence(raw))
+
+
 class SeverityRoutingAndRenderingTests(unittest.TestCase):
     def _make_pr_file(self) -> "review_service.PullRequestFile":
         return review_service.PullRequestFile(
@@ -416,7 +484,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                                 "path": "fortune/service.py",
                                 "line": 1,
                                 "severity": severity,
-                                "body": "이 라인의 위험 요소를 반드시 처리해야 합니다.",
+                                "confidence": 0.9,
+                                "body": "Evidence: x = 1. Problem: 위험한 상태 전이가 검증 없이 남습니다. Impact: 현재 코드에서 잘못된 리뷰 이벤트가 발생합니다. Fix: 해당 상태 전이를 검증하거나 코멘트를 제거하세요.",
                             }
                         ],
                     },
@@ -444,7 +513,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "Minor",
-                        "body": "네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+                        "confidence": 0.9,
+                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
                     }
                 ],
             },
@@ -456,6 +526,107 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         # 중복으로 판정해 제거하므로, suggestions 가 비어 있어도 정상 — 라인 코멘트는 보존됨.
         self.assertEqual(len(validated.comments), 1)
         self.assertEqual(validated.comments[0].severity, "Minor")
+
+    def test_model_comment_missing_confidence_is_dropped(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "검토.",
+                "event": "REQUEST_CHANGES",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "body": "Evidence: x = 1. Problem: 근거가 부족합니다. Impact: 잘못된 리뷰가 남습니다. Fix: 제거하세요.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.comments, [])
+        self.assertEqual(validated.event, "APPROVE")
+
+    def test_model_comment_below_confidence_threshold_is_dropped(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "검토.",
+                "event": "REQUEST_CHANGES",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.79,
+                        "body": "Evidence: x = 1. Problem: 확신이 낮습니다. Impact: false positive 입니다. Fix: 제거하세요.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
+        )
+        self.assertEqual(validated.comments, [])
+        self.assertEqual(validated.event, "APPROVE")
+
+    def test_model_comment_without_required_sections_is_dropped(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": "이 줄은 문제가 있으니 수정해야 합니다.",
+                    }
+                ]
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(
+            stats.dropped_model_comment_reasons,
+            {"missing_required_finding_sections": 1},
+        )
+
+    def test_non_object_model_comment_is_dropped_without_crashing(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {"comments": ["이 값은 dict가 아닙니다."]},
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(stats.dropped_model_comment_reasons, {"non_object_comment": 1})
+
+    def test_model_comment_rejects_bool_zero_and_float_lines(self) -> None:
+        valid_body = (
+            "Evidence: x = 1. Problem: 잘못된 라인 타입입니다. "
+            "Impact: GitHub 라인 코멘트가 엉뚱한 줄에 붙을 수 있습니다. Fix: 정수 라인만 허용하세요."
+        )
+        for raw_line in (True, False, 0, 1.5):
+            with self.subTest(raw_line=raw_line):
+                comments, stats = review_service.collect_validated_comments(
+                    {
+                        "comments": [
+                            {
+                                "path": "fortune/service.py",
+                                "line": raw_line,
+                                "severity": "Major",
+                                "confidence": 0.95,
+                                "body": valid_body,
+                            }
+                        ]
+                    },
+                    [self._make_pr_file()],
+                )
+
+                self.assertEqual(comments, [])
+                self.assertEqual(stats.dropped_model_comment_reasons, {"invalid_line_type": 1})
 
     def test_rule_based_secret_logging_comment_gets_critical_severity(self) -> None:
         # 비밀값 로그 감지는 직접 Critical 을 붙이므로 모델이 아무것도 안 보내도
@@ -509,8 +680,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(
             rendered_bodies,
             [
-                "[Critical] 서명 검증이 제거돼 인증 우회 위험이 있습니다.",
-                "[Minor] 네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
+                "[Critical] 서명 검증이 제거돼 인증 우회 위험이 있습니다.\n\nConfidence: 1.00",
+                "[Minor] 네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.\n\nConfidence: 1.00",
             ],
         )
 
@@ -530,7 +701,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "Critical",
-                        "body": "서명 검증이 비활성화돼 인증 우회 위험이 있습니다.",
+                        "confidence": 0.95,
+                        "body": "Evidence: 서명 검증 분기가 제거되었습니다. Problem: 인증 우회 경로가 생깁니다. Impact: 서명 없는 요청이 처리될 수 있습니다. Fix: 서명 검증을 복구하세요.",
                     }
                 ],
             }
@@ -582,14 +754,13 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(validated.suggestions, [])
         self.assertEqual(validated.comments, [])
 
-    def test_suggestions_only_stays_at_comment_not_approve(self) -> None:
-        # suggestions 가 있으면 검토는 끝났지만 완전 승인은 아니므로 COMMENT 로 남긴다.
-        # APPROVE 로 튀지 않는지가 핵심 — '권장 개선이 있는 PR' 도 APPROVE 로 찍히면
-        # 리뷰어 신호가 왜곡된다.
+    def test_top_level_suggestions_without_line_confidence_are_ignored(self) -> None:
+        # 모델이 path/line/confidence 없는 전역 suggestions 만 보내면 finding 으로
+        # 게시하지 않는다. false positive 방지 쪽이 optional suggestion 누락보다 중요하다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "구조를 정리했습니다.",
-                "event": "APPROVE",  # 모델이 과하게 emit 해도 런타임이 다운그레이드
+                "event": "REQUEST_CHANGES",
                 "positives": [],
                 "must_fix": [],
                 "suggestions": ["네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다."],
@@ -597,8 +768,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             },
             [self._make_pr_file()],
         )
-        self.assertEqual(validated.event, "COMMENT")
-        self.assertTrue(validated.suggestions)
+        self.assertEqual(validated.event, "APPROVE")
+        self.assertEqual(validated.suggestions, [])
 
     def test_minor_line_comment_alone_stays_at_comment_not_approve(self) -> None:
         # Minor 라인 코멘트가 하나라도 있으면 APPROVE 가 아니라 COMMENT. 라인 코멘트가
@@ -615,7 +786,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "Minor",
-                        "body": "네이밍을 통일하면 일관성이 좋아집니다.",
+                        "confidence": 0.9,
+                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
                     }
                 ],
             },
@@ -624,12 +796,13 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(validated.event, "COMMENT")
         self.assertEqual(len(validated.comments), 1)
 
-    def test_must_fix_beats_model_approve_emission(self) -> None:
-        # 모델이 APPROVE 를 보내도 must_fix 가 있으면 REQUEST_CHANGES 로 강제된다.
+    def test_top_level_must_fix_without_line_confidence_is_ignored(self) -> None:
+        # 모델이 APPROVE 를 보내든 REQUEST_CHANGES 를 보내든, 검증된 라인 코멘트 없는
+        # raw must_fix 는 merge-blocking 신호로 쓰지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "보안 체크를 확인해야 합니다.",
-                "event": "APPROVE",  # 모델이 잘못 보낸 경우
+                "event": "REQUEST_CHANGES",
                 "positives": [],
                 "must_fix": ["signature 검증이 제거되어 인증 우회 위험이 있습니다."],
                 "suggestions": [],
@@ -637,7 +810,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             },
             [self._make_pr_file()],
         )
-        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.event, "APPROVE")
 
     def test_unknown_severity_value_from_model_falls_back_to_minor(self) -> None:
         # 모델이 매핑에 없는 비표준 등급(p0, urgent 등) 을 보내도 Minor 로 안전 폴백.
@@ -655,7 +829,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "p0",
-                        "body": "이 라인은 살짝 아쉽습니다.",
+                        "confidence": 0.9,
+                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
                     }
                 ],
             },
@@ -860,7 +1035,8 @@ class DescriptionPatternEndToEndTests(unittest.TestCase):
                         "path": "api/handler.py",
                         "line": 10,
                         "severity": "Major",
-                        "body": "None 반환 시 AttributeError 가 발생해 요청이 500 으로 끝납니다.",
+                        "confidence": 0.9,
+                        "body": "Evidence: return data.value. Problem: None 반환 시 AttributeError 가 발생합니다. Impact: 요청이 500 으로 끝납니다. Fix: None 분기를 먼저 처리하세요.",
                     }
                 ],
             },
@@ -923,9 +1099,9 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
             right_side_lines={1},
         )
 
-    def test_legacy_concerns_with_risk_marker_are_routed_to_must_fix(self) -> None:
-        # 구 스키마로 응답한 모델 출력이 legacy_concerns 로 실려와도, 위험 신호가 있으면
-        # must_fix 로 흡수돼 event 가 REQUEST_CHANGES 로 강제되어야 한다.
+    def test_legacy_concerns_with_risk_marker_are_ignored_without_line_comment(self) -> None:
+        # 구 스키마 concerns 는 path/line/confidence 를 담을 수 없으므로 차단성 문구가
+        # 있어도 게시하지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "캐시 로직을 조정했습니다.",
@@ -937,16 +1113,12 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
             [self._make_pr_file()],
         )
 
-        self.assertIn(
-            "signature 검증을 건너뛰어 인증 우회 위험이 있습니다.", validated.must_fix
-        )
+        self.assertEqual(validated.must_fix, [])
         self.assertEqual(validated.suggestions, [])
-        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertEqual(validated.event, "APPROVE")
 
-    def test_direct_must_fix_and_suggestions_fields_pass_through_without_legacy_path(self) -> None:
-        # 모델이 새 스키마를 이미 따르는 경우 legacy_concerns 경로를 타지 않고 그대로
-        # 두 필드에 실려야 한다. split_legacy_concerns 의 risk marker 분배가 덮어쓰지
-        # 않는지도 함께 확인한다 (suggestions 에 위험 마커가 있어도 강제 승격 없음).
+    def test_direct_must_fix_and_suggestions_fields_are_ignored_without_line_comment(self) -> None:
+        # 새 스키마의 top-level buckets 도 line-scoped evidence 가 없으면 게시하지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "로직을 정리했습니다.",
@@ -961,20 +1133,12 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
             [self._make_pr_file()],
         )
 
-        self.assertIn(
-            "signature 검증이 비활성화돼 인증 우회 위험이 있습니다.",
-            validated.must_fix,
-        )
-        self.assertIn(
-            "네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
-            validated.suggestions,
-        )
-        # must_fix 가 실제로 있으므로 event 는 REQUEST_CHANGES 로 강제된다.
-        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.suggestions, [])
+        self.assertEqual(validated.event, "APPROVE")
 
-    def test_legacy_concerns_without_risk_marker_are_routed_to_suggestions(self) -> None:
-        # 위험 신호 없는 legacy concern 은 suggestions 로 가고, must_fix 가 비어 있으므로
-        # event 는 COMMENT 로 다운그레이드되어야 한다.
+    def test_legacy_concerns_without_risk_marker_are_ignored(self) -> None:
+        # 낮은 위험의 legacy concern 도 라인 근거가 없으면 COMMENT 로 남기지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "네이밍을 정리했습니다.",
@@ -987,12 +1151,34 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(validated.must_fix, [])
-        self.assertIn(
-            "네이밍 스타일을 payload_meta 로 통일하면 일관성이 좋아집니다.",
-            validated.suggestions,
+        self.assertEqual(validated.suggestions, [])
+        self.assertEqual(validated.event, "APPROVE")
+
+    def test_line_comment_still_drives_request_changes_when_top_level_is_ignored(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": ["이 문장은 무시됩니다."],
+                "suggestions": ["이 문장도 무시됩니다."],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.93,
+                        "body": "Evidence: x = 1. Problem: 잘못된 상태입니다. Impact: 요청이 실패합니다. Fix: 검증을 추가하세요.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
         )
-        # must_fix 가 비어 있으므로 모델이 요청한 REQUEST_CHANGES 는 COMMENT 로 다운그레이드.
-        self.assertEqual(validated.event, "COMMENT")
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.suggestions, [])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
 
 
 class DescriptiveChangeNarrationTests(unittest.TestCase):
