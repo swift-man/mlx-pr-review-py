@@ -85,7 +85,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
 
         # 새 스키마 키 계약
         self.assertIn("summary, event, positives, must_fix, suggestions, comments", system_prompt)
-        self.assertIn("positives, must_fix, suggestions must be JSON arrays of strings", system_prompt)
+        self.assertIn("must_fix and suggestions must be empty arrays", system_prompt)
         self.assertIn("{path, line, severity, confidence, body}", system_prompt)
 
         # 핵심 원칙
@@ -95,13 +95,13 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("'~가 추가되었습니다'", system_prompt)
         self.assertIn("Prefer empty arrays over padding", system_prompt)
 
-        # 필드 정의가 세 바구니 모두 명시돼 있는지
-        self.assertIn("must_fix: items that must be addressed before merge", system_prompt)
-        self.assertIn("suggestions: nice-to-have improvements", system_prompt)
+        # 필드 정의가 line-scoped finding 계약을 명시하는지
+        self.assertIn("must_fix: always return []", system_prompt)
+        self.assertIn("suggestions: always return []", system_prompt)
         self.assertIn("positives: things THIS PR actually improves", system_prompt)
 
         # event 규칙이 runtime 강제 안내를 포함
-        self.assertIn("runtime rewrites event based on must_fix", system_prompt)
+        self.assertIn("runtime rewrites event based on accepted line comments", system_prompt)
 
         # 보안/계약 체크리스트 보존
         self.assertIn("disable validation", system_prompt)
@@ -109,8 +109,6 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("log a token/secret", system_prompt)
 
         # 스키마 예시와 빈 결과 예시가 새 키로 갱신됐는지
-        self.assertIn('"must_fix":["한국어 반드시 수정할 사항"]', system_prompt)
-        self.assertIn('"suggestions":["한국어 권장 개선사항"]', system_prompt)
         self.assertIn('"must_fix":[],"suggestions":[]', system_prompt)
 
         # 라인 코멘트 severity 4단계 정의가 프롬프트에 노출되는지
@@ -123,15 +121,15 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn('"confidence":0.92', system_prompt)
         # event 강제 규칙이 세 분기(REQUEST_CHANGES / APPROVE / COMMENT) 를 모두 노출하는지.
         self.assertIn(
-            "REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment",
+            "REQUEST_CHANGES is triggered by any accepted Critical/Major line comment",
             system_prompt,
         )
         self.assertIn(
-            "APPROVE is used ONLY when must_fix, suggestions, and comments are all empty",
+            "APPROVE is used ONLY when comments is empty",
             system_prompt,
         )
         self.assertIn(
-            "Minor/Suggestion line comments or any suggestions keep event at COMMENT",
+            "Minor/Suggestion line comments keep event at COMMENT",
             system_prompt,
         )
         # event enum 자체에 APPROVE 가 포함돼 있는지
@@ -161,20 +159,20 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
             "verify that the same string or logic is not already present in the diff or base file",
             system_prompt,
         )
-        # Confidence gradient 가 두 단계로 나뉘고, must_fix → suggestions 버킷 이동과
-        # comments[] severity 양쪽을 모두 포함하는지 고정한다.
+        # Confidence gradient 가 두 단계로 나뉘고, comments[] severity 양쪽을 모두
+        # 포함하는지 고정한다.
         self.assertIn("Confidence gradient:", system_prompt)
         self.assertIn(
-            "if a finding's validity itself is uncertain, drop it or demote to the lowest tier",
+            "if a finding's validity itself is uncertain, drop it or demote to 'Suggestion'",
             system_prompt,
         )
-        self.assertIn("move from must_fix to suggestions", system_prompt)
+        self.assertNotIn("move from must_fix to suggestions", system_prompt)
         self.assertIn(
             "if the finding is valid but its severity is ambiguous, default to 'Minor'",
             system_prompt,
         )
         self.assertIn(
-            "any must_fix entry require concrete code evidence",
+            "Critical and Major require concrete code evidence",
             system_prompt,
         )
         # 기존 severity 섹션의 "When in doubt use Minor" 는 gradient 로 흡수돼 빠졌는지 확인.

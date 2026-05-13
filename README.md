@@ -84,7 +84,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_REVIEW_BACKEND=local` 또는 `remote` (옵션, 기본값은 `local`)
 - `MLX_GENERATE_URL=http://127.0.0.1:8002/v1/generate` (remote backend용)
 - `MLX_GENERATE_AUTH_TOKEN=...` (옵션, remote generate 서버가 Bearer 인증을 쓸 때)
-- `MLX_GENERATE_TIMEOUT=600` (옵션, remote generate 응답 timeout 초)
+- `MLX_GENERATE_TIMEOUT=600` (옵션, remote generate 응답 timeout 초. 초과 시 같은 장기 생성 요청을 재시도하지 않고 명확한 timeout 오류를 남김)
 - `MLX_MODEL=mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` (운영 예시값. local 클라이언트 코드 기본값은 7B)
 - `MLX_DEVICE=cpu` (옵션, Metal 장애 시 fallback. 비워두면 MLX 기본 장치 사용)
 - `GITHUB_API_URL=https://api.github.com` (옵션)
@@ -364,17 +364,24 @@ zsh /Users/runner/pr-review/scripts/send_test_webhook.sh
 {
   "summary": "The diff introduces one likely regression.",
   "event": "REQUEST_CHANGES",
+  "positives": [],
+  "must_fix": [],
+  "suggestions": [],
   "comments": [
     {
       "path": "src/app.py",
       "line": 42,
-      "body": "This branch now skips the None check and can raise an exception."
+      "severity": "Major",
+      "confidence": 0.92,
+      "body": "Evidence: ... Problem: ... Impact: ... Fix: ..."
     }
   ]
 }
 ```
 
-`line`은 반드시 해당 patch의 RIGHT-side 유효 라인이어야 합니다.
+`line`은 반드시 해당 patch의 RIGHT-side 유효 라인이어야 합니다. 모델이 만든 finding은 `comments[]`에만 넣고,
+`must_fix`와 `suggestions`는 빈 배열로 둡니다. 서비스는 path/line/confidence가 없는 top-level finding을
+false positive 방지를 위해 게시하지 않습니다.
 [`review_runner/sample_mlx_client.py`](/Users/m4_25/develop/codereview/review_runner/sample_mlx_client.py)는
 기존 경로 호환을 위한 래퍼만 남겨뒀습니다.
 

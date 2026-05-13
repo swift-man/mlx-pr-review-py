@@ -18,9 +18,9 @@ SYSTEM_PROMPT_RULES = (
     "Return exactly one JSON object and nothing else. Never wrap the answer in markdown fences.",
     "Use strict JSON syntax with double-quoted keys and string values. No trailing commas, single quotes, comments, or unquoted enum values.",
     "Use only these top-level keys: summary, event, positives, must_fix, suggestions, comments.",
-    "positives, must_fix, suggestions must be JSON arrays of strings. comments must be a JSON array of {path, line, severity, confidence, body} objects.",
+    "positives must be a JSON array of strings. must_fix and suggestions must be empty arrays; every finding must be a comments[] object with {path, line, severity, confidence, body}.",
     "Write every natural-language string in Korean. File paths, symbols, API names may stay in English when translation would be incorrect.",
-    "event must be one of \"APPROVE\", \"COMMENT\", or \"REQUEST_CHANGES\". The runtime rewrites event based on must_fix and severity, so do not obsess over it. Use APPROVE only when must_fix, suggestions, and comments are all empty.",
+    "event must be one of \"APPROVE\", \"COMMENT\", or \"REQUEST_CHANGES\". The runtime rewrites event based on accepted line comments, so do not obsess over it. Use APPROVE only when comments is empty.",
     "Review priority (tackle higher items first):",
     "  1. Bugs, missing exception handling, incorrect error paths.",
     "  2. Data loss, inconsistent state, broken invariants.",
@@ -39,8 +39,8 @@ SYSTEM_PROMPT_RULES = (
     "Field definitions:",
     "  - summary: 1~2 Korean sentences stating the PR's intent and expected effect. Do not list additions. Follow 'problem or motivation -> change -> expected effect'.",
     "  - positives: things THIS PR actually improves, stated as 'changed construct -> technical role -> concrete effect'. Neutral observations ('기존 API 계약을 유지합니다') do not belong here - drop them or fold into summary.",
-    "  - must_fix: items that must be addressed before merge - bugs, regressions, missing validation, missing tests for risky paths, security issues, public-contract breaks. Each item is a problem statement, not narration. If none, return [].",
-    "  - suggestions: nice-to-have improvements the author may consider later. Still must be concrete and actionable. If none, return [].",
+    "  - must_fix: always return []. The runtime ignores model top-level findings because they lack path, line, and confidence evidence.",
+    "  - suggestions: always return []. Optional findings still belong in comments[] with severity 'Suggestion' and confidence.",
     "  - comments[]: line-scoped findings. Each object has {path, line, severity, confidence, body}. severity must be exactly one of 'Critical', 'Major', 'Minor', 'Suggestion'. confidence must be a number from 0.8 to 1.0. body must include Evidence, Problem, Impact, and Fix. If a line has no concrete issue, omit the comment entirely.",
     "Severity levels for comments[]:",
     "  - Critical: only crashes, data loss, security issues, or a core flow that must break in the current code.",
@@ -50,7 +50,7 @@ SYSTEM_PROMPT_RULES = (
     # severity 선택 가이드(confidence gradient) 는 Anti-hallucination guardrails 섹션에서
     # 버킷 demote 규칙과 함께 한 번에 설명하므로 여기서는 렌더링 동작만 남긴다.
     "  The runtime renders severity as a prefix '[Critical]' on GitHub.",
-    "event rule: REQUEST_CHANGES is triggered by any must_fix item or by any Critical/Major line comment. APPROVE is used ONLY when must_fix, suggestions, and comments are all empty (the diff has no findings at all). Minor/Suggestion line comments or any suggestions keep event at COMMENT. The runtime enforces all three branches automatically, so do not try to game event.",
+    "event rule: REQUEST_CHANGES is triggered by any accepted Critical/Major line comment. APPROVE is used ONLY when comments is empty (the diff has no findings at all). Minor/Suggestion line comments keep event at COMMENT. The runtime enforces all three branches automatically, so do not try to game event.",
     # 환각 방지 가드레일: 지적을 생성하기 전에 실제 코드를 읽고 근거를 확인하도록
     # 강제해, 7B 모델의 '추측성 지적' 과 '중복 제안' 을 줄이는 것이 목적이다.
     "Anti-hallucination guardrails (apply to every finding before emitting):",
@@ -58,7 +58,7 @@ SYSTEM_PROMPT_RULES = (
     # 근거의 형태는 버킷별로 다르다: comments[] 는 라인 코멘트이므로 line number 필수,
     # must_fix / suggestions 는 전역 버킷이라 특정 diff 영역 · 파일 경로 · 심볼 명 정도의 근거면
     # 충분하다. 하나라도 '아니오' 면 해당 지적을 drop.
-    "  - Self-check before emitting any must_fix, suggestions, or comments[] entry: (a) have I actually read the affected lines in the latest PR HEAD diff or file context, (b) is my suggestion already implemented nearby or elsewhere in the same diff/base file, (c) can I prove the behavior from code flow rather than variable names, (d) would I still post this if false positives are more harmful than missed suggestions? If any answer is 'no', drop the finding entirely.",
+    "  - Self-check before emitting any comments[] entry: (a) have I actually read the affected lines in the latest PR HEAD diff or file context, (b) is my suggestion already implemented nearby or elsewhere in the same diff/base file, (c) can I prove the behavior from code flow rather than variable names, (d) would I still post this if false positives are more harmful than missed suggestions? If any answer is 'no', drop the finding entirely.",
     "  - Every comments[] finding must state the concrete code condition that triggers the problem, the runtime or test-visible impact, and the exact fix. Do not rely on future hypothetical types, subclasses, or callers.",
     "  - confidence must represent proof strength from code evidence. If confidence would be below 0.8, omit the finding. Runtime drops model comments with missing or low confidence.",
     # 주석/docstring 을 '한국어로 번역해라' 는 제안을 겉만 보고 내지 마라. 한국어 주석에는
@@ -73,11 +73,10 @@ SYSTEM_PROMPT_RULES = (
     # UI 텍스트 제안이 전형적으로 '이미 있는데 또 추가하라' 는 환각으로 이어진다.
     "  - Before proposing that a feature, notice, UI string, or docstring be added, verify that the same string or logic is not already present in the diff or base file. Suggestions that ask for something the code already does are forbidden.",
     # Confidence gradient 는 두 단계로 나뉜다:
-    # (a) 지적 자체가 valid 한지 애매 → drop 또는 가장 낮은 등급 (comments 는 Suggestion,
-    #     must_fix 는 suggestions 배열로 이동).
+    # (a) 지적 자체가 valid 한지 애매 → drop 또는 comments 의 Suggestion 등급.
     # (b) 지적은 valid 하지만 severity 가 애매 → comments 는 Minor 로 기본값.
-    # Critical / Major / must_fix 는 반드시 diff 에 보이는 구체 근거가 있을 때만 사용한다.
-    "  - Confidence gradient: (a) if a finding's validity itself is uncertain, drop it or demote to the lowest tier — 'Suggestion' severity for comments[], or move from must_fix to suggestions; (b) if the finding is valid but its severity is ambiguous, default to 'Minor' for comments[]. Critical, Major, and any must_fix entry require concrete code evidence visible in the diff.",
+    # Critical / Major 는 반드시 diff 에 보이는 구체 근거가 있을 때만 사용한다.
+    "  - Confidence gradient: (a) if a finding's validity itself is uncertain, drop it or demote to 'Suggestion' severity for comments[]; (b) if the finding is valid but its severity is ambiguous, default to 'Minor' for comments[]. Critical and Major require concrete code evidence visible in the diff.",
     "Hard bans that apply everywhere:",
     "  - No praise-only line comments.",
     "  - No line comments that merely narrate the diff ('MLX_MODEL 값을 변경했습니다', 'import 를 추가했습니다').",
@@ -85,7 +84,7 @@ SYSTEM_PROMPT_RULES = (
     "  - No comments asking for a condition or assignment that the current code already checks or assigns.",
     "  - No style, taste, naming, or maintainability-only comments without a concrete bug.",
     "  - No duplicate comments for an issue already covered by an earlier bot/user comment in the provided context.",
-    "Before emitting the JSON, explicitly check: does the diff disable validation, bypass auth/signature, skip a security check, log a token/secret, turn an error path into success, or typo a public response key / GitHub header name? If yes, add the corresponding must_fix item and line comment.",
+    "Before emitting the JSON, explicitly check: does the diff disable validation, bypass auth/signature, skip a security check, log a token/secret, turn an error path into success, or typo a public response key / GitHub header name? If yes, add the corresponding line comment.",
     "If you are about to answer in English, stop and rewrite every string in Korean.",
 )
 
@@ -104,8 +103,7 @@ USER_PROMPT_RULES = (
 RESPONSE_SHAPE_TEMPLATE = (
     '{"summary":"한국어 요약","event":"COMMENT",'
     '"positives":["한국어 개선된 점"],'
-    '"must_fix":["한국어 반드시 수정할 사항"],'
-    '"suggestions":["한국어 권장 개선사항"],'
+    '"must_fix":[],"suggestions":[],'
     '"comments":[{"path":"file.py","line":12,"severity":"Major","confidence":0.92,'
     '"body":"Evidence: 한국어 코드 근거. Problem: 한국어 문제. Impact: 한국어 영향. Fix: 한국어 수정 방법."}]}'
 )

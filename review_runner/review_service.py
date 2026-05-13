@@ -1068,45 +1068,47 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
         "instructions": {
             "task": "이 PR diff를 리뷰하고, 실제로 수정이 필요한 문제를 구체적으로 알려주세요.",
             "language_rules": [
-                "summary, positives, concerns, comments의 모든 문장은 반드시 한국어로 작성하세요.",
+                "summary, positives, must_fix, suggestions, comments의 모든 문장은 반드시 한국어로 작성하세요.",
                 "톤은 전문적이고 간결하게 유지하세요.",
                 "칭찬은 positives에만 작성하고, 라인 코멘트에는 작성하지 마세요.",
             ],
             "json_rules": [
-                "최상위 키는 summary, event, positives, concerns, comments만 사용하세요.",
-                "positives와 concerns는 반드시 JSON 배열로 반환하세요.",
-                "summary 문자열 안에 positive1:, concerns1:, comments: 같은 라벨을 섞어 쓰지 마세요.",
-                "event 값은 COMMENT 또는 REQUEST_CHANGES 중 하나만 사용하세요.",
+                "최상위 키는 summary, event, positives, must_fix, suggestions, comments만 사용하세요.",
+                "positives, must_fix, suggestions는 반드시 JSON 배열로 반환하세요.",
+                "must_fix와 suggestions에는 finding을 넣지 말고 []를 반환하세요. 모든 finding은 comments에만 작성하세요.",
+                "summary 문자열 안에 positive1:, must_fix:, suggestions:, comments: 같은 라벨을 섞어 쓰지 마세요.",
+                "event 값은 APPROVE, COMMENT, REQUEST_CHANGES 중 하나만 사용하세요.",
             ],
             "line_comment_rules": [
                 "라인 코멘트는 실제 diff에서 보이는 문제만 지적하세요.",
                 "반드시 각 파일의 valid_comment_lines 안에 있는 RIGHT-side line 번호만 사용하세요.",
-                "정확성, 보안, 안정성, 신뢰성, 성능, 중요한 유지보수성 문제를 우선하세요.",
+                "정확성, 보안, 안정성, 성능, 변경된 동작에 대한 누락 테스트를 우선하세요.",
                 "스타일-only 코멘트나 칭찬-only 코멘트는 금지합니다.",
-                "각 코멘트에는 왜 문제인지와 어떻게 고치면 좋은지를 한국어로 짧고 분명하게 적으세요.",
+                "각 코멘트에는 severity, confidence, Evidence, Problem, Impact, Fix를 포함하세요.",
+                "confidence가 0.8 미만이면 코멘트를 작성하지 마세요.",
             ],
             "summary_rules": [
                 "summary는 전체 변경을 한두 문장으로 요약하세요.",
                 "positives에는 좋은 점을 1~3개 정도 작성하세요.",
-                "concerns에는 개선이 필요한 점을 0~3개 정도 작성하세요.",
                 "문제가 없더라도 positives는 반드시 1개 이상 작성하세요.",
-                "라인 코멘트와 summary/concerns 내용은 diff에 근거해야 합니다.",
+                "라인 코멘트와 summary 내용은 diff에 근거해야 합니다.",
                 "파일별 추가/삭제/변경 개수나 line 번호를 summary에 나열하지 마세요.",
             ],
             "response_schema": {
                 "summary": "짧은 전체 리뷰 요약 (한국어)",
-                "event": "COMMENT 또는 REQUEST_CHANGES",
+                "event": "APPROVE, COMMENT 또는 REQUEST_CHANGES",
                 "positives": [
                     "좋은 점 한 항목 (한국어 문자열)",
                 ],
-                "concerns": [
-                    "개선이 필요한 점 한 항목 (한국어 문자열)",
-                ],
+                "must_fix": [],
+                "suggestions": [],
                 "comments": [
                     {
                         "path": "relative/file.py",
                         "line": 12,
-                        "body": "왜 문제인지와 어떻게 수정하면 좋은지 설명하는 한국어 코멘트",
+                        "severity": "Major",
+                        "confidence": 0.92,
+                        "body": "Evidence: 코드 근거. Problem: 문제. Impact: 영향. Fix: 수정 방법.",
                     }
                 ],
             },
@@ -1523,18 +1525,23 @@ def validate_mlx_output(
 
     summary = normalize_text(result.get("summary")) or "자동 리뷰를 완료했습니다."
     positives = sanitize_positive_items(normalize_text_list(result.get("positives"), max_items=10))
-    must_fix = sanitize_text_items(normalize_text_list(result.get("must_fix"), max_items=10))
-    suggestions = sanitize_text_items(normalize_text_list(result.get("suggestions"), max_items=10))
-
-    # 파서가 '레거시 concerns' 로 흘려보낸 구 스키마 항목을 risk marker 기준으로
-    # 두 버킷에 분배한다. 새 스키마 필드가 이미 차 있으면 추가만 한다.
-    legacy_concerns = sanitize_text_items(
+    raw_must_fix = sanitize_text_items(normalize_text_list(result.get("must_fix"), max_items=10))
+    raw_suggestions = sanitize_text_items(normalize_text_list(result.get("suggestions"), max_items=10))
+    raw_legacy_concerns = sanitize_text_items(
         normalize_text_list(result.get("legacy_concerns") or result.get("concerns"), max_items=10)
     )
-    if legacy_concerns:
-        extra_must_fix, extra_suggestions = split_legacy_concerns(legacy_concerns)
-        must_fix = merge_distinct_items(must_fix, extra_must_fix, max_items=10)
-        suggestions = merge_distinct_items(suggestions, extra_suggestions, max_items=10)
+    if log_prefix and (raw_must_fix or raw_suggestions or raw_legacy_concerns):
+        log_progress(
+            log_prefix,
+            "Ignoring model top-level finding buckets without line confidence "
+            f"must_fix={len(raw_must_fix)} suggestions={len(raw_suggestions)} "
+            f"legacy_concerns={len(raw_legacy_concerns)}",
+        )
+
+    # 모델의 top-level finding 은 path/line/confidence 계약을 증명할 수 없으므로 게시하지 않는다.
+    # GitHub 본문 요약은 아래에서 검증 통과한 라인 코멘트만 바탕으로 다시 만든다.
+    must_fix: list[str] = []
+    suggestions: list[str] = []
 
     # 라인 코멘트 요약을 등급별로 다른 버킷에 태운다. Critical/Major 요약은 상단
     # must_fix 에, Minor/Suggestion 요약은 suggestions 에 남겨 훑을 때 우선순위가

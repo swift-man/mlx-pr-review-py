@@ -263,45 +263,39 @@ class PostGenerateTests(unittest.TestCase):
         self.assertNotIn("token=abc", msg)
         self.assertEqual(urlopen.call_count, 2)
 
-    def test_read_timeout_retries_once(self) -> None:
-        first_response = mock.MagicMock()
-        first_response.read.side_effect = TimeoutError("timed out")
-        first_response.__enter__.return_value = first_response
-        first_response.__exit__.return_value = False
-        success = _make_response({"ok": True, "text": "ok", "model": "m"})
-        urlopen = mock.MagicMock(side_effect=[first_response, success])
-
-        with self._patch_env(), \
-             mock.patch("urllib.request.urlopen", urlopen), \
-             mock.patch("time.sleep") as sleeper:
-            result = client._post_generate(self.messages)
-
-        self.assertEqual(result["text"], "ok")
-        self.assertEqual(urlopen.call_count, 2)
-        sleeper.assert_called_once_with(1.0)
-
-    def test_read_timeout_twice_raises_with_sanitized_url(self) -> None:
-        first_response = mock.MagicMock()
-        first_response.read.side_effect = TimeoutError("first")
-        first_response.__enter__.return_value = first_response
-        first_response.__exit__.return_value = False
-        second_response = mock.MagicMock()
-        second_response.read.side_effect = TimeoutError("second")
-        second_response.__enter__.return_value = second_response
-        second_response.__exit__.return_value = False
-        urlopen = mock.MagicMock(side_effect=[first_response, second_response])
+    def test_read_timeout_raises_without_retry_with_sanitized_url(self) -> None:
+        response = mock.MagicMock()
+        response.read.side_effect = TimeoutError("timed out")
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        urlopen = mock.MagicMock(return_value=response)
 
         with self._patch_env(MLX_GENERATE_URL="http://user:pw@gpu/v1/generate?token=abc"), \
              mock.patch("urllib.request.urlopen", urlopen), \
-             mock.patch("time.sleep"):
+             mock.patch("time.sleep") as sleeper:
             with self.assertRaises(RuntimeError) as ctx:
                 client._post_generate(self.messages)
 
         msg = str(ctx.exception)
-        self.assertIn("after retry", msg)
+        self.assertIn("timed out after", msg)
+        self.assertIn("http://gpu/v1/generate", msg)
         self.assertNotIn("user:pw", msg)
         self.assertNotIn("token=abc", msg)
-        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(urlopen.call_count, 1)
+        sleeper.assert_not_called()
+
+    def test_url_error_wrapping_timeout_raises_without_retry(self) -> None:
+        urlopen = mock.MagicMock(side_effect=urllib.error.URLError(TimeoutError("timed out")))
+
+        with self._patch_env(MLX_GENERATE_TIMEOUT="9"), \
+             mock.patch("urllib.request.urlopen", urlopen), \
+             mock.patch("time.sleep") as sleeper:
+            with self.assertRaises(RuntimeError) as ctx:
+                client._post_generate(self.messages)
+
+        self.assertIn("timed out after 9.0s", str(ctx.exception))
+        self.assertEqual(urlopen.call_count, 1)
+        sleeper.assert_not_called()
 
     def test_non_json_body_rejected(self) -> None:
         response = mock.MagicMock()

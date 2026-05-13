@@ -1,7 +1,7 @@
 """Smoke tests for the deterministic mock review client.
 
 mock_review_client 는 실제 MLX 추론 없이 GitHub Review API 연동만 검증할 때 사용된다.
-Phase 2 스키마 (must_fix / suggestions / comments[].severity) 를 따르는지 고정해,
+Phase 2 스키마 (must_fix / suggestions / comments[].severity/confidence) 를 따르는지 고정해,
 구 스키마 호환 경로(legacy_concerns) 에 조용히 의존하지 않도록 방어선을 둔다.
 """
 
@@ -47,12 +47,15 @@ class MockReviewClientSchemaTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, response, msg=f"missing top-level key: {key}")
 
-    def test_line_comment_includes_severity(self) -> None:
+    def test_line_comment_includes_severity_and_confidence(self) -> None:
         response = mock_review_client.build_response(self._sample_payload())
         self.assertEqual(len(response["comments"]), 1)
         comment = response["comments"][0]
         # severity 가 있어야 build_review_payload 에서 '[Minor]' 같은 접두사로 렌더된다.
         self.assertIn("severity", comment)
+        # confidence 가 없으면 validator 가 모델 코멘트를 drop 하므로 mock E2E 가
+        # 라인 코멘트 등록 경로를 검증하지 못한다.
+        self.assertEqual(comment["confidence"], 1.0)
         # mock 은 반복 테스트 시 PR 이 REQUEST_CHANGES 로 쌓이지 않도록 non-blocking 등급을 쓴다.
         self.assertEqual(comment["severity"], "Minor")
         self.assertEqual(comment["path"], "src/handler.py")
@@ -80,6 +83,22 @@ class MockReviewClientSchemaTests(unittest.TestCase):
             response["comments"][0]["severity"],
             review_service.SEVERITY_MINOR,
         )
+
+    def test_mock_response_survives_review_service_validation(self) -> None:
+        response = mock_review_client.build_response(self._sample_payload())
+        pr_file = review_service.PullRequestFile(
+            filename="src/handler.py",
+            status="modified",
+            patch="@@ -12,0 +12,1 @@\n+const value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={12},
+        )
+
+        validated = review_service.validate_mlx_output(response, [pr_file])
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].confidence, 1.0)
 
 
 if __name__ == "__main__":

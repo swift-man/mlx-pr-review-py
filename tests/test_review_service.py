@@ -698,14 +698,13 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(validated.suggestions, [])
         self.assertEqual(validated.comments, [])
 
-    def test_suggestions_only_stays_at_comment_not_approve(self) -> None:
-        # suggestions 가 있으면 검토는 끝났지만 완전 승인은 아니므로 COMMENT 로 남긴다.
-        # APPROVE 로 튀지 않는지가 핵심 — '권장 개선이 있는 PR' 도 APPROVE 로 찍히면
-        # 리뷰어 신호가 왜곡된다.
+    def test_top_level_suggestions_without_line_confidence_are_ignored(self) -> None:
+        # 모델이 path/line/confidence 없는 전역 suggestions 만 보내면 finding 으로
+        # 게시하지 않는다. false positive 방지 쪽이 optional suggestion 누락보다 중요하다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "구조를 정리했습니다.",
-                "event": "APPROVE",  # 모델이 과하게 emit 해도 런타임이 다운그레이드
+                "event": "REQUEST_CHANGES",
                 "positives": [],
                 "must_fix": [],
                 "suggestions": ["네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다."],
@@ -713,8 +712,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             },
             [self._make_pr_file()],
         )
-        self.assertEqual(validated.event, "COMMENT")
-        self.assertTrue(validated.suggestions)
+        self.assertEqual(validated.event, "APPROVE")
+        self.assertEqual(validated.suggestions, [])
 
     def test_minor_line_comment_alone_stays_at_comment_not_approve(self) -> None:
         # Minor 라인 코멘트가 하나라도 있으면 APPROVE 가 아니라 COMMENT. 라인 코멘트가
@@ -741,12 +740,13 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(validated.event, "COMMENT")
         self.assertEqual(len(validated.comments), 1)
 
-    def test_must_fix_beats_model_approve_emission(self) -> None:
-        # 모델이 APPROVE 를 보내도 must_fix 가 있으면 REQUEST_CHANGES 로 강제된다.
+    def test_top_level_must_fix_without_line_confidence_is_ignored(self) -> None:
+        # 모델이 APPROVE 를 보내든 REQUEST_CHANGES 를 보내든, 검증된 라인 코멘트 없는
+        # raw must_fix 는 merge-blocking 신호로 쓰지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "보안 체크를 확인해야 합니다.",
-                "event": "APPROVE",  # 모델이 잘못 보낸 경우
+                "event": "REQUEST_CHANGES",
                 "positives": [],
                 "must_fix": ["signature 검증이 제거되어 인증 우회 위험이 있습니다."],
                 "suggestions": [],
@@ -754,7 +754,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             },
             [self._make_pr_file()],
         )
-        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.event, "APPROVE")
 
     def test_unknown_severity_value_from_model_falls_back_to_minor(self) -> None:
         # 모델이 매핑에 없는 비표준 등급(p0, urgent 등) 을 보내도 Minor 로 안전 폴백.
@@ -1042,9 +1043,9 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
             right_side_lines={1},
         )
 
-    def test_legacy_concerns_with_risk_marker_are_routed_to_must_fix(self) -> None:
-        # 구 스키마로 응답한 모델 출력이 legacy_concerns 로 실려와도, 위험 신호가 있으면
-        # must_fix 로 흡수돼 event 가 REQUEST_CHANGES 로 강제되어야 한다.
+    def test_legacy_concerns_with_risk_marker_are_ignored_without_line_comment(self) -> None:
+        # 구 스키마 concerns 는 path/line/confidence 를 담을 수 없으므로 차단성 문구가
+        # 있어도 게시하지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "캐시 로직을 조정했습니다.",
@@ -1056,16 +1057,12 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
             [self._make_pr_file()],
         )
 
-        self.assertIn(
-            "signature 검증을 건너뛰어 인증 우회 위험이 있습니다.", validated.must_fix
-        )
+        self.assertEqual(validated.must_fix, [])
         self.assertEqual(validated.suggestions, [])
-        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertEqual(validated.event, "APPROVE")
 
-    def test_direct_must_fix_and_suggestions_fields_pass_through_without_legacy_path(self) -> None:
-        # 모델이 새 스키마를 이미 따르는 경우 legacy_concerns 경로를 타지 않고 그대로
-        # 두 필드에 실려야 한다. split_legacy_concerns 의 risk marker 분배가 덮어쓰지
-        # 않는지도 함께 확인한다 (suggestions 에 위험 마커가 있어도 강제 승격 없음).
+    def test_direct_must_fix_and_suggestions_fields_are_ignored_without_line_comment(self) -> None:
+        # 새 스키마의 top-level buckets 도 line-scoped evidence 가 없으면 게시하지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "로직을 정리했습니다.",
@@ -1080,20 +1077,12 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
             [self._make_pr_file()],
         )
 
-        self.assertIn(
-            "signature 검증이 비활성화돼 인증 우회 위험이 있습니다.",
-            validated.must_fix,
-        )
-        self.assertIn(
-            "네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.",
-            validated.suggestions,
-        )
-        # must_fix 가 실제로 있으므로 event 는 REQUEST_CHANGES 로 강제된다.
-        self.assertEqual(validated.event, "REQUEST_CHANGES")
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.suggestions, [])
+        self.assertEqual(validated.event, "APPROVE")
 
-    def test_legacy_concerns_without_risk_marker_are_routed_to_suggestions(self) -> None:
-        # 위험 신호 없는 legacy concern 은 suggestions 로 가고, must_fix 가 비어 있으므로
-        # event 는 COMMENT 로 다운그레이드되어야 한다.
+    def test_legacy_concerns_without_risk_marker_are_ignored(self) -> None:
+        # 낮은 위험의 legacy concern 도 라인 근거가 없으면 COMMENT 로 남기지 않는다.
         validated = review_service.validate_mlx_output(
             {
                 "summary": "네이밍을 정리했습니다.",
@@ -1106,12 +1095,34 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(validated.must_fix, [])
-        self.assertIn(
-            "네이밍 스타일을 payload_meta 로 통일하면 일관성이 좋아집니다.",
-            validated.suggestions,
+        self.assertEqual(validated.suggestions, [])
+        self.assertEqual(validated.event, "APPROVE")
+
+    def test_line_comment_still_drives_request_changes_when_top_level_is_ignored(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": ["이 문장은 무시됩니다."],
+                "suggestions": ["이 문장도 무시됩니다."],
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.93,
+                        "body": "Evidence: x = 1. Problem: 잘못된 상태입니다. Impact: 요청이 실패합니다. Fix: 검증을 추가하세요.",
+                    }
+                ],
+            },
+            [self._make_pr_file()],
         )
-        # must_fix 가 비어 있으므로 모델이 요청한 REQUEST_CHANGES 는 COMMENT 로 다운그레이드.
-        self.assertEqual(validated.event, "COMMENT")
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.suggestions, [])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
 
 
 class DescriptiveChangeNarrationTests(unittest.TestCase):
