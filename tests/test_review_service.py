@@ -516,10 +516,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                     [self._make_pr_file()],
                 )
                 self.assertEqual(validated.event, "REQUEST_CHANGES")
-                # 이전에는 차단 등급 라인 코멘트 요약이 must_fix 로 승격됐으나,
-                # dedupe_across_sections 도입으로 원본 라인 코멘트와 동일 내용이면
-                # must_fix 에서 제거된다. event 결정은 blocking_comments 가 담당하므로
-                # must_fix 가 비어도 REQUEST_CHANGES 는 유지된다.
+                self.assertIn("위험한 상태 전이가 검증 없이 남습니다.", validated.must_fix)
                 self.assertEqual(len(validated.comments), 1)
                 self.assertEqual(validated.comments[0].severity, review_service.normalize_severity(severity))
 
@@ -550,8 +547,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         )
         self.assertEqual(validated.event, "COMMENT")
         self.assertEqual(validated.must_fix, [])
-        # dedupe_across_sections 가 suggestions 의 comment summary 를 원본 라인 코멘트와
-        # 중복으로 판정해 제거하므로, suggestions 가 비어 있어도 정상 — 라인 코멘트는 보존됨.
+        self.assertIn("낮은 위험의 검증 누락입니다.", validated.suggestions)
         self.assertEqual(len(validated.comments), 1)
         self.assertEqual(validated.comments[0].severity, "Minor")
 
@@ -920,9 +916,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(
             validated.comments[0].severity, review_service.SEVERITY_CRITICAL
         )
-        # Blocking 이 살아남으면 event 는 REQUEST_CHANGES 로 승격된다. (요약이 must_fix 로
-        # 들어가더라도 dedupe_across_sections 가 원본 라인 코멘트와 동일 내용이라 제거하므로
-        # must_fix 는 비어 있는 것이 정상 — blocking_comments 가 event 를 결정한다.)
+        self.assertIn("인증 우회 경로가 생깁니다.", validated.must_fix)
         self.assertEqual(validated.event, "REQUEST_CHANGES")
 
     def test_normalize_severity_accepts_common_synonyms(self) -> None:
@@ -1107,6 +1101,24 @@ class BuildReviewResultTests(unittest.TestCase):
 
 
 class DedupeAcrossSectionsTests(unittest.TestCase):
+    def test_summarize_structured_comment_uses_problem_section(self) -> None:
+        summaries = review_service.summarize_comment_bodies(
+            [
+                review_service.ReviewComment(
+                    path="a.py",
+                    line=1,
+                    body=_finding_body(
+                        problem="None 반환 시 AttributeError가 발생합니다.",
+                        why="요청이 500으로 끝납니다.",
+                        fix="None 분기를 먼저 처리하면 회귀 방지에 도움이 됩니다.",
+                    ),
+                    severity=review_service.SEVERITY_MAJOR,
+                )
+            ]
+        )
+
+        self.assertEqual(summaries, ["None 반환 시 AttributeError가 발생합니다."])
+
     def test_identical_finding_in_must_fix_and_comment_is_deduped_to_comment(self) -> None:
         # 같은 finding 이 must_fix 와 comments[] 에 동시에 있으면 라인 anchor 쪽을 보존.
         same_text = "signature 검증이 제거되어 인증 우회 위험이 있습니다."
@@ -1398,7 +1410,7 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(len(validated.comments), 1)
-        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.must_fix, ["잘못된 상태입니다."])
         self.assertEqual(validated.suggestions, [])
         self.assertEqual(validated.event, "REQUEST_CHANGES")
 

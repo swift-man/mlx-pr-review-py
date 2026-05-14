@@ -784,7 +784,7 @@ def summarize_comment_bodies(comments: list[ReviewComment], max_items: int = 3) 
     seen: set[str] = set()
 
     for comment in comments:
-        first_line = comment.body.strip().splitlines()[0] if comment.body.strip() else ""
+        first_line = extract_finding_problem(comment.body) or (comment.body.strip().splitlines()[0] if comment.body.strip() else "")
         text = normalize_text(first_line)
         if not text:
             continue
