@@ -31,6 +31,16 @@ def _mlx_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _finding_body(
+    *,
+    problem: str = "검증 가능한 문제가 있습니다.",
+    why: str = "현재 코드 경로에서 사용자-visible 영향이 발생합니다.",
+    fix: str = "해당 경로를 명시적으로 처리하세요.",
+    confidence: str = "High",
+) -> str:
+    return f"Problem: {problem} Why it matters: {why} Suggested fix: {fix} Confidence: {confidence}"
+
+
 class RunMlxTests(unittest.TestCase):
     def test_configured_mlx_backend_defaults_to_local(self) -> None:
         with mock.patch.dict(os.environ, _mlx_env(), clear=False):
@@ -383,12 +393,20 @@ class ReviewNormalizationTests(unittest.TestCase):
                             "path": "fortune/service.py",
                             "line": 12,
                             "confidence": 0.91,
-                            "body": "Evidence: cache_entry = build_cache_entry(). Problem: 캐시 생성 경로 변경에 대한 검증이 필요합니다. Impact: 만료 흐름 회귀를 놓칠 수 있습니다. Fix: 정상 흐름과 만료 흐름 테스트를 추가하세요.",
+                            "body": _finding_body(
+                                problem="캐시 생성 경로 변경에 대한 검증이 필요합니다.",
+                                why="만료 흐름 회귀를 놓칠 수 있습니다.",
+                                fix="정상 흐름과 만료 흐름 테스트를 추가하세요.",
+                            ),
                         },
                         {
                             "path": "missing.py",
                             "line": 12,
-                            "body": "Evidence: missing.py. Problem: PR에 없는 파일입니다. Impact: GitHub 라인 코멘트 등록이 실패합니다. Fix: 실제 diff 파일만 사용하세요.",
+                            "body": _finding_body(
+                                problem="PR에 없는 파일입니다.",
+                                why="GitHub 라인 코멘트 등록이 실패합니다.",
+                                fix="실제 diff 파일만 사용하세요.",
+                            ),
                         },
                         {
                             "path": "fortune/service.py",
@@ -426,9 +444,11 @@ def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> 
 class NormalizeSeverityTests(unittest.TestCase):
     def test_recognizes_all_four_severities_case_insensitively(self) -> None:
         cases = {
-            "Critical": review_service.SEVERITY_CRITICAL,
-            "critical": review_service.SEVERITY_CRITICAL,
-            "CRITICAL": review_service.SEVERITY_CRITICAL,
+            "Blocking": review_service.SEVERITY_BLOCKING,
+            "blocking": review_service.SEVERITY_BLOCKING,
+            "Critical": review_service.SEVERITY_BLOCKING,
+            "critical": review_service.SEVERITY_BLOCKING,
+            "CRITICAL": review_service.SEVERITY_BLOCKING,
             "  Major ": review_service.SEVERITY_MAJOR,
             "MINOR": review_service.SEVERITY_MINOR,
             "suggestion": review_service.SEVERITY_SUGGESTION,
@@ -438,10 +458,10 @@ class NormalizeSeverityTests(unittest.TestCase):
                 self.assertEqual(review_service.normalize_severity(raw), expected)
 
     def test_defaults_to_minor_when_missing_or_unknown(self) -> None:
-        # 모델이 누락하거나 완전히 엉뚱한 값을 보내도 Critical 로 튀지 않도록 Minor 폴백.
+        # 모델이 누락하거나 완전히 엉뚱한 값을 보내도 Blocking 으로 튀지 않도록 Minor 폴백.
         # 'blocker' / 'high' 같이 흔히 쓰는 관용어는 별도 매핑으로 흡수되므로 여기서는
         # 매핑에 명시적으로 없는 값들만 검사한다.
-        for raw in (None, "", "urgent", "cosmetic", "p0", "wishlist", 3, ["Critical"]):
+        for raw in (None, "", "urgent", "cosmetic", "p0", "wishlist", 3, ["Blocking"]):
             with self.subTest(raw=raw):
                 self.assertEqual(review_service.normalize_severity(raw), review_service.SEVERITY_MINOR)
 
@@ -469,8 +489,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             right_side_lines={1},
         )
 
-    def test_critical_comment_drives_request_changes_and_major_too(self) -> None:
-        for severity in ("Critical", "Major"):
+    def test_blocking_comment_drives_request_changes_and_major_too(self) -> None:
+        for severity in ("Blocking", "Major"):
             with self.subTest(severity=severity):
                 validated = review_service.validate_mlx_output(
                     {
@@ -485,7 +505,11 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                                 "line": 1,
                                 "severity": severity,
                                 "confidence": 0.9,
-                                "body": "Evidence: x = 1. Problem: 위험한 상태 전이가 검증 없이 남습니다. Impact: 현재 코드에서 잘못된 리뷰 이벤트가 발생합니다. Fix: 해당 상태 전이를 검증하거나 코멘트를 제거하세요.",
+                                "body": _finding_body(
+                                    problem="위험한 상태 전이가 검증 없이 남습니다.",
+                                    why="현재 코드에서 잘못된 리뷰 이벤트가 발생합니다.",
+                                    fix="해당 상태 전이를 검증하거나 코멘트를 제거하세요.",
+                                ),
                             }
                         ],
                     },
@@ -497,7 +521,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                 # must_fix 에서 제거된다. event 결정은 blocking_comments 가 담당하므로
                 # must_fix 가 비어도 REQUEST_CHANGES 는 유지된다.
                 self.assertEqual(len(validated.comments), 1)
-                self.assertEqual(validated.comments[0].severity, severity)
+                self.assertEqual(validated.comments[0].severity, review_service.normalize_severity(severity))
 
     def test_minor_comment_alone_stays_at_comment_level(self) -> None:
         # Minor/Suggestion 만 있는 경우에는 REQUEST_CHANGES 가 발동하면 안 된다.
@@ -514,7 +538,11 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "Minor",
                         "confidence": 0.9,
-                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
+                        "body": _finding_body(
+                            problem="낮은 위험의 검증 누락입니다.",
+                            why="특정 입력에서 결과가 달라질 수 있습니다.",
+                            fix="경계 조건 테스트를 추가하세요.",
+                        ),
                     }
                 ],
             },
@@ -540,7 +568,11 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "path": "fortune/service.py",
                         "line": 1,
                         "severity": "Major",
-                        "body": "Evidence: x = 1. Problem: 근거가 부족합니다. Impact: 잘못된 리뷰가 남습니다. Fix: 제거하세요.",
+                        "body": _finding_body(
+                            problem="근거가 부족합니다.",
+                            why="잘못된 리뷰가 남습니다.",
+                            fix="제거하세요.",
+                        ),
                     }
                 ],
             },
@@ -563,7 +595,11 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "Major",
                         "confidence": 0.79,
-                        "body": "Evidence: x = 1. Problem: 확신이 낮습니다. Impact: false positive 입니다. Fix: 제거하세요.",
+                        "body": _finding_body(
+                            problem="확신이 낮습니다.",
+                            why="false positive 입니다.",
+                            fix="제거하세요.",
+                        ),
                     }
                 ],
             },
@@ -594,6 +630,57 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             {"missing_required_finding_sections": 1},
         )
 
+    def test_model_comment_with_numeric_confidence_label_is_dropped(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": (
+                            "Problem: 잘못된 상태입니다. Why it matters: 요청이 실패합니다. "
+                            "Suggested fix: 검증을 추가하세요. Confidence: 0.95"
+                        ),
+                    }
+                ]
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(stats.dropped_model_comment_reasons, {"invalid_confidence_label": 1})
+
+    def test_blocking_or_major_without_high_confidence_label_is_dropped(self) -> None:
+        for severity in ("Blocking", "Major"):
+            with self.subTest(severity=severity):
+                comments, stats = review_service.collect_validated_comments(
+                    {
+                        "comments": [
+                            {
+                                "path": "fortune/service.py",
+                                "line": 1,
+                                "severity": severity,
+                                "confidence": 0.95,
+                                "body": _finding_body(
+                                    problem="실패 경로가 있습니다.",
+                                    why="현재 코드에서 사용자 요청이 실패합니다.",
+                                    fix="실패 조건을 처리하세요.",
+                                    confidence="Medium",
+                                ),
+                            }
+                        ]
+                    },
+                    [self._make_pr_file()],
+                )
+
+                self.assertEqual(comments, [])
+                self.assertEqual(
+                    stats.dropped_model_comment_reasons,
+                    {"blocking_without_high_confidence": 1},
+                )
+
     def test_non_object_model_comment_is_dropped_without_crashing(self) -> None:
         comments, stats = review_service.collect_validated_comments(
             {"comments": ["이 값은 dict가 아닙니다."]},
@@ -604,9 +691,10 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(stats.dropped_model_comment_reasons, {"non_object_comment": 1})
 
     def test_model_comment_rejects_bool_zero_and_float_lines(self) -> None:
-        valid_body = (
-            "Evidence: x = 1. Problem: 잘못된 라인 타입입니다. "
-            "Impact: GitHub 라인 코멘트가 엉뚱한 줄에 붙을 수 있습니다. Fix: 정수 라인만 허용하세요."
+        valid_body = _finding_body(
+            problem="잘못된 라인 타입입니다.",
+            why="GitHub 라인 코멘트가 엉뚱한 줄에 붙을 수 있습니다.",
+            fix="정수 라인만 허용하세요.",
         )
         for raw_line in (True, False, 0, 1.5):
             with self.subTest(raw_line=raw_line):
@@ -628,8 +716,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                 self.assertEqual(comments, [])
                 self.assertEqual(stats.dropped_model_comment_reasons, {"invalid_line_type": 1})
 
-    def test_rule_based_secret_logging_comment_gets_critical_severity(self) -> None:
-        # 비밀값 로그 감지는 직접 Critical 을 붙이므로 모델이 아무것도 안 보내도
+    def test_rule_based_secret_logging_comment_gets_blocking_severity(self) -> None:
+        # 비밀값 로그 감지는 직접 Blocking 을 붙이므로 모델이 아무것도 안 보내도
         # event 가 REQUEST_CHANGES 로 승격해야 한다.
         pr_file = review_service.PullRequestFile(
             filename="price_proxy/dbsec.py",
@@ -680,8 +768,8 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(
             rendered_bodies,
             [
-                "[Critical] 서명 검증이 제거돼 인증 우회 위험이 있습니다.\n\nConfidence: 1.00",
-                "[Minor] 네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.\n\nConfidence: 1.00",
+                "[Blocking] 서명 검증이 제거돼 인증 우회 위험이 있습니다.\n\nConfidence score: 1.00",
+                "[Minor] 네이밍을 payload_meta 로 통일하면 일관성이 좋아집니다.\n\nConfidence score: 1.00",
             ],
         )
 
@@ -700,9 +788,13 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                     {
                         "path": "fortune/service.py",
                         "line": 1,
-                        "severity": "Critical",
+                        "severity": "Blocking",
                         "confidence": 0.95,
-                        "body": "Evidence: 서명 검증 분기가 제거되었습니다. Problem: 인증 우회 경로가 생깁니다. Impact: 서명 없는 요청이 처리될 수 있습니다. Fix: 서명 검증을 복구하세요.",
+                        "body": _finding_body(
+                            problem="인증 우회 경로가 생깁니다.",
+                            why="서명 없는 요청이 처리될 수 있습니다.",
+                            fix="서명 검증을 복구하세요.",
+                        ),
                     }
                 ],
             }
@@ -714,7 +806,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(
             validated.comments[0].severity, review_service.SEVERITY_CRITICAL
         )
-        # Critical 이 살아남으면 event 는 REQUEST_CHANGES 로 승격된다. (요약이 must_fix 로
+        # Blocking 이 살아남으면 event 는 REQUEST_CHANGES 로 승격된다. (요약이 must_fix 로
         # 들어가더라도 dedupe_across_sections 가 원본 라인 코멘트와 동일 내용이라 제거하므로
         # must_fix 는 비어 있는 것이 정상 — blocking_comments 가 event 를 결정한다.)
         self.assertEqual(validated.event, "REQUEST_CHANGES")
@@ -787,7 +879,11 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "Minor",
                         "confidence": 0.9,
-                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
+                        "body": _finding_body(
+                            problem="낮은 위험의 검증 누락입니다.",
+                            why="특정 입력에서 결과가 달라질 수 있습니다.",
+                            fix="경계 조건 테스트를 추가하세요.",
+                        ),
                     }
                 ],
             },
@@ -815,7 +911,7 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
 
     def test_unknown_severity_value_from_model_falls_back_to_minor(self) -> None:
         # 모델이 매핑에 없는 비표준 등급(p0, urgent 등) 을 보내도 Minor 로 안전 폴백.
-        # blocker/high 같은 일반 관용어는 이미 Critical/Major 로 매핑되므로 여기서는
+        # blocker/high 같은 일반 관용어는 이미 Blocking/Major 로 매핑되므로 여기서는
         # 정말로 사전에 없는 문자열을 사용한다.
         validated = review_service.validate_mlx_output(
             {
@@ -830,7 +926,11 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "p0",
                         "confidence": 0.9,
-                        "body": "Evidence: x = 1. Problem: 낮은 위험의 검증 누락입니다. Impact: 특정 입력에서 결과가 달라질 수 있습니다. Fix: 경계 조건 테스트를 추가하세요.",
+                        "body": _finding_body(
+                            problem="낮은 위험의 검증 누락입니다.",
+                            why="특정 입력에서 결과가 달라질 수 있습니다.",
+                            fix="경계 조건 테스트를 추가하세요.",
+                        ),
                     }
                 ],
             },
@@ -1036,7 +1136,11 @@ class DescriptionPatternEndToEndTests(unittest.TestCase):
                         "line": 10,
                         "severity": "Major",
                         "confidence": 0.9,
-                        "body": "Evidence: return data.value. Problem: None 반환 시 AttributeError 가 발생합니다. Impact: 요청이 500 으로 끝납니다. Fix: None 분기를 먼저 처리하세요.",
+                        "body": _finding_body(
+                            problem="None 반환 시 AttributeError 가 발생합니다.",
+                            why="요청이 500 으로 끝납니다.",
+                            fix="None 분기를 먼저 처리하세요.",
+                        ),
                     }
                 ],
             },
@@ -1168,7 +1272,11 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
                         "line": 1,
                         "severity": "Major",
                         "confidence": 0.93,
-                        "body": "Evidence: x = 1. Problem: 잘못된 상태입니다. Impact: 요청이 실패합니다. Fix: 검증을 추가하세요.",
+                        "body": _finding_body(
+                            problem="잘못된 상태입니다.",
+                            why="요청이 실패합니다.",
+                            fix="검증을 추가하세요.",
+                        ),
                     }
                 ],
             },

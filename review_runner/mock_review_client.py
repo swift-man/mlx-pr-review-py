@@ -51,8 +51,9 @@ def build_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "severity": "Minor",
                 "confidence": 1.0,
                 "body": (
-                    "Evidence: 테스트용 diff 라인입니다. Problem: Review API 라인 코멘트 등록 경로를 확인해야 합니다. "
-                    "Impact: 이 메시지가 PR 상세 diff에 보이지 않으면 웹훅 검증이 불완전합니다. Fix: Review API 연동 설정을 확인하세요."
+                    "Problem: Review API 라인 코멘트 등록 경로를 확인해야 합니다. "
+                    "Why it matters: 이 메시지가 PR 상세 diff에 보이지 않으면 웹훅 검증이 불완전합니다. "
+                    "Suggested fix: Review API 연동 설정을 확인하세요. Confidence: High"
                 ),
             }
         ],

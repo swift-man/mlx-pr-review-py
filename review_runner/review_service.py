@@ -500,37 +500,41 @@ def resolve_github_token(repository: str | None = None, api_url: str = DEFAULT_A
     )
 
 
-SEVERITY_CRITICAL = "Critical"
+SEVERITY_BLOCKING = "Blocking"
+# Backward-compatible alias: older model/test fixtures may still say Critical.
+SEVERITY_CRITICAL = SEVERITY_BLOCKING
 SEVERITY_MAJOR = "Major"
 SEVERITY_MINOR = "Minor"
 SEVERITY_SUGGESTION = "Suggestion"
-ALL_SEVERITIES = (SEVERITY_CRITICAL, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
+ALL_SEVERITIES = (SEVERITY_BLOCKING, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
 MIN_MODEL_COMMENT_CONFIDENCE = 0.8
-REQUIRED_MODEL_COMMENT_SECTIONS = ("evidence", "problem", "impact", "fix")
-# Critical / Major 는 머지 전 반드시 봐야 하는 차단성 등급이라 event 를 REQUEST_CHANGES
+REQUIRED_MODEL_COMMENT_SECTIONS = ("problem", "why it matters", "suggested fix", "confidence")
+CONFIDENCE_LABEL_RE = re.compile(r"\bconfidence\s*:\s*(high|medium|low)\b", re.IGNORECASE)
+# Blocking / Major 는 머지 전 반드시 봐야 하는 차단성 등급이라 event 를 REQUEST_CHANGES
 # 로 승격시킨다. Minor / Suggestion 은 개선 제안이라 COMMENT 로 남는다.
-BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_MAJOR})
+BLOCKING_SEVERITIES = frozenset({SEVERITY_BLOCKING, SEVERITY_MAJOR})
 
 
 def normalize_severity(value: Any) -> str:
     """모델이 실어 보낸 severity 값을 정규화된 4단계 중 하나로 변환한다.
 
-    대소문자와 앞뒤 공백을 무시하고, 코드 리뷰 관용어(blocker/high/low/nit 등)도
+    대소문자와 앞뒤 공백을 무시하고, 코드 리뷰 관용어(critical/high/low/nit 등)도
     가까운 등급으로 매핑한다. 인식 불가이거나 누락된 경우 Minor 로 폴백해 잘못된
-    Critical 승격을 막는다.
+    Blocking 승격을 막는다.
     """
     if not isinstance(value, str):
         return SEVERITY_MINOR
     cleaned = value.strip().lower()
     mapping = {
         # 공식 4단계
-        "critical": SEVERITY_CRITICAL,
+        "blocking": SEVERITY_BLOCKING,
+        "critical": SEVERITY_BLOCKING,
         "major": SEVERITY_MAJOR,
         "minor": SEVERITY_MINOR,
         "suggestion": SEVERITY_SUGGESTION,
         # 관용어 동의어 — 모델이 학습 데이터에서 흡수한 대체 표현들을 안전하게 흡수한다.
-        "blocker": SEVERITY_CRITICAL,
-        "severe": SEVERITY_CRITICAL,
+        "blocker": SEVERITY_BLOCKING,
+        "severe": SEVERITY_BLOCKING,
         "high": SEVERITY_MAJOR,
         "medium": SEVERITY_MINOR,
         "moderate": SEVERITY_MINOR,
@@ -560,9 +564,17 @@ def normalize_confidence(value: Any) -> float | None:
 
 
 def has_required_finding_sections(body: str) -> bool:
-    """모델 라인 코멘트가 근거/문제/영향/수정 템플릿을 모두 포함하는지 확인한다."""
+    """모델 라인 코멘트가 요청된 리뷰 코멘트 템플릿을 모두 포함하는지 확인한다."""
     normalized = body.lower()
     return all(re.search(rf"\b{re.escape(section)}\s*:", normalized) for section in REQUIRED_MODEL_COMMENT_SECTIONS)
+
+
+def extract_confidence_label(body: str) -> str | None:
+    """본문의 Confidence: High/Medium/Low 라벨을 추출한다."""
+    match = CONFIDENCE_LABEL_RE.search(body)
+    if match is None:
+        return None
+    return match.group(1).lower()
 
 
 @dataclass
@@ -1091,7 +1103,11 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
                 "반드시 각 파일의 valid_comment_lines 안에 있는 RIGHT-side line 번호만 사용하세요.",
                 "정확성, 보안, 안정성, 성능, 변경된 동작에 대한 누락 테스트를 우선하세요.",
                 "스타일-only 코멘트나 칭찬-only 코멘트는 금지합니다.",
-                "각 코멘트에는 severity, confidence, Evidence, Problem, Impact, Fix를 포함하세요.",
+                "각 코멘트에는 severity, numeric confidence, Problem, Why it matters, Suggested fix, Confidence(High/Medium/Low)를 포함하세요.",
+                "최신 PR HEAD의 현재 파일과 line을 기준으로만 지적하고, outdated diff나 이미 수정된 코드는 지적하지 마세요.",
+                "guard, early return, optional 여부, 타입 선언, 배열 empty 방어, 상태 전이 조건을 먼저 확인하세요.",
+                "Blocking/Major는 재현 가능한 입력, 상태, 실행 순서와 High confidence가 있을 때만 사용하세요.",
+                "테스트 지적은 현재 테스트를 확인한 뒤 어떤 실패 모드를 막는지 설명할 수 있을 때만 작성하세요.",
                 f"confidence가 {MIN_MODEL_COMMENT_CONFIDENCE:.2f} 미만이면 코멘트를 작성하지 마세요.",
             ],
             "summary_rules": [
@@ -1115,7 +1131,7 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
                         "line": 12,
                         "severity": "Major",
                         "confidence": 0.92,
-                        "body": "Evidence: 코드 근거. Problem: 문제. Impact: 영향. Fix: 수정 방법.",
+                        "body": "Problem: 문제. Why it matters: 영향. Suggested fix: 수정 방법. Confidence: High",
                     }
                 ],
             },
@@ -1368,6 +1384,10 @@ def collect_validated_comments(
         if not has_required_finding_sections(body):
             increment_reason(stats.dropped_model_comment_reasons, "missing_required_finding_sections")
             continue
+        confidence_label = extract_confidence_label(body)
+        if confidence_label is None:
+            increment_reason(stats.dropped_model_comment_reasons, "invalid_confidence_label")
+            continue
 
         pr_file = file_index.get(path)
         # GitHub Review API는 실제 patch의 RIGHT-side 라인만 허용하므로 여기서 엄격하게 거른다.
@@ -1386,16 +1406,20 @@ def collect_validated_comments(
             increment_reason(stats.dropped_model_comment_reasons, "low_confidence")
             continue
 
+        severity = normalize_severity(raw.get("severity"))
+        if severity in BLOCKING_SEVERITIES and confidence_label != "high":
+            increment_reason(stats.dropped_model_comment_reasons, "blocking_without_high_confidence")
+            continue
+
         key = (path, line, body)
         if key in seen_comment_keys:
             increment_reason(stats.dropped_model_comment_reasons, "duplicate_model_comment")
             continue
         seen_comment_keys.add(key)
         # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
-        # 잘못된 Critical 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
+        # 잘못된 Blocking 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
         # 패턴 4 (description 재진술의 Major 태그) 는 looks_like_praise_only_comment
         # 가 이미 위에서 코멘트를 drop 하므로 별도 severity 강등 단계는 두지 않는다.
-        severity = normalize_severity(raw.get("severity"))
         comments.append(ReviewComment(path=path, line=line, body=body, severity=severity, confidence=confidence))
         stats.accepted_model_comments += 1
 
@@ -1419,7 +1443,7 @@ def decide_review_event(
     """최종 리뷰 event 를 두 플래그만으로 결정한다.
 
     3 단계 판정:
-    - should_request_changes=True → REQUEST_CHANGES. must_fix 또는 Critical/Major
+    - should_request_changes=True → REQUEST_CHANGES. must_fix 또는 Blocking/Major
       라인 코멘트가 있으면 이 분기로 간다.
     - has_any_finding=False → APPROVE. 지적이 하나도 없을 때만. '명시적 승인' 의사.
     - 나머지(suggestions 또는 Minor 라인 코멘트만 있는 경우) → COMMENT.
@@ -1556,10 +1580,10 @@ def validate_mlx_output(
     must_fix: list[str] = []
     suggestions: list[str] = []
 
-    # 라인 코멘트 요약을 등급별로 다른 버킷에 태운다. Critical/Major 요약은 상단
+    # 라인 코멘트 요약을 등급별로 다른 버킷에 태운다. Blocking/Major 요약은 상단
     # must_fix 에, Minor/Suggestion 요약은 suggestions 에 남겨 훑을 때 우선순위가
     # 유지되도록 한다. 규칙 기반 감지기(서명 우회, 비밀값 로그) 는 명시적으로
-    # Critical / Major 를 붙이므로 반드시 must_fix 쪽으로 가 REQUEST_CHANGES 를 유도한다.
+    # Blocking / Major 를 붙이므로 반드시 must_fix 쪽으로 가 REQUEST_CHANGES 를 유도한다.
     blocking_comments = [c for c in comments if c.severity in BLOCKING_SEVERITIES]
     non_blocking_comments = [c for c in comments if c.severity not in BLOCKING_SEVERITIES]
     must_fix_summaries = summarize_comment_bodies(blocking_comments, max_items=3)
@@ -1575,7 +1599,7 @@ def validate_mlx_output(
         must_fix, suggestions, comments, positives
     )
 
-    # 차단성 신호(must_fix 또는 Critical/Major 라인 코멘트) 가 있을 때만
+    # 차단성 신호(must_fix 또는 Blocking/Major 라인 코멘트) 가 있을 때만
     # REQUEST_CHANGES 로 승격한다. 순수 Minor/Suggestion 코멘트만 있으면 COMMENT 유지.
     should_request_changes = bool(must_fix or blocking_comments)
     # summary 재작성 등은 '뭐라도 남길 내용이 있는지' 로 판단하므로 has_findings 는 별도.
@@ -1677,9 +1701,9 @@ def build_review_payload(
                 "path": comment.path,
                 "line": comment.line,
                 "side": comment.side,
-                # GitHub 라인 코멘트 본문 맨 앞에 '[Critical]' 같은 등급 태그를 붙여
+                # GitHub 라인 코멘트 본문 맨 앞에 '[Blocking]' 같은 등급 태그를 붙여
                 # 훑는 사람이 심각도를 즉시 구분할 수 있게 한다.
-                "body": f"[{comment.severity}] {comment.body}\n\nConfidence: {comment.confidence:.2f}",
+                "body": f"[{comment.severity}] {comment.body}\n\nConfidence score: {comment.confidence:.2f}",
             }
             for comment in comments
         ],
