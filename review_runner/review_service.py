@@ -585,6 +585,14 @@ def extract_confidence_label(body: str) -> str | None:
     return label_match.group(1).lower()
 
 
+def extract_finding_problem(body: str) -> str:
+    """구조화된 finding 본문에서 Problem 섹션만 꺼낸다."""
+    body_match = FINDING_BODY_RE.match(body)
+    if body_match is None:
+        return normalize_text(body)
+    return normalize_text(body_match.group("problem"))
+
+
 def format_finding_body(
     *,
     problem: str,
@@ -839,6 +847,13 @@ def iter_patch_lines(patch: str) -> list[tuple[str, int, str]]:
     return rows
 
 
+def is_test_file_path(path: str) -> bool:
+    """규칙 기반 운영 위험 탐지에서 제외할 테스트 파일인지 판정한다."""
+    normalized = path.replace("\\", "/")
+    filename = normalized.rsplit("/", 1)[-1]
+    return normalized.startswith("tests/") or filename.startswith("test_") or filename.endswith("_test.py")
+
+
 def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
     findings: list[ReviewComment] = []
     previous_visible_line = ""
@@ -960,6 +975,8 @@ def detect_rule_based_comments(files: list[PullRequestFile]) -> list[ReviewComme
     )
 
     for pr_file in files:
+        if is_test_file_path(pr_file.filename):
+            continue
         for detector in detectors:
             for comment in detector(pr_file):
                 key = (comment.path, comment.line, comment.body)
@@ -1403,7 +1420,7 @@ def collect_validated_comments(
         if not body:
             increment_reason(stats.dropped_model_comment_reasons, "empty_body")
             continue
-        if looks_like_praise_only_comment(body):
+        if looks_like_praise_only_comment(extract_finding_problem(body)):
             increment_reason(stats.dropped_model_comment_reasons, "style_or_praise_only")
             continue
         if not has_required_finding_sections(body):

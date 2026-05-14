@@ -703,6 +703,29 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
                     {"blocking_without_high_confidence": 1},
                 )
 
+    def test_structured_comment_with_positive_fix_phrase_is_kept(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": _finding_body(
+                            problem="None 반환 시 AttributeError가 발생합니다.",
+                            why="요청이 500으로 끝납니다.",
+                            fix="None 분기를 먼저 처리하면 회귀 방지에 도움이 됩니다.",
+                        ),
+                    }
+                ]
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(stats.dropped_model_comment_reasons, {})
+
     def test_non_object_model_comment_is_dropped_without_crashing(self) -> None:
         comments, stats = review_service.collect_validated_comments(
             {"comments": ["이 값은 dict가 아닙니다."]},
@@ -816,6 +839,22 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             with self.subTest(path=comment.path, line=comment.line):
                 self.assertTrue(review_service.has_required_finding_sections(comment.body))
                 self.assertEqual(review_service.extract_confidence_label(comment.body), "high")
+
+    def test_rule_based_detectors_ignore_test_fixture_patch_strings(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="tests/test_review_service.py",
+            status="modified",
+            patch=(
+                "@@ -790,0 +790,2 @@\n"
+                "+patch='@@ -0,0 +218,1 @@\\n+print(f\"access token={token}\")\\n'\n"
+                "+patch='@@ -0,0 +5,1 @@\\n+return {\"stauts\": \"ok\"}\\n'\n"
+            ),
+            additions=2,
+            deletions=0,
+            right_side_lines={790, 791},
+        )
+
+        self.assertEqual(review_service.detect_rule_based_comments([pr_file]), [])
 
     def test_build_review_payload_prefixes_line_comment_body_with_severity_tag(self) -> None:
         payload = review_service.build_review_payload(
