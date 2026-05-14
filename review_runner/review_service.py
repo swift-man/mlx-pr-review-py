@@ -508,8 +508,14 @@ SEVERITY_MINOR = "Minor"
 SEVERITY_SUGGESTION = "Suggestion"
 ALL_SEVERITIES = (SEVERITY_BLOCKING, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
 MIN_MODEL_COMMENT_CONFIDENCE = 0.8
-REQUIRED_MODEL_COMMENT_SECTIONS = ("problem", "why it matters", "suggested fix", "confidence")
-CONFIDENCE_LABEL_RE = re.compile(r"\bconfidence\s*:\s*(high|medium|low)\b", re.IGNORECASE)
+FINDING_BODY_RE = re.compile(
+    r"^\s*problem\s*:\s*(?P<problem>.+?)\s+"
+    r"why\s+it\s+matters\s*:\s*(?P<why>.+?)\s+"
+    r"suggested\s+fix\s*:\s*(?P<fix>.+?)\s+"
+    r"confidence\s*:\s*(?P<confidence>.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+CONFIDENCE_LABEL_RE = re.compile(r"^(high|medium|low)$", re.IGNORECASE)
 # Blocking / Major 는 머지 전 반드시 봐야 하는 차단성 등급이라 event 를 REQUEST_CHANGES
 # 로 승격시킨다. Minor / Suggestion 은 개선 제안이라 COMMENT 로 남는다.
 BLOCKING_SEVERITIES = frozenset({SEVERITY_BLOCKING, SEVERITY_MAJOR})
@@ -565,16 +571,34 @@ def normalize_confidence(value: Any) -> float | None:
 
 def has_required_finding_sections(body: str) -> bool:
     """모델 라인 코멘트가 요청된 리뷰 코멘트 템플릿을 모두 포함하는지 확인한다."""
-    normalized = body.lower()
-    return all(re.search(rf"\b{re.escape(section)}\s*:", normalized) for section in REQUIRED_MODEL_COMMENT_SECTIONS)
+    return FINDING_BODY_RE.match(body) is not None
 
 
 def extract_confidence_label(body: str) -> str | None:
-    """본문의 Confidence: High/Medium/Low 라벨을 추출한다."""
-    match = CONFIDENCE_LABEL_RE.search(body)
-    if match is None:
+    """본문 마지막 Confidence: High/Medium/Low 라벨을 추출한다."""
+    body_match = FINDING_BODY_RE.match(body)
+    if body_match is None:
         return None
-    return match.group(1).lower()
+    label_match = CONFIDENCE_LABEL_RE.match(body_match.group("confidence").strip())
+    if label_match is None:
+        return None
+    return label_match.group(1).lower()
+
+
+def format_finding_body(
+    *,
+    problem: str,
+    why_it_matters: str,
+    suggested_fix: str,
+    confidence: str = "High",
+) -> str:
+    """GitHub 라인 코멘트에 쓰는 표준 finding 본문을 만든다."""
+    return (
+        f"Problem: {normalize_text(problem)} "
+        f"Why it matters: {normalize_text(why_it_matters)} "
+        f"Suggested fix: {normalize_text(suggested_fix)} "
+        f"Confidence: {confidence}"
+    )
 
 
 @dataclass
@@ -832,9 +856,10 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                         ReviewComment(
                             path=pr_file.filename,
                             line=line_number,
-                            body=(
-                                "서명 헤더가 없을 때 바로 반환하면 서명 검증이 건너뛰어져 위조된 웹훅도 처리될 수 있습니다. "
-                                "누락된 서명은 401로 거부하도록 유지하세요."
+                            body=format_finding_body(
+                                problem="서명 헤더가 없을 때 바로 반환해 서명 검증이 건너뛰어집니다.",
+                                why_it_matters="서명 없는 위조 웹훅이 처리될 수 있습니다.",
+                                suggested_fix="누락된 서명은 401로 거부하도록 유지하세요.",
                             ),
                             severity=SEVERITY_CRITICAL,
                         )
@@ -848,9 +873,10 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                         ReviewComment(
                             path=pr_file.filename,
                             line=line_number,
-                            body=(
-                                "서명 값이 없을 때 요청을 통과시키고 있어 인증되지 않은 웹훅을 받아들이게 됩니다. "
-                                "서명 누락이나 불일치는 예외를 발생시켜 요청을 거부해야 합니다."
+                            body=format_finding_body(
+                                problem="서명 값이 없거나 불일치해도 return으로 요청을 통과시킵니다.",
+                                why_it_matters="인증되지 않은 웹훅을 받아들이게 됩니다.",
+                                suggested_fix="서명 누락이나 불일치는 예외를 발생시켜 요청을 거부하세요.",
                             ),
                             severity=SEVERITY_CRITICAL,
                         )
@@ -877,21 +903,19 @@ def detect_secret_logging(pr_file: PullRequestFile) -> list[ReviewComment]:
         return []
 
     if match_count == 1:
-        body = (
-            "토큰이나 secret 값을 로그에 남기면 서버 로그 접근만으로 인증 정보가 유출될 수 있습니다. "
-            "민감한 값은 출력하지 말고, 필요하면 마스킹된 메타데이터만 기록하세요."
-        )
+        problem = "토큰이나 secret 값을 로그에 남깁니다."
     else:
-        body = (
-            "이 파일에서 토큰이나 secret 값을 로그에 남기는 코드가 여러 곳 추가되었습니다. "
-            "민감한 값은 출력하지 말고, 필요하면 마스킹된 메타데이터만 기록하세요."
-        )
+        problem = "이 파일에서 토큰이나 secret 값을 로그에 남기는 코드가 여러 곳 추가되었습니다."
 
     return [
         ReviewComment(
             path=pr_file.filename,
             line=first_match_line,
-            body=body,
+            body=format_finding_body(
+                problem=problem,
+                why_it_matters="서버 로그 접근만으로 인증 정보가 유출될 수 있습니다.",
+                suggested_fix="민감한 값은 출력하지 말고, 필요하면 마스킹된 메타데이터만 기록하세요.",
+            ),
             severity=SEVERITY_CRITICAL,
         )
     ]
@@ -912,9 +936,10 @@ def detect_contract_typos(pr_file: PullRequestFile) -> list[ReviewComment]:
                 ReviewComment(
                     path=pr_file.filename,
                     line=line_number,
-                    body=(
-                        f"`{typo}` 오타 때문에 기존 계약에서 기대하는 `{expected}` 키나 헤더를 찾지 못해 호출 흐름이 깨질 수 있습니다. "
-                        f"공개 응답 필드와 GitHub 헤더 이름은 `{expected}`로 정확히 유지하세요."
+                    body=format_finding_body(
+                        problem=f"`{typo}` 오타 때문에 기존 계약에서 기대하는 `{expected}` 키나 헤더를 찾지 못합니다.",
+                        why_it_matters="공개 응답 필드나 GitHub 헤더 이름이 어긋나 호출 흐름이 깨질 수 있습니다.",
+                        suggested_fix=f"공개 응답 필드와 GitHub 헤더 이름은 `{expected}`로 정확히 유지하세요.",
                     ),
                     severity=SEVERITY_MAJOR,
                 )

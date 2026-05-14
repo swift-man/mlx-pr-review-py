@@ -652,6 +652,28 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(comments, [])
         self.assertEqual(stats.dropped_model_comment_reasons, {"invalid_confidence_label": 1})
 
+    def test_model_comment_with_confidence_phrase_before_final_section_is_dropped(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": (
+                            "Problem: 설명 중 Confidence: High 예시를 언급합니다. "
+                            "Why it matters: 요청이 실패합니다. Suggested fix: 검증을 추가하세요."
+                        ),
+                    }
+                ]
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(stats.dropped_model_comment_reasons, {"missing_required_finding_sections": 1})
+
     def test_blocking_or_major_without_high_confidence_label_is_dropped(self) -> None:
         for severity in ("Blocking", "Major"):
             with self.subTest(severity=severity):
@@ -739,8 +761,61 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
             [pr_file],
         )
         self.assertEqual(len(validated.comments), 1)
-        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_CRITICAL)
+        comment = validated.comments[0]
+        self.assertEqual(comment.severity, review_service.SEVERITY_CRITICAL)
+        self.assertTrue(review_service.has_required_finding_sections(comment.body))
+        self.assertEqual(review_service.extract_confidence_label(comment.body), "high")
         self.assertEqual(validated.event, "REQUEST_CHANGES")
+        payload = review_service.build_review_payload(
+            summary=validated.summary,
+            event=validated.event,
+            comments=validated.comments,
+            positives=validated.positives,
+            must_fix=validated.must_fix,
+            suggestions=validated.suggestions,
+        )
+        rendered_body = payload["comments"][0]["body"]
+        self.assertIn("Problem:", rendered_body)
+        self.assertIn("Why it matters:", rendered_body)
+        self.assertIn("Suggested fix:", rendered_body)
+        self.assertIn("Confidence: High", rendered_body)
+        self.assertIn("Confidence score: 1.00", rendered_body)
+
+    def test_rule_based_comments_use_required_finding_template(self) -> None:
+        files = [
+            review_service.PullRequestFile(
+                filename="hooks.py",
+                status="modified",
+                patch="@@ -10,1 +10,2 @@\n if not signature:\n+    return\n",
+                additions=1,
+                deletions=0,
+                right_side_lines={11},
+            ),
+            review_service.PullRequestFile(
+                filename="price_proxy/dbsec.py",
+                status="modified",
+                patch='@@ -0,0 +218,1 @@\n+print(f"access token={token}")\n',
+                additions=1,
+                deletions=0,
+                right_side_lines={218},
+            ),
+            review_service.PullRequestFile(
+                filename="api/response.py",
+                status="modified",
+                patch='@@ -0,0 +5,1 @@\n+return {"stauts": "ok"}\n',
+                additions=1,
+                deletions=0,
+                right_side_lines={5},
+            ),
+        ]
+
+        comments = review_service.detect_rule_based_comments(files)
+
+        self.assertEqual(len(comments), 3)
+        for comment in comments:
+            with self.subTest(path=comment.path, line=comment.line):
+                self.assertTrue(review_service.has_required_finding_sections(comment.body))
+                self.assertEqual(review_service.extract_confidence_label(comment.body), "high")
 
     def test_build_review_payload_prefixes_line_comment_body_with_severity_tag(self) -> None:
         payload = review_service.build_review_payload(
