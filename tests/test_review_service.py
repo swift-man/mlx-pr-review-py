@@ -482,6 +482,12 @@ version: 1
 review:
   labels:
     - "review-heavy"
+  profiles:
+    ios:
+      include:
+        - "docs/**"
+      exclude:
+        - "Sources/**"
   include:
     - "**/*.swift"
 """

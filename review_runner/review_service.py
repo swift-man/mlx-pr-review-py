@@ -908,7 +908,9 @@ def parse_reviewbot_config(raw_config: str) -> ReviewBotConfig:
                 review_indent = indent
             continue
 
-        if ignored_bucket_indent is not None and indent <= ignored_bucket_indent:
+        if ignored_bucket_indent is not None:
+            if indent > ignored_bucket_indent:
+                continue
             ignored_bucket_indent = None
 
         if not stripped.startswith("- ") and ":" in key_line:
