@@ -34,6 +34,7 @@ DEFAULT_NO_FINDINGS_SUMMARY = (
 )
 DEFAULT_FINDINGS_SUMMARY = "자동 리뷰에서 확인이 필요한 변경 사항이 발견되었습니다. 아래 코멘트와 개선점을 확인해 주세요."
 REVIEWBOT_CONFIG_PATH = ".reviewbot.yml"
+FORCED_ALWAYS_REVIEW_PATTERNS = (REVIEWBOT_CONFIG_PATH, "AGENTS.md")
 NO_FINDINGS_SUMMARY_MARKERS = (
     DEFAULT_NO_FINDINGS_SUMMARY,
     "즉시 수정이 필요한 문제는 보이지 않습니다.",
@@ -329,6 +330,15 @@ def build_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cafile)
 
 
+class GitHubApiError(RuntimeError):
+    def __init__(self, *, method: str, url: str, status: int, response_body: str) -> None:
+        self.method = method
+        self.url = url
+        self.status = status
+        self.response_body = response_body
+        super().__init__(f"GitHub API {method} {url} failed: {status} {response_body}")
+
+
 def request_json_url(
     method: str,
     url: str,
@@ -355,7 +365,7 @@ def request_json_url(
             return json.loads(raw)
     except urllib.error.HTTPError as exc:
         message = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GitHub API {method} {url} failed: {exc.code} {message}") from exc
+        raise GitHubApiError(method=method, url=url, status=exc.code, response_body=message) from exc
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, ssl.SSLError):
             ca_bundle = os.environ.get(DEFAULT_CA_BUNDLE_ENV) or os.environ.get("SSL_CERT_FILE") or certifi.where()
@@ -759,14 +769,23 @@ class GitHubApi:
         )
         if not isinstance(response, dict):
             raise RuntimeError(f"GitHub contents response for {path} was not a file")
+        entry_type = response.get("type")
+        if entry_type != "file":
+            raise RuntimeError(f"GitHub contents response for {path} was not a regular file (type={entry_type!r})")
         encoding = response.get("encoding")
         content = response.get("content")
         if encoding != "base64" or not isinstance(content, str):
-            raise RuntimeError(f"GitHub contents response for {path} did not include base64 content")
+            raise RuntimeError(
+                f"GitHub contents response for {path} did not include base64 content "
+                f"(type={entry_type!r}, encoding={encoding!r})"
+            )
         try:
             return base64.b64decode("".join(content.split()), validate=True).decode("utf-8")
         except (binascii.Error, UnicodeDecodeError) as exc:
-            raise RuntimeError(f"GitHub contents response for {path} could not be decoded as UTF-8") from exc
+            raise RuntimeError(
+                f"GitHub contents response for {path} could not be decoded as UTF-8 "
+                f"(type={entry_type!r}, encoding={encoding!r})"
+            ) from exc
 
     def post_review(self, pull_number: int, body: dict[str, Any]) -> Any:
         return self.request_json(
@@ -849,7 +868,7 @@ def strip_reviewbot_yaml_value(raw_value: str) -> str:
             if char == quote:
                 return "".join(chars).strip()
             chars.append(char)
-        return "".join(chars).strip()
+        raise ValueError(f"unterminated {quote} quoted string: {raw_value!r}")
     return value.split(" #", 1)[0].strip()
 
 
@@ -863,6 +882,7 @@ def parse_reviewbot_config(raw_config: str) -> ReviewBotConfig:
     in_review_section = False
     review_indent = -1
     current_bucket: str | None = None
+    ignored_bucket_indent: int | None = None
 
     for line_number, raw_line in enumerate(raw_config.splitlines(), start=1):
         if "\t" in raw_line[: len(raw_line) - len(raw_line.lstrip())]:
@@ -882,22 +902,39 @@ def parse_reviewbot_config(raw_config: str) -> ReviewBotConfig:
         if indent <= review_indent:
             in_review_section = False
             current_bucket = None
+            ignored_bucket_indent = None
             if key_line == "review:":
                 in_review_section = True
                 review_indent = indent
             continue
 
-        if key_line.endswith(":") and not stripped.startswith("- "):
-            key = key_line[:-1].strip()
+        if ignored_bucket_indent is not None and indent <= ignored_bucket_indent:
+            ignored_bucket_indent = None
+
+        if not stripped.startswith("- ") and ":" in key_line:
+            key, raw_value = key_line.split(":", 1)
+            key = key.strip()
+            value = raw_value.strip()
+            if key in buckets and value:
+                raise ValueError(f"unsupported value for review.{key} at line {line_number}")
             current_bucket = key if key in buckets else None
+            ignored_bucket_indent = None if key in buckets else indent
             continue
 
         if stripped.startswith("- "):
+            if current_bucket is None and ignored_bucket_indent is not None:
+                continue
             if current_bucket is None:
                 raise ValueError(f"list item outside include/exclude/always_review at line {line_number}")
-            value = strip_reviewbot_yaml_value(stripped[2:])
+            try:
+                value = strip_reviewbot_yaml_value(stripped[2:])
+            except ValueError as exc:
+                raise ValueError(f"{exc} at line {line_number}") from exc
             if value:
                 buckets[current_bucket].append(value)
+            continue
+
+        raise ValueError(f"unsupported review config line at line {line_number}")
 
     return ReviewBotConfig(
         include=tuple(buckets["include"]),
@@ -908,7 +945,9 @@ def parse_reviewbot_config(raw_config: str) -> ReviewBotConfig:
 
 
 def is_github_not_found_error(exc: RuntimeError) -> bool:
-    return " failed: 404 " in str(exc)
+    if isinstance(exc, GitHubApiError):
+        return exc.status == 404
+    return bool(re.search(r"\bfailed:\s*404\b", str(exc)))
 
 
 def load_reviewbot_config(github: GitHubApi, pull_number: int, *, log_prefix: str = "") -> ReviewBotConfig:
@@ -971,6 +1010,8 @@ def matches_any_reviewbot_pattern(path: str, patterns: tuple[str, ...]) -> bool:
 
 
 def should_review_file(path: str, config: ReviewBotConfig) -> bool:
+    if matches_any_reviewbot_pattern(path, FORCED_ALWAYS_REVIEW_PATTERNS):
+        return True
     if not config.has_filters:
         return True
     if matches_any_reviewbot_pattern(path, config.always_review):

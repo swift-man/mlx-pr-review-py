@@ -399,7 +399,7 @@ review:
     - "Tuist/**/*.swift"
 ```
 
-적용 순서는 `always_review`가 최우선이고, 그 다음 `include`, 마지막으로 `exclude`입니다. 예를 들어 `**/*.md`를 제외하더라도 `always_review`에 `AGENTS.md`를 넣으면 해당 파일은 계속 리뷰됩니다.
+적용 순서는 `always_review`가 최우선이고, 그 다음 `include`, 마지막으로 `exclude`입니다. 예를 들어 `**/*.md`를 제외하더라도 `always_review`에 `AGENTS.md`를 넣으면 해당 파일은 계속 리뷰됩니다. 또한 `.reviewbot.yml`과 `AGENTS.md`는 설정 파일이 실수나 악의로 제외하더라도 diff에 포함되어 있으면 항상 리뷰 대상에 남습니다.
 
 ## 10. CLI 테스트
 

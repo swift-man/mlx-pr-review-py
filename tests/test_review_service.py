@@ -476,11 +476,49 @@ review: # reviewbot settings
         self.assertEqual(config.exclude, ("**/*.generated.swift", "README.md"))
         self.assertEqual(config.always_review, (".reviewbot.yml", "AGENTS.md"))
 
+    def test_parse_reviewbot_config_ignores_unknown_list_buckets(self) -> None:
+        raw_config = """
+version: 1
+review:
+  labels:
+    - "review-heavy"
+  include:
+    - "**/*.swift"
+"""
+
+        config = review_service.parse_reviewbot_config(raw_config)
+
+        self.assertEqual(config.include, ("**/*.swift",))
+        self.assertEqual(config.exclude, ())
+        self.assertEqual(config.always_review, ())
+
+    def test_parse_reviewbot_config_rejects_unsupported_known_bucket_values(self) -> None:
+        cases = (
+            'review:\n  include: ["Sources/App.swift"]\n',
+            'review:\n  exclude: "README.md"\n',
+            'review:\n  always_review: .reviewbot.yml\n',
+        )
+        for raw_config in cases:
+            with self.subTest(raw_config=raw_config):
+                with self.assertRaisesRegex(ValueError, "unsupported value for review"):
+                    review_service.parse_reviewbot_config(raw_config)
+
+    def test_parse_reviewbot_config_rejects_unterminated_quoted_values(self) -> None:
+        raw_config = """
+version: 1
+review:
+  include:
+    - "Sources/App.swift
+"""
+
+        with self.assertRaisesRegex(ValueError, "unterminated"):
+            review_service.parse_reviewbot_config(raw_config)
+
     def test_filter_reviewbot_files_applies_include_exclude_and_always_review(self) -> None:
         config = review_service.ReviewBotConfig(
             include=("**/*.swift", "Package.swift"),
             exclude=("Pods/**", "**/*.generated.swift", "**/*.md"),
-            always_review=(".reviewbot.yml", "Package.swift"),
+            always_review=(".reviewbot.yml", "Package.swift", "README.md"),
             loaded=True,
         )
         files = [
@@ -497,9 +535,27 @@ review: # reviewbot settings
 
         self.assertEqual(
             [pr_file.filename for pr_file in filtered],
-            ["Sources/App.swift", "RootFile.swift", ".reviewbot.yml", "Package.swift"],
+            ["Sources/App.swift", "RootFile.swift", "README.md", ".reviewbot.yml", "Package.swift"],
         )
-        self.assertEqual(skipped, 3)
+        self.assertEqual(skipped, 2)
+
+    def test_filter_reviewbot_files_forces_control_files_even_when_config_excludes_them(self) -> None:
+        config = review_service.ReviewBotConfig(
+            include=(),
+            exclude=("**/*",),
+            always_review=(),
+            loaded=True,
+        )
+        files = [
+            self._pr_file(".reviewbot.yml"),
+            self._pr_file("AGENTS.md"),
+            self._pr_file("Sources/App.swift"),
+        ]
+
+        filtered, skipped = review_service.filter_reviewbot_files(files, config)
+
+        self.assertEqual([pr_file.filename for pr_file in filtered], [".reviewbot.yml", "AGENTS.md"])
+        self.assertEqual(skipped, 1)
 
     def test_reviewbot_glob_matching_uses_path_segments(self) -> None:
         self.assertTrue(review_service.reviewbot_glob_matches("**/*.swift", "RootFile.swift"))
@@ -572,10 +628,16 @@ review:
         self.assertTrue(result.reviewbot_config_loaded)
 
     def test_load_patchable_pr_files_result_reviews_all_files_when_config_is_missing(self) -> None:
+        case = self
+
         class FakeGitHub:
             repository = "swift-man/app"
 
+            def __init__(self) -> None:
+                self.loaded_paths: list[tuple[str, str]] = []
+
             def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 7)
                 return [
                     {
                         "filename": "README.md",
@@ -587,13 +649,17 @@ review:
                 ]
 
             def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 7)
                 return "abc123"
 
             def get_file_text(self, path: str, *, ref: str) -> str:
+                self.loaded_paths.append((path, ref))
                 raise RuntimeError("GitHub API GET https://api.github.com/repos/swift-man/app/contents/.reviewbot.yml failed: 404 Not Found")
 
-        result = review_service.load_patchable_pr_files_result(FakeGitHub(), 7)
+        fake_github = FakeGitHub()
+        result = review_service.load_patchable_pr_files_result(fake_github, 7)
 
+        self.assertEqual(fake_github.loaded_paths, [(review_service.REVIEWBOT_CONFIG_PATH, "abc123")])
         self.assertEqual([pr_file.filename for pr_file in result.files], ["README.md"])
         self.assertEqual(result.patchable_count, 1)
         self.assertEqual(result.skipped_by_reviewbot, 0)
