@@ -989,18 +989,32 @@ def split_review_path(path: str) -> list[str]:
 
 
 def reviewbot_glob_segments_match(pattern_segments: list[str], path_segments: list[str]) -> bool:
-    if not pattern_segments:
-        return not path_segments
-    head = pattern_segments[0]
-    if head == "**":
-        return reviewbot_glob_segments_match(pattern_segments[1:], path_segments) or (
-            bool(path_segments) and reviewbot_glob_segments_match(pattern_segments, path_segments[1:])
-        )
-    if not path_segments:
-        return False
-    if not fnmatch.fnmatchcase(path_segments[0], head):
-        return False
-    return reviewbot_glob_segments_match(pattern_segments[1:], path_segments[1:])
+    memo: dict[tuple[int, int], bool] = {}
+
+    def matches(pattern_index: int, path_index: int) -> bool:
+        key = (pattern_index, path_index)
+        if key in memo:
+            return memo[key]
+
+        if pattern_index == len(pattern_segments):
+            result = path_index == len(path_segments)
+        else:
+            head = pattern_segments[pattern_index]
+            if head == "**":
+                result = matches(pattern_index + 1, path_index) or (
+                    path_index < len(path_segments) and matches(pattern_index, path_index + 1)
+                )
+            elif path_index == len(path_segments):
+                result = False
+            elif not fnmatch.fnmatchcase(path_segments[path_index], head):
+                result = False
+            else:
+                result = matches(pattern_index + 1, path_index + 1)
+
+        memo[key] = result
+        return result
+
+    return matches(0, 0)
 
 
 def reviewbot_glob_matches(pattern: str, path: str) -> bool:

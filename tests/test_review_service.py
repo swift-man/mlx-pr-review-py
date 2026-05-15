@@ -572,6 +572,12 @@ review:
         self.assertFalse(review_service.reviewbot_glob_matches("*.md", "docs/guide.md"))
         self.assertFalse(review_service.reviewbot_glob_matches(".reviewbot.yml", "nested/.reviewbot.yml"))
 
+    def test_reviewbot_glob_matching_handles_repeated_double_star_patterns(self) -> None:
+        pattern = "**/**/**/**/**/**/**/target.swift"
+
+        self.assertTrue(review_service.reviewbot_glob_matches(pattern, "a/b/c/d/e/f/g/target.swift"))
+        self.assertFalse(review_service.reviewbot_glob_matches(pattern, "a/b/c/d/e/f/g/target.py"))
+
     def test_load_patchable_pr_files_result_fetches_config_from_pr_head(self) -> None:
         raw_config = """
 version: 1
