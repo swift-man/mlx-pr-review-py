@@ -114,7 +114,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
 
         # 라인 코멘트 severity 4단계 정의가 프롬프트에 노출되는지
         self.assertIn("Severity levels for comments", system_prompt)
-        self.assertIn("Critical", system_prompt)
+        self.assertIn("Blocking", system_prompt)
         self.assertIn("Major", system_prompt)
         self.assertIn("Minor", system_prompt)
         self.assertIn("Suggestion", system_prompt)
@@ -122,7 +122,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn('"confidence":0.92', system_prompt)
         # event 강제 규칙이 세 분기(REQUEST_CHANGES / APPROVE / COMMENT) 를 모두 노출하는지.
         self.assertIn(
-            "REQUEST_CHANGES is triggered by any accepted Critical/Major line comment",
+            "REQUEST_CHANGES is triggered by any accepted Blocking/Major line comment",
             system_prompt,
         )
         self.assertIn(
@@ -146,7 +146,11 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("code flow rather than variable names", system_prompt)
         self.assertIn("below 0.8, omit the finding", system_prompt)
         self.assertIn("missing or low confidence", system_prompt)
-        self.assertIn("Evidence, Problem, Impact, and Fix", system_prompt)
+        self.assertIn("Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low", system_prompt)
+        self.assertIn("Review only the latest PR HEAD", system_prompt)
+        self.assertIn("Every finding must be reproducible", system_prompt)
+        self.assertIn("Performance findings must include expected call frequency", system_prompt)
+        self.assertIn("Test findings must name the exact missing failure mode", system_prompt)
         self.assertIn("Do not suggest 'translate this comment/docstring to Korean'", system_prompt)
         self.assertIn("U+AC00 to U+D7A3", system_prompt)
         # 영문 판정 기준이 'entirely ASCII' 에서 'contains no Hangul characters' 로 바뀐 것을
@@ -173,7 +177,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
             system_prompt,
         )
         self.assertIn(
-            "Critical and Major require concrete code evidence",
+            "Blocking and Major require concrete code evidence",
             system_prompt,
         )
         # 기존 severity 섹션의 "When in doubt use Minor" 는 gradient 로 흡수돼 빠졌는지 확인.
@@ -182,7 +186,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)
-        self.assertIn("Evidence, Problem, Impact, Fix 와 confidence", user_prompt)
+        self.assertIn("Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low", user_prompt)
         self.assertIn("must_fix, suggestions, comments 가 비어 있어도 괜찮습니다", user_prompt)
         self.assertIn("diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요", user_prompt)
 

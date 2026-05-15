@@ -373,15 +373,17 @@ zsh /Users/runner/pr-review/scripts/send_test_webhook.sh
       "line": 42,
       "severity": "Major",
       "confidence": 0.92,
-      "body": "Evidence: ... Problem: ... Impact: ... Fix: ..."
+      "body": "Problem: ... Why it matters: ... Suggested fix: ... Confidence: High"
     }
   ]
 }
 ```
 
-`line`은 반드시 해당 patch의 RIGHT-side 유효 라인이어야 합니다. 모델이 만든 finding은 `comments[]`에만 넣고,
+`severity`는 `Blocking`, `Major`, `Minor`, `Suggestion` 중 하나여야 하고, `line`은 반드시 해당 patch의
+RIGHT-side 유효 라인이어야 합니다. 모델이 만든 finding은 `comments[]`에만 넣고,
 `must_fix`와 `suggestions`는 빈 배열로 둡니다. 서비스는 path/line/confidence가 없는 top-level finding을
-false positive 방지를 위해 게시하지 않습니다.
+false positive 방지를 위해 게시하지 않습니다. `Blocking`/`Major`는 본문 `Confidence: High`와 numeric
+`confidence >= 0.8`을 모두 만족할 때만 게시됩니다.
 [`review_runner/sample_mlx_client.py`](/Users/m4_25/develop/codereview/review_runner/sample_mlx_client.py)는
 기존 경로 호환을 위한 래퍼만 남겨뒀습니다.
 
@@ -496,11 +498,11 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 | `Anti-hallucination guardrails` 섹션 전체 | 리뷰 생성 전 self-check + 번역 금지 + add-already-exists 금지 + confidence gradient |
 | `Do not restate what the diff already does` 규칙 | narration 금지 (패턴 3 일부) |
 | `~가 추가되었습니다 / 변경되었습니다 / 수정되었습니다 are narration` | 서술형 어미 식별 |
-| `Severity levels for comments[]` + severity enforcement | Major/Minor 남용 억제 |
+| `Severity levels for comments[]` + severity/confidence enforcement | Blocking/Major 남용 억제 |
 
 **제거 기준**: 15-1 의 회귀 PR 4 개 케이스를 새 모델로 돌려 다음 두 조건을 모두 만족하면 해당 규칙 제거.
 1. 세 패턴(역해석 / 환각 / 중복 출력) 이 **한 건도 재현되지 않음**.
-2. Critical / Major 등급이 **영향(impact) 서술 없이 남발되지 않음**. 위 표에 `severity enforcement` 가 A 계층 책임으로 들어가 있으므로 이 조건이 빠지면 severity 오남용을 감지할 도구가 사라진다.
+2. Blocking / Major 등급이 **재현 조건, 영향, 수정 방법, Confidence: High 없이 남발되지 않음**. 위 표에 `severity/confidence enforcement` 가 A 계층 책임으로 들어가 있으므로 이 조건이 빠지면 severity 오남용을 감지할 도구가 사라진다.
 
 샘플 확장 시 주의: 기본 `MLX_TEMPERATURE=0.0` 에서는 같은 입력이 항상 같은 출력을 내므로 **단순 반복 실행은 샘플 다양성을 늘리지 못한다**. 샘플을 늘리려면 (1) `MLX_TEMPERATURE` 를 올려 비결정 샘플링을 활성화하거나, (2) 서로 다른 PR / commit fixture 를 15-1 목록에 추가하는 방향으로 간다. 어느 쪽이든 판정 기준은 여전히 "재현 0 건" 및 "오남용 0 건".
 
@@ -522,7 +524,7 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 | `looks_like_prompt_echo` / `looks_like_diff_stat_dump` / `looks_like_generic_positive` / `looks_like_generic_model_change_comment` / `looks_like_process_policy_comment` / `looks_like_descriptive_change_narration` / `looks_like_positive_only_concern` / `looks_like_identifier_localization_comment` / `looks_like_no_findings_summary` | 위 marker 들을 각 지적 유형에 적용하는 판정 함수들 |
 | `split_legacy_concerns` | 구 스키마 `concerns` 를 risk marker 기준으로 `must_fix` / `suggestions` 분배 |
 
-> ⚠️ **`normalize_severity` 는 B 계층 marker filter 와 분리**: `normalize_severity` 는 'blocker/high/low/nit' 같은 관용어를 canonical severity enum 으로 정규화하는 **호환 레이어** 이지, 실패 패턴을 걸러내는 필터가 아닙니다. 아래 B 계층 제거 기준으로 판단하지 말고, **새 모델이 항상 Canonical severity(Critical/Major/Minor/Suggestion)만 emit 한다고 확인된 뒤에만** 제거하세요. 조기 제거 시 관용어가 전부 Minor 로 폴백돼 event 라우팅이 왜곡됩니다.
+> ⚠️ **`normalize_severity` 는 B 계층 marker filter 와 분리**: `normalize_severity` 는 'critical/blocker/high/low/nit' 같은 관용어를 canonical severity enum 으로 정규화하는 **호환 레이어** 이지, 실패 패턴을 걸러내는 필터가 아닙니다. 아래 B 계층 제거 기준으로 판단하지 말고, **새 모델이 항상 Canonical severity(Blocking/Major/Minor/Suggestion)만 emit 한다고 확인된 뒤에만** 제거하세요. 조기 제거 시 관용어가 전부 Minor 로 폴백돼 event 라우팅이 왜곡됩니다.
 
 **제거 기준**: 회귀 PR 4 개 케이스를 **후처리 필터를 비활성화한 상태** 로 새 모델에 돌렸을 때, **원본 모델 출력** 에서 해당 marker 가 겨냥하는 패턴이 한 건도 나타나지 않으면 해당 marker·함수 쌍 제거. 예를 들어 `LOW_SIGNAL_POSITIVE_MARKERS` 의 제거는 원본 출력의 positives 배열에 "PR diff 가 잘 작성되었습니다" 류 저신호 칭찬이 없는지로 판정, `DESCRIPTIVE_NARRATION_SUFFIXES` 는 `must_fix` / `suggestions` 에 "~되었습니다" 서술형 어미가 없는지로 판정.
 

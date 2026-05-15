@@ -362,7 +362,7 @@ def extract_section_items(text: str, key: str, item_pattern: re.Pattern[str]) ->
 def normalize_event_value(raw_event: str, *, has_comments: bool) -> str:
     """파서 단계에서는 3 가지 이벤트(APPROVE/COMMENT/REQUEST_CHANGES) 를 모두 수용한다.
 
-    실제 승격·다운그레이드 규칙(must_fix / Critical·Major 라인 코멘트 기반) 은
+    실제 승격·다운그레이드 규칙(must_fix / Blocking·Major 라인 코멘트 기반) 은
     review_service.decide_review_event 가 해당 값을 보지 않고 플래그만으로 최종
     확정하므로, 파서는 알 수 없는 값만 안전한 기본값으로 치환한다. 유효한 세 값은
     그대로 통과시켜 normalized_response 에 보존한다 (테스트/로그 등 관측용).
