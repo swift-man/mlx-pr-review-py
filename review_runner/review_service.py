@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import fnmatch
 import json
 import os
 import re
@@ -30,6 +33,8 @@ DEFAULT_NO_FINDINGS_SUMMARY = (
     "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
 )
 DEFAULT_FINDINGS_SUMMARY = "자동 리뷰에서 확인이 필요한 변경 사항이 발견되었습니다. 아래 코멘트와 개선점을 확인해 주세요."
+REVIEWBOT_CONFIG_PATH = ".reviewbot.yml"
+FORCED_ALWAYS_REVIEW_PATTERNS = (REVIEWBOT_CONFIG_PATH, "AGENTS.md")
 NO_FINDINGS_SUMMARY_MARKERS = (
     DEFAULT_NO_FINDINGS_SUMMARY,
     "즉시 수정이 필요한 문제는 보이지 않습니다.",
@@ -325,6 +330,15 @@ def build_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cafile)
 
 
+class GitHubApiError(RuntimeError):
+    def __init__(self, *, method: str, url: str, status: int, response_body: str) -> None:
+        self.method = method
+        self.url = url
+        self.status = status
+        self.response_body = response_body
+        super().__init__(f"GitHub API {method} {url} failed: {status} {response_body}")
+
+
 def request_json_url(
     method: str,
     url: str,
@@ -351,7 +365,7 @@ def request_json_url(
             return json.loads(raw)
     except urllib.error.HTTPError as exc:
         message = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GitHub API {method} {url} failed: {exc.code} {message}") from exc
+        raise GitHubApiError(method=method, url=url, status=exc.code, response_body=message) from exc
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, ssl.SSLError):
             ca_bundle = os.environ.get(DEFAULT_CA_BUNDLE_ENV) or os.environ.get("SSL_CERT_FILE") or certifi.where()
@@ -629,6 +643,26 @@ class PullRequestFile:
     right_side_lines: set[int]
 
 
+@dataclass(frozen=True)
+class ReviewBotConfig:
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+    always_review: tuple[str, ...] = ()
+    loaded: bool = False
+
+    @property
+    def has_filters(self) -> bool:
+        return bool(self.include or self.exclude or self.always_review)
+
+
+@dataclass
+class PullRequestFileLoadResult:
+    files: list[PullRequestFile]
+    patchable_count: int
+    skipped_by_reviewbot: int = 0
+    reviewbot_config_loaded: bool = False
+
+
 @dataclass
 class ValidatedReview:
     """모델 출력과 규칙 기반 검사를 합쳐서 정규화한 리뷰 결과다.
@@ -717,6 +751,42 @@ class GitHubApi:
             page += 1
         return files
 
+    def get_pull_head_sha(self, pull_number: int) -> str:
+        pull = self.request_json("GET", f"/repos/{self.repository}/pulls/{pull_number}")
+        head = pull.get("head") if isinstance(pull, dict) else None
+        sha = head.get("sha") if isinstance(head, dict) else None
+        normalized_sha = str(sha or "").strip()
+        if not normalized_sha:
+            raise RuntimeError(f"GitHub pull request response did not include head.sha for #{pull_number}")
+        return normalized_sha
+
+    def get_file_text(self, path: str, *, ref: str) -> str:
+        encoded_path = urllib.parse.quote(path, safe="/")
+        response = self.request_json(
+            "GET",
+            f"/repos/{self.repository}/contents/{encoded_path}",
+            params={"ref": ref},
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError(f"GitHub contents response for {path} was not a file")
+        entry_type = response.get("type")
+        if entry_type != "file":
+            raise RuntimeError(f"GitHub contents response for {path} was not a regular file (type={entry_type!r})")
+        encoding = response.get("encoding")
+        content = response.get("content")
+        if encoding != "base64" or not isinstance(content, str):
+            raise RuntimeError(
+                f"GitHub contents response for {path} did not include base64 content "
+                f"(type={entry_type!r}, encoding={encoding!r})"
+            )
+        try:
+            return base64.b64decode("".join(content.split()), validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                f"GitHub contents response for {path} could not be decoded as UTF-8 "
+                f"(type={entry_type!r}, encoding={encoding!r})"
+            ) from exc
+
     def post_review(self, pull_number: int, body: dict[str, Any]) -> Any:
         return self.request_json(
             "POST",
@@ -777,6 +847,204 @@ def build_pr_files(raw_files: list[dict[str, Any]]) -> list[PullRequestFile]:
             )
         )
     return files
+
+
+def strip_reviewbot_yaml_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if value[0] in {"'", '"'}:
+        quote = value[0]
+        escaped = False
+        chars: list[str] = []
+        for char in value[1:]:
+            if escaped:
+                chars.append(char)
+                escaped = False
+                continue
+            if quote == '"' and char == "\\":
+                escaped = True
+                continue
+            if char == quote:
+                return "".join(chars).strip()
+            chars.append(char)
+        raise ValueError(f"unterminated {quote} quoted string: {raw_value!r}")
+    return value.split(" #", 1)[0].strip()
+
+
+def parse_reviewbot_config(raw_config: str) -> ReviewBotConfig:
+    """리뷰 대상 저장소의 .reviewbot.yml 중 review include/exclude 목록만 읽는다."""
+    buckets: dict[str, list[str]] = {
+        "include": [],
+        "exclude": [],
+        "always_review": [],
+    }
+    in_review_section = False
+    review_indent = -1
+    current_bucket: str | None = None
+    ignored_bucket_indent: int | None = None
+
+    for line_number, raw_line in enumerate(raw_config.splitlines(), start=1):
+        if "\t" in raw_line[: len(raw_line) - len(raw_line.lstrip())]:
+            raise ValueError(f"tabs are not supported in indentation at line {line_number}")
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        key_line = stripped.split(" #", 1)[0].rstrip()
+        if not in_review_section:
+            if key_line == "review:":
+                in_review_section = True
+                review_indent = indent
+            continue
+
+        if indent <= review_indent:
+            in_review_section = False
+            current_bucket = None
+            ignored_bucket_indent = None
+            if key_line == "review:":
+                in_review_section = True
+                review_indent = indent
+            continue
+
+        if ignored_bucket_indent is not None:
+            if indent > ignored_bucket_indent:
+                continue
+            ignored_bucket_indent = None
+
+        if not stripped.startswith("- ") and ":" in key_line:
+            key, raw_value = key_line.split(":", 1)
+            key = key.strip()
+            value = raw_value.strip()
+            if key in buckets and value:
+                raise ValueError(f"unsupported value for review.{key} at line {line_number}")
+            current_bucket = key if key in buckets else None
+            ignored_bucket_indent = None if key in buckets else indent
+            continue
+
+        if stripped.startswith("- "):
+            if current_bucket is None and ignored_bucket_indent is not None:
+                continue
+            if current_bucket is None:
+                raise ValueError(f"list item outside include/exclude/always_review at line {line_number}")
+            try:
+                value = strip_reviewbot_yaml_value(stripped[2:])
+            except ValueError as exc:
+                raise ValueError(f"{exc} at line {line_number}") from exc
+            if value:
+                buckets[current_bucket].append(value)
+            continue
+
+        raise ValueError(f"unsupported review config line at line {line_number}")
+
+    return ReviewBotConfig(
+        include=tuple(buckets["include"]),
+        exclude=tuple(buckets["exclude"]),
+        always_review=tuple(buckets["always_review"]),
+        loaded=True,
+    )
+
+
+def is_github_not_found_error(exc: RuntimeError) -> bool:
+    if isinstance(exc, GitHubApiError):
+        return exc.status == 404
+    return bool(re.search(r"\bfailed:\s*404\b", str(exc)))
+
+
+def load_reviewbot_config(github: GitHubApi, pull_number: int, *, log_prefix: str = "") -> ReviewBotConfig:
+    try:
+        head_sha = github.get_pull_head_sha(pull_number)
+        raw_config = github.get_file_text(REVIEWBOT_CONFIG_PATH, ref=head_sha)
+    except RuntimeError as exc:
+        if is_github_not_found_error(exc):
+            log_progress(log_prefix, f"No {REVIEWBOT_CONFIG_PATH} found at PR HEAD; reviewing all patchable files")
+        else:
+            log_progress(log_prefix, f"Could not load {REVIEWBOT_CONFIG_PATH}; reviewing all patchable files: {exc}")
+        return ReviewBotConfig()
+
+    try:
+        config = parse_reviewbot_config(raw_config)
+    except ValueError as exc:
+        log_progress(log_prefix, f"Ignoring invalid {REVIEWBOT_CONFIG_PATH}; reviewing all patchable files: {exc}")
+        return ReviewBotConfig()
+
+    log_progress(
+        log_prefix,
+        f"Loaded {REVIEWBOT_CONFIG_PATH} "
+        f"include={len(config.include)} exclude={len(config.exclude)} always_review={len(config.always_review)}",
+    )
+    return config
+
+
+def normalize_review_path(path: str) -> str:
+    normalized = path.replace("\\", "/").lstrip("/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def split_review_path(path: str) -> list[str]:
+    return [segment for segment in normalize_review_path(path).split("/") if segment]
+
+
+def reviewbot_glob_segments_match(pattern_segments: list[str], path_segments: list[str]) -> bool:
+    memo: dict[tuple[int, int], bool] = {}
+
+    def matches(pattern_index: int, path_index: int) -> bool:
+        key = (pattern_index, path_index)
+        if key in memo:
+            return memo[key]
+
+        if pattern_index == len(pattern_segments):
+            result = path_index == len(path_segments)
+        else:
+            head = pattern_segments[pattern_index]
+            if head == "**":
+                result = matches(pattern_index + 1, path_index) or (
+                    path_index < len(path_segments) and matches(pattern_index, path_index + 1)
+                )
+            elif path_index == len(path_segments):
+                result = False
+            elif not fnmatch.fnmatchcase(path_segments[path_index], head):
+                result = False
+            else:
+                result = matches(pattern_index + 1, path_index + 1)
+
+        memo[key] = result
+        return result
+
+    return matches(0, 0)
+
+
+def reviewbot_glob_matches(pattern: str, path: str) -> bool:
+    return reviewbot_glob_segments_match(split_review_path(pattern), split_review_path(path))
+
+
+def matches_any_reviewbot_pattern(path: str, patterns: tuple[str, ...]) -> bool:
+    return any(reviewbot_glob_matches(pattern, path) for pattern in patterns)
+
+
+def should_review_file(path: str, config: ReviewBotConfig) -> bool:
+    if matches_any_reviewbot_pattern(path, FORCED_ALWAYS_REVIEW_PATTERNS):
+        return True
+    if not config.has_filters:
+        return True
+    if matches_any_reviewbot_pattern(path, config.always_review):
+        return True
+    if config.include and not matches_any_reviewbot_pattern(path, config.include):
+        return False
+    return not matches_any_reviewbot_pattern(path, config.exclude)
+
+
+def filter_reviewbot_files(
+    files: list[PullRequestFile],
+    config: ReviewBotConfig,
+) -> tuple[list[PullRequestFile], int]:
+    if not config.has_filters:
+        return files, 0
+    filtered = [pr_file for pr_file in files if should_review_file(pr_file.filename, config)]
+    return filtered, len(files) - len(filtered)
 
 
 def summarize_comment_bodies(comments: list[ReviewComment], max_items: int = 3) -> list[str]:
@@ -1822,12 +2090,39 @@ def build_review_message(
     return "\n".join(message_lines)
 
 
-def load_patchable_pr_files(github: GitHubApi, pull_number: int, *, log_prefix: str = "") -> list[PullRequestFile]:
+def load_patchable_pr_files_result(
+    github: GitHubApi,
+    pull_number: int,
+    *,
+    log_prefix: str = "",
+) -> PullRequestFileLoadResult:
     log_progress(log_prefix, f"Fetching PR files for {github.repository}#{pull_number}")
     raw_files = github.list_pr_files(pull_number)
     pr_files = build_pr_files(raw_files)
-    log_progress(log_prefix, f"Loaded {len(pr_files)} patchable file(s)")
-    return pr_files
+    if not pr_files:
+        log_progress(log_prefix, "Loaded 0 patchable file(s)")
+        return PullRequestFileLoadResult(files=[], patchable_count=0)
+
+    config = load_reviewbot_config(github, pull_number, log_prefix=log_prefix)
+    filtered_files, skipped_by_reviewbot = filter_reviewbot_files(pr_files, config)
+    if config.loaded:
+        log_progress(
+            log_prefix,
+            f"Loaded {len(filtered_files)} patchable file(s) after {REVIEWBOT_CONFIG_PATH} filters "
+            f"(skipped {skipped_by_reviewbot} of {len(pr_files)})",
+        )
+    else:
+        log_progress(log_prefix, f"Loaded {len(filtered_files)} patchable file(s)")
+    return PullRequestFileLoadResult(
+        files=filtered_files,
+        patchable_count=len(pr_files),
+        skipped_by_reviewbot=skipped_by_reviewbot,
+        reviewbot_config_loaded=config.loaded,
+    )
+
+
+def load_patchable_pr_files(github: GitHubApi, pull_number: int, *, log_prefix: str = "") -> list[PullRequestFile]:
+    return load_patchable_pr_files_result(github, pull_number, log_prefix=log_prefix).files
 
 
 def generate_review_artifacts(
@@ -1911,14 +2206,19 @@ def review_pull_request(
     """PR diff를 수집하고 모델 리뷰를 생성한 뒤 GitHub에 등록한다."""
     started_at = time.monotonic()
     github = GitHubApi(token=token, repository=repository, api_url=api_url)
-    pr_files = load_patchable_pr_files(github, pull_number, log_prefix=log_prefix)
+    file_load_result = load_patchable_pr_files_result(github, pull_number, log_prefix=log_prefix)
+    pr_files = file_load_result.files
 
     if not pr_files:
+        reason = "No patchable files found."
+        if file_load_result.reviewbot_config_loaded and file_load_result.patchable_count > 0:
+            reason = f"No reviewable files after {REVIEWBOT_CONFIG_PATH} filters."
         return {
             "status": "skipped",
-            "reason": "No patchable files found.",
+            "reason": reason,
             "repository": repository,
             "pull_number": pull_number,
+            "skipped_by_reviewbot": file_load_result.skipped_by_reviewbot,
         }
 
     artifacts = generate_review_artifacts(repository, pull_number, pr_files, log_prefix=log_prefix)

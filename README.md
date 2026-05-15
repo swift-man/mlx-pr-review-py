@@ -336,11 +336,70 @@ zsh /Users/runner/pr-review/scripts/send_test_webhook.sh
 2. `X-Hub-Signature-256` 서명 검증
 3. `pull_request` 이벤트와 허용 액션만 통과
 4. GitHub API `pulls/{number}/files`로 파일 목록과 patch 조회
-5. patch를 MLX 프롬프트 JSON으로 직렬화
-6. 공유된 MLX 실행 슬롯을 잡고 모델을 재사용해 JSON 응답 생성
-7. MLX JSON 응답 검증
-8. GitHub Review API payload로 변환
-9. 라인 코멘트와 전체 리뷰를 한 번에 등록
+5. PR HEAD의 `.reviewbot.yml`이 있으면 `include` / `exclude` / `always_review` 규칙으로 리뷰 대상 파일을 필터링
+6. patch를 MLX 프롬프트 JSON으로 직렬화
+7. 공유된 MLX 실행 슬롯을 잡고 모델을 재사용해 JSON 응답 생성
+8. MLX JSON 응답 검증
+9. GitHub Review API payload로 변환
+10. 라인 코멘트와 전체 리뷰를 한 번에 등록
+
+### 9-1. 리뷰 대상 필터 설정
+
+리뷰 대상 저장소 루트에 `.reviewbot.yml`을 두면 불필요한 파일을 프롬프트에서 제외할 수 있습니다. 설정 파일은 최신 PR HEAD 기준으로 읽으며, 파일이 없거나 파싱할 수 없으면 기존처럼 모든 patchable file을 리뷰합니다.
+
+```yaml
+version: 1
+
+review:
+  include:
+    - "**/*.swift"
+    - "Package.swift"
+    - "Project.swift"
+    - "Tuist/**/*.swift"
+    - "**/Info.plist"
+
+  exclude:
+    - "Pods/**"
+    - "Carthage/**"
+    - ".build/**"
+    - "DerivedData/**"
+    - "build/**"
+    - "dist/**"
+    - "node_modules/**"
+    - "vendor/**"
+    - "**/Generated/**"
+    - "**/*.generated.swift"
+    - "**/*.pb.swift"
+    - "**/*.graphql.swift"
+    - "**/*+Generated.swift"
+    - "**/*.xcassets/**"
+    - "**/*.png"
+    - "**/*.jpg"
+    - "**/*.jpeg"
+    - "**/*.gif"
+    - "**/*.webp"
+    - "**/*.pdf"
+    - "**/*.mp4"
+    - "**/*.mov"
+    - "Package.resolved"
+    - "Podfile.lock"
+    - "package-lock.json"
+    - "yarn.lock"
+    - "pnpm-lock.yaml"
+    - "README.md"
+    - "CHANGELOG.md"
+    - "docs/**"
+    - "**/*.md"
+
+  always_review:
+    - ".reviewbot.yml"
+    - "AGENTS.md"
+    - "Package.swift"
+    - "Project.swift"
+    - "Tuist/**/*.swift"
+```
+
+적용 순서는 `always_review`가 최우선이고, 그 다음 `include`, 마지막으로 `exclude`입니다. 예를 들어 `**/*.md`를 제외하더라도 `always_review`에 `AGENTS.md`를 넣으면 해당 파일은 계속 리뷰됩니다. 또한 `.reviewbot.yml`과 `AGENTS.md`는 설정 파일이 실수나 악의로 제외하더라도 diff에 포함되어 있으면 항상 리뷰 대상에 남습니다.
 
 ## 10. CLI 테스트
 
@@ -348,11 +407,12 @@ zsh /Users/runner/pr-review/scripts/send_test_webhook.sh
 
 1. `GITHUB_EVENT_PATH`에서 PR 번호를 읽음
 2. GitHub API `pulls/{number}/files`로 파일 목록과 patch를 읽음
-3. 각 파일의 RIGHT-side comment 가능 라인을 계산함
-4. patch를 MLX 프롬프트 JSON으로 직렬화함
-5. MLX JSON 응답을 검증함
-6. GitHub Review API payload로 변환함
-7. 라인 코멘트와 전체 리뷰를 한 번에 등록함
+3. PR HEAD의 `.reviewbot.yml`이 있으면 리뷰 대상 파일을 필터링함
+4. 각 파일의 RIGHT-side comment 가능 라인을 계산함
+5. patch를 MLX 프롬프트 JSON으로 직렬화함
+6. MLX JSON 응답을 검증함
+7. GitHub Review API payload로 변환함
+8. 라인 코멘트와 전체 리뷰를 한 번에 등록함
 
 ## 11. MLX 어댑터 교체 포인트
 
