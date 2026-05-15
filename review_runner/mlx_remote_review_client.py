@@ -28,6 +28,7 @@ from review_runner.mlx_review_prompt import build_messages
 DEFAULT_GENERATE_URL = "http://127.0.0.1:8002/v1/generate"
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_TIMEOUT_SECONDS = 600.0
+DEFAULT_CLIENT_MAX_BODY_BYTES = 1 * 1024 * 1024
 ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 
 
@@ -196,6 +197,14 @@ def _post_generate(messages: list[dict[str, str]]) -> dict[str, Any]:
     url = _generate_url()
     request_body = _build_request_body(messages)
     encoded = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
+    max_body_bytes = _get_env_int("MLX_GENERATE_CLIENT_MAX_BODY_BYTES", DEFAULT_CLIENT_MAX_BODY_BYTES)
+    if max_body_bytes > 0 and len(encoded) > max_body_bytes:
+        raise RuntimeError(
+            "MLX generate request body is too large "
+            f"({len(encoded)} > {max_body_bytes} bytes). "
+            "Reduce reviewed files with .reviewbot.yml or raise both "
+            "MLX_GENERATE_CLIENT_MAX_BODY_BYTES and the generate server's MLX_HTTP_BODY_MAX_BYTES."
+        )
     timeout = _get_env_float("MLX_GENERATE_TIMEOUT", DEFAULT_TIMEOUT_SECONDS)
     sanitized = _sanitize_url_for_logging(url)
 

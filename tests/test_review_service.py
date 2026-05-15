@@ -639,7 +639,7 @@ review:
         self.assertEqual(result.skipped_by_reviewbot, 2)
         self.assertTrue(result.reviewbot_config_loaded)
 
-    def test_load_patchable_pr_files_result_reviews_all_files_when_config_is_missing(self) -> None:
+    def test_load_patchable_pr_files_result_applies_builtin_generated_excludes_when_config_is_missing(self) -> None:
         case = self
 
         class FakeGitHub:
@@ -657,7 +657,21 @@ review:
                         "patch": "@@ -0,0 +1,1 @@\n+x\n",
                         "additions": 1,
                         "deletions": 0,
-                    }
+                    },
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -0,0 +1,1 @@\n+x\n",
+                        "additions": 1,
+                        "deletions": 0,
+                    },
+                    {
+                        "filename": "LaunchingView.doccarchive/css/topic.css",
+                        "status": "removed",
+                        "patch": "@@ -1,1 +0,0 @@\n-x\n",
+                        "additions": 0,
+                        "deletions": 1,
+                    },
                 ]
 
             def get_pull_head_sha(self, pull_number: int) -> str:
@@ -672,10 +686,59 @@ review:
         result = review_service.load_patchable_pr_files_result(fake_github, 7)
 
         self.assertEqual(fake_github.loaded_paths, [(review_service.REVIEWBOT_CONFIG_PATH, "abc123")])
-        self.assertEqual([pr_file.filename for pr_file in result.files], ["README.md"])
-        self.assertEqual(result.patchable_count, 1)
-        self.assertEqual(result.skipped_by_reviewbot, 0)
+        self.assertEqual([pr_file.filename for pr_file in result.files], ["README.md", "Sources/App.swift"])
+        self.assertEqual(result.patchable_count, 3)
+        self.assertEqual(result.skipped_by_reviewbot, 1)
         self.assertFalse(result.reviewbot_config_loaded)
+        self.assertTrue(result.default_filter_applied)
+
+    def test_explicit_reviewbot_config_can_review_paths_excluded_by_builtin_defaults(self) -> None:
+        raw_config = """
+version: 1
+review:
+  include:
+    - "**/*.doccarchive/**"
+"""
+        case = self
+
+        class FakeGitHub:
+            repository = "swift-man/app"
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 7)
+                return [
+                    {
+                        "filename": "LaunchingView.doccarchive/css/topic.css",
+                        "status": "removed",
+                        "patch": "@@ -1,1 +0,0 @@\n-x\n",
+                        "additions": 0,
+                        "deletions": 1,
+                    },
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -0,0 +1,1 @@\n+x\n",
+                        "additions": 1,
+                        "deletions": 0,
+                    },
+                ]
+
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 7)
+                return "abc123"
+
+            def get_file_text(self, path: str, *, ref: str) -> str:
+                case.assertEqual((path, ref), (review_service.REVIEWBOT_CONFIG_PATH, "abc123"))
+                return raw_config
+
+        result = review_service.load_patchable_pr_files_result(FakeGitHub(), 7)
+
+        self.assertEqual(
+            [pr_file.filename for pr_file in result.files],
+            ["LaunchingView.doccarchive/css/topic.css"],
+        )
+        self.assertTrue(result.reviewbot_config_loaded)
+        self.assertFalse(result.default_filter_applied)
 
 
 class NormalizeSeverityTests(unittest.TestCase):

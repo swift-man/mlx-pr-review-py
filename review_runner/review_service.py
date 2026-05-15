@@ -35,6 +35,42 @@ DEFAULT_NO_FINDINGS_SUMMARY = (
 DEFAULT_FINDINGS_SUMMARY = "자동 리뷰에서 확인이 필요한 변경 사항이 발견되었습니다. 아래 코멘트와 개선점을 확인해 주세요."
 REVIEWBOT_CONFIG_PATH = ".reviewbot.yml"
 FORCED_ALWAYS_REVIEW_PATTERNS = (REVIEWBOT_CONFIG_PATH, "AGENTS.md")
+DEFAULT_REVIEWBOT_EXCLUDE_PATTERNS = (
+    # dependency / build output
+    "Pods/**",
+    "Carthage/**",
+    ".build/**",
+    "DerivedData/**",
+    "build/**",
+    "dist/**",
+    "node_modules/**",
+    "vendor/**",
+    # generated documentation / archives
+    "*.doccarchive/**",
+    "**/*.doccarchive/**",
+    # generated source
+    "**/Generated/**",
+    "**/*.generated.swift",
+    "**/*.pb.swift",
+    "**/*.graphql.swift",
+    "**/*+Generated.swift",
+    # resources and binary artifacts
+    "**/*.xcassets/**",
+    "**/*.png",
+    "**/*.jpg",
+    "**/*.jpeg",
+    "**/*.gif",
+    "**/*.webp",
+    "**/*.pdf",
+    "**/*.mp4",
+    "**/*.mov",
+    # lock files
+    "Package.resolved",
+    "Podfile.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+)
 NO_FINDINGS_SUMMARY_MARKERS = (
     DEFAULT_NO_FINDINGS_SUMMARY,
     "즉시 수정이 필요한 문제는 보이지 않습니다.",
@@ -661,6 +697,7 @@ class PullRequestFileLoadResult:
     patchable_count: int
     skipped_by_reviewbot: int = 0
     reviewbot_config_loaded: bool = False
+    default_filter_applied: bool = False
 
 
 @dataclass
@@ -952,22 +989,35 @@ def is_github_not_found_error(exc: RuntimeError) -> bool:
     return bool(re.search(r"\bfailed:\s*404\b", str(exc)))
 
 
+def default_reviewbot_config() -> ReviewBotConfig:
+    return ReviewBotConfig(exclude=DEFAULT_REVIEWBOT_EXCLUDE_PATTERNS)
+
+
 def load_reviewbot_config(github: GitHubApi, pull_number: int, *, log_prefix: str = "") -> ReviewBotConfig:
     try:
         head_sha = github.get_pull_head_sha(pull_number)
         raw_config = github.get_file_text(REVIEWBOT_CONFIG_PATH, ref=head_sha)
     except RuntimeError as exc:
         if is_github_not_found_error(exc):
-            log_progress(log_prefix, f"No {REVIEWBOT_CONFIG_PATH} found at PR HEAD; reviewing all patchable files")
+            log_progress(
+                log_prefix,
+                f"No {REVIEWBOT_CONFIG_PATH} found at PR HEAD; applying built-in generated-file excludes",
+            )
         else:
-            log_progress(log_prefix, f"Could not load {REVIEWBOT_CONFIG_PATH}; reviewing all patchable files: {exc}")
-        return ReviewBotConfig()
+            log_progress(
+                log_prefix,
+                f"Could not load {REVIEWBOT_CONFIG_PATH}; applying built-in generated-file excludes: {exc}",
+            )
+        return default_reviewbot_config()
 
     try:
         config = parse_reviewbot_config(raw_config)
     except ValueError as exc:
-        log_progress(log_prefix, f"Ignoring invalid {REVIEWBOT_CONFIG_PATH}; reviewing all patchable files: {exc}")
-        return ReviewBotConfig()
+        log_progress(
+            log_prefix,
+            f"Ignoring invalid {REVIEWBOT_CONFIG_PATH}; applying built-in generated-file excludes: {exc}",
+        )
+        return default_reviewbot_config()
 
     log_progress(
         log_prefix,
@@ -2111,6 +2161,12 @@ def load_patchable_pr_files_result(
             f"Loaded {len(filtered_files)} patchable file(s) after {REVIEWBOT_CONFIG_PATH} filters "
             f"(skipped {skipped_by_reviewbot} of {len(pr_files)})",
         )
+    elif skipped_by_reviewbot:
+        log_progress(
+            log_prefix,
+            f"Loaded {len(filtered_files)} patchable file(s) after built-in generated-file filters "
+            f"(skipped {skipped_by_reviewbot} of {len(pr_files)})",
+        )
     else:
         log_progress(log_prefix, f"Loaded {len(filtered_files)} patchable file(s)")
     return PullRequestFileLoadResult(
@@ -2118,6 +2174,7 @@ def load_patchable_pr_files_result(
         patchable_count=len(pr_files),
         skipped_by_reviewbot=skipped_by_reviewbot,
         reviewbot_config_loaded=config.loaded,
+        default_filter_applied=not config.loaded and config.has_filters,
     )
 
 
@@ -2213,6 +2270,8 @@ def review_pull_request(
         reason = "No patchable files found."
         if file_load_result.reviewbot_config_loaded and file_load_result.patchable_count > 0:
             reason = f"No reviewable files after {REVIEWBOT_CONFIG_PATH} filters."
+        elif file_load_result.default_filter_applied and file_load_result.patchable_count > 0:
+            reason = "No reviewable files after built-in generated-file filters."
         return {
             "status": "skipped",
             "reason": reason,

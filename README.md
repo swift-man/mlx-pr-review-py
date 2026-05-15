@@ -85,6 +85,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_GENERATE_URL=http://127.0.0.1:8002/v1/generate` (remote backend용)
 - `MLX_GENERATE_AUTH_TOKEN=...` (옵션, remote generate 서버가 Bearer 인증을 쓸 때)
 - `MLX_GENERATE_TIMEOUT=600` (옵션, remote generate 응답 timeout 초. 초과 시 같은 장기 생성 요청을 재시도하지 않고 명확한 timeout 오류를 남김)
+- `MLX_GENERATE_CLIENT_MAX_BODY_BYTES=1048576` (옵션, remote generate 요청 body 상한. 서버의 `MLX_HTTP_BODY_MAX_BYTES`와 맞춰 설정)
 - `MLX_MODEL=mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` (운영 예시값. local 클라이언트 코드 기본값은 7B)
 - `MLX_DEVICE=cpu` (옵션, Metal 장애 시 fallback. 비워두면 MLX 기본 장치 사용)
 - `GITHUB_API_URL=https://api.github.com` (옵션)
@@ -102,6 +103,9 @@ GitHub App으로 인증하면 리뷰 작성자가 개인 계정이 아니라 App
 재사용하고, 동시 리뷰 요청은 메모리 급증을 막기 위해 한 번에 하나씩 처리합니다.
 `MLX_REVIEW_BACKEND=remote`로 설정하거나 `MLX_GENERATE_URL`만 설정하면 `mlx-final-py`의
 `POST /v1/generate`로 chat messages를 보내고, 웹훅 서버는 `mlx-lm`을 import하지 않습니다.
+remote backend 요청 body가 `MLX_GENERATE_CLIENT_MAX_BODY_BYTES`를 넘으면 큰 diff를 전송하다
+`Broken pipe`로 실패하기 전에 명확한 오류를 남깁니다. 큰 PR은 대상 저장소의 `.reviewbot.yml`
+또는 내장 generated-file 필터로 빌드 산출물과 생성 문서를 제외하는 쪽을 우선합니다.
 실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client` 같은 커스텀 커맨드로 바꿔서 테스트할 수 있습니다.
 
 매번 `export`를 다시 입력하기 귀찮다면 `/Users/runner/pr-review/scripts/local_review_env.example.sh`를

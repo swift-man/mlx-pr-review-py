@@ -19,6 +19,7 @@ _REMOTE_ENV_KEYS = (
     "MLX_GENERATE_URL",
     "MLX_GENERATE_AUTH_TOKEN",
     "MLX_GENERATE_TIMEOUT",
+    "MLX_GENERATE_CLIENT_MAX_BODY_BYTES",
     "MLX_MAX_TOKENS",
     "MLX_TEMPERATURE",
     "MLX_TOP_P",
@@ -262,6 +263,19 @@ class PostGenerateTests(unittest.TestCase):
         self.assertNotIn("user:pw", msg)
         self.assertNotIn("token=abc", msg)
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_request_body_too_large_raises_before_opening_connection(self) -> None:
+        urlopen = mock.MagicMock()
+
+        with self._patch_env(MLX_GENERATE_CLIENT_MAX_BODY_BYTES="10"), \
+             mock.patch("urllib.request.urlopen", urlopen):
+            with self.assertRaises(RuntimeError) as ctx:
+                client._post_generate([{"role": "user", "content": "x" * 100}])
+
+        msg = str(ctx.exception)
+        self.assertIn("request body is too large", msg)
+        self.assertIn(".reviewbot.yml", msg)
+        urlopen.assert_not_called()
 
     def test_read_timeout_raises_without_retry_with_sanitized_url(self) -> None:
         response = mock.MagicMock()

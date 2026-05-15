@@ -39,6 +39,8 @@ export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
 # export MLX_GENERATE_AUTH_TOKEN=replace-me
 # 응답 timeout (초). 초과하면 같은 장기 생성 요청을 다시 보내지 않고 timeout 으로 실패 처리한다 (default 600).
 # export MLX_GENERATE_TIMEOUT=600
+# 요청 body 상한 (bytes). mlx-final-py 의 MLX_HTTP_BODY_MAX_BYTES 와 맞춰서 올리세요.
+# export MLX_GENERATE_CLIENT_MAX_BODY_BYTES=1048576
 
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
