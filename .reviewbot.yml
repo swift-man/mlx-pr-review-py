@@ -1,0 +1,51 @@
+version: 1
+
+review:
+  include:
+    - "**/*.py"
+    - "review_runner/requirements.txt"
+    - "scripts/**/*.sh"
+    - "deploy/**/*.conf"
+    - "tests/fixtures/**"
+    - "README.md"
+    - "AGENTS.md"
+    - ".reviewbot.yml"
+
+  exclude:
+    # local/editor noise
+    - ".DS_Store"
+    - "**/.DS_Store"
+    - ".idea/**"
+    - ".vscode/**"
+
+    # Python cache / virtualenv
+    - "__pycache__/**"
+    - "**/__pycache__/**"
+    - "**/*.pyc"
+    - ".venv/**"
+    - "venv/**"
+    - "env/**"
+
+    # test / coverage output
+    - ".pytest_cache/**"
+    - ".mypy_cache/**"
+    - ".ruff_cache/**"
+    - ".coverage"
+    - "htmlcov/**"
+
+    # package / build output
+    - "build/**"
+    - "dist/**"
+    - "*.egg-info/**"
+
+    # generated or large runtime logs
+    - "logs/**"
+    - "**/*.log"
+
+  always_review:
+    - ".reviewbot.yml"
+    - "AGENTS.md"
+    - "README.md"
+    - "review_runner/review_service.py"
+    - "review_runner/webhook_app.py"
+    - "review_runner/mlx_review_client.py"
