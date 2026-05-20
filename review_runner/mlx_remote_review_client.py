@@ -27,7 +27,7 @@ from review_runner.mlx_review_prompt import build_messages
 
 DEFAULT_GENERATE_URL = "http://127.0.0.1:8002/v1/generate"
 DEFAULT_MAX_TOKENS = 900
-DEFAULT_TIMEOUT_SECONDS = 600.0
+DEFAULT_TIMEOUT_SECONDS = 240.0
 DEFAULT_CLIENT_MAX_BODY_BYTES = 1 * 1024 * 1024
 ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 

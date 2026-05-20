@@ -35,7 +35,7 @@ def get_env_bool(name: str, default: bool = False) -> bool:
 
 def get_env_int(name: str, default: int) -> int:
     raw_value = os.environ.get(name)
-    if raw_value is None:
+    if raw_value is None or raw_value.strip() == "":
         return default
     try:
         return int(raw_value)
@@ -45,7 +45,7 @@ def get_env_int(name: str, default: int) -> int:
 
 def get_env_float(name: str, default: float) -> float:
     raw_value = os.environ.get(name)
-    if raw_value is None:
+    if raw_value is None or raw_value.strip() == "":
         return default
     try:
         return float(raw_value)

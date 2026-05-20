@@ -189,6 +189,15 @@ class PostGenerateTests(unittest.TestCase):
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual(body["max_tokens"], 900)
 
+    def test_default_timeout_is_bounded_for_webhook_runtime(self) -> None:
+        response = _make_response({"ok": True, "text": "ok", "model": "mock"})
+        urlopen = mock.MagicMock(return_value=response)
+
+        with self._patch_env(), mock.patch("urllib.request.urlopen", urlopen):
+            client._post_generate(self.messages)
+
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 240.0)
+
     def test_http_4xx_raises_immediately_no_retry(self) -> None:
         body = b'{"ok":false,"error":"bad request"}'
         http_exc = urllib.error.HTTPError(
