@@ -7,6 +7,11 @@ from unittest import mock
 from review_runner import mlx_review_client
 
 
+class MlxReviewClientDefaultsTests(unittest.TestCase):
+    def test_default_max_tokens_is_bounded_for_webhook_runtime(self) -> None:
+        self.assertEqual(mlx_review_client.DEFAULT_MAX_TOKENS, 900)
+
+
 class MlxReviewClientDeviceTests(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.pop("MLX_DEVICE", None)
