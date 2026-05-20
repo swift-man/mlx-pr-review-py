@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.swiftman.pr-review</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/runner/pr-review/scripts/run_webhook_server.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/runner/pr-review</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LOCAL_REVIEW_HOME</key>
+    <string>/Users/runner/pr-review</string>
+    <key>LOCAL_REVIEW_ENV_FILE</key>
+    <string>/Users/runner/pr-review/scripts/local_review_env.sh</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/mlx-pr-review-webhook.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/mlx-pr-review-webhook.err.log</string>
+</dict>
+</plist>

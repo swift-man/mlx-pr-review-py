@@ -84,12 +84,12 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_REVIEW_BACKEND=local` 또는 `remote` (옵션, 기본값은 `local`)
 - `MLX_GENERATE_URL=http://127.0.0.1:8002/v1/generate` (remote backend용)
 - `MLX_GENERATE_AUTH_TOKEN=...` (옵션, remote generate 서버가 Bearer 인증을 쓸 때)
-- `MLX_GENERATE_TIMEOUT=600` (옵션, remote generate 응답 timeout 초. 초과 시 같은 장기 생성 요청을 재시도하지 않고 명확한 timeout 오류를 남김)
+- `MLX_GENERATE_TIMEOUT=240` (옵션, remote generate 응답 timeout 초. 초과 시 같은 장기 생성 요청을 재시도하지 않고 명확한 timeout 오류를 남김)
 - `MLX_GENERATE_CLIENT_MAX_BODY_BYTES=1048576` (옵션, remote generate 요청 body 상한. 서버의 `MLX_HTTP_BODY_MAX_BYTES`와 맞춰 설정)
 - `MLX_MODEL=mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` (운영 예시값. local 클라이언트 코드 기본값은 7B)
 - `MLX_DEVICE=cpu` (옵션, Metal 장애 시 fallback. 비워두면 MLX 기본 장치 사용)
 - `GITHUB_API_URL=https://api.github.com` (옵션)
-- `MLX_MAX_TOKENS=1200` (옵션)
+- `MLX_MAX_TOKENS=900` (옵션, webhook 리뷰가 MLX generate를 오래 점유하지 않도록 운영 예시는 보수적인 상한을 권장)
 - `MLX_MAX_FINDINGS=10` (옵션)
 - `MLX_TRUST_REMOTE_CODE=0` (옵션)
 - `DRY_RUN=1` (옵션, 실제 GitHub 리뷰를 남기지 않고 흐름만 확인할 때)
@@ -243,6 +243,37 @@ zsh /Users/runner/pr-review/scripts/run_webhook_server.sh
 ```
 
 운영 중 실제 리뷰를 남길 때는 마지막 시작 전에 `unset DRY_RUN`만 하면 됩니다.
+
+### LaunchAgent로 상시 실행
+
+터미널에서 `nohup ... &`로 띄운 프로세스는 세션 종료나 프로세스 그룹 정리에 같이 내려갈 수 있습니다.
+운영에서는 LaunchAgent로 webhook 서버와 remote MLX generate 서버를 유지하는 편이 안전합니다.
+
+기본 템플릿은 `/Users/runner` 경로를 기준으로 합니다. 다른 계정이나 설치 경로를 쓰면 plist 안의
+`/Users/runner/pr-review`, `/Users/runner/mlx-final-py` 값을 실제 경로로 바꾼 뒤 설치하세요.
+
+```bash
+mkdir -p ~/Library/LaunchAgents
+
+cp deploy/launchagents/com.swiftman.pr-review.plist ~/Library/LaunchAgents/
+cp deploy/launchagents/com.swiftman.mlx-final-text.plist ~/Library/LaunchAgents/
+
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.swiftman.pr-review.plist 2>/dev/null || true
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.swiftman.mlx-final-text.plist 2>/dev/null || true
+
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.swiftman.mlx-final-text.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.swiftman.pr-review.plist
+
+curl http://127.0.0.1:8002/healthz
+curl http://127.0.0.1:8000/healthz
+```
+
+로그는 아래 파일에서 확인합니다.
+
+```bash
+tail -f /tmp/mlx-final-text.log /tmp/mlx-final-text.err.log
+tail -f /tmp/mlx-pr-review-webhook.log /tmp/mlx-pr-review-webhook.err.log
+```
 
 ## 7. 수동 웹훅 테스트 완전판
 
