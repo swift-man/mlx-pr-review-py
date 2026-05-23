@@ -426,8 +426,9 @@ class ReviewNormalizationTests(unittest.TestCase):
             lines,
         )
         self.assertIn(
-            "[delivery=test] Comment validation accepted_model_comments=1/3 rule_based_added=0 "
-            "rule_based_duplicates=0 dropped_after_validation=path_mismatch=1, style_or_praise_only=1",
+            "[delivery=test] Comment validation accepted_model_comments=1/3 accepted_top_level_findings=0/0 "
+            "rule_based_added=0 rule_based_duplicates=0 "
+            "dropped_after_validation=path_mismatch=1, style_or_praise_only=1 dropped_top_level=none",
             lines,
         )
         self.assertEqual(len(validated.comments), 1)
@@ -1667,6 +1668,55 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         self.assertEqual(validated.suggestions, [])
         self.assertEqual(validated.event, "APPROVE")
 
+    def test_line_anchored_top_level_must_fix_is_recovered_as_comment(self) -> None:
+        # 모델이 comments[] 형식을 놓쳐도 path:line + 표준 finding 본문이 있으면
+        # 검증 가능한 실제 버그 신호로 복구한다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [
+                    (
+                        "fortune/service.py:1 Problem: status 키가 `staus`로 잘못 반환됩니다. "
+                        "Why it matters: 기존 클라이언트가 status 필드를 찾지 못해 실패합니다. "
+                        "Suggested fix: 응답 키를 `status`로 되돌리세요. Confidence: High"
+                    )
+                ],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        comment = validated.comments[0]
+        self.assertEqual(comment.path, "fortune/service.py")
+        self.assertEqual(comment.line, 1)
+        self.assertEqual(comment.severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(comment.confidence, 0.9)
+        self.assertEqual(validated.must_fix, ["status 키가 `staus`로 잘못 반환됩니다."])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_top_level_finding_without_valid_line_anchor_is_still_ignored(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "must_fix": [
+                    (
+                        "fortune/service.py:999 Problem: 잘못된 라인입니다. "
+                        "Why it matters: GitHub 코멘트 등록이 실패합니다. "
+                        "Suggested fix: 실제 diff 라인을 사용하세요. Confidence: High"
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(stats.accepted_top_level_findings, 0)
+        self.assertEqual(stats.dropped_top_level_finding_reasons, {"invalid_right_side_line": 1})
+
     def test_legacy_concerns_without_risk_marker_are_ignored(self) -> None:
         # 낮은 위험의 legacy concern 도 라인 근거가 없으면 COMMENT 로 남기지 않는다.
         validated = review_service.validate_mlx_output(
@@ -1923,6 +1973,20 @@ class BuildReviewPayloadTests(unittest.TestCase):
         self.assertNotIn("### 반드시 수정할 사항", body)
         self.assertIn("### 권장 개선사항", body)
         self.assertIn("### 개선된 점", body)
+
+    def test_body_omits_positive_section_when_no_specific_positives(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="APPROVE",
+            comments=[],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+        )
+
+        body = payload["body"]
+        self.assertNotIn("### 개선된 점", body)
+        self.assertIn("### 라인 단위 코멘트", body)
 
 
 if __name__ == "__main__":

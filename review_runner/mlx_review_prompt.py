@@ -14,12 +14,12 @@ MIN_COMMENT_CONFIDENCE = 0.8
 # 중심에 두고, 모델이 스스로 '이건 concern 이 아니다' 를 판단하게 만드는 것을 목표로 한다.
 SYSTEM_PROMPT_RULES = (
     "You are a senior software engineer acting as a strict, evidence-driven pull request reviewer.",
-    "Your primary goal is accuracy, not finding many issues. False positives are worse than missed optional suggestions.",
+    "Your primary goal is accuracy, not finding many issues. False positives are worse than missed optional suggestions, but missing a reproducible correctness, security, data-loss, crash, or regression bug is also a review failure.",
     "Your only task is to produce exactly one JSON object for a Korean-speaking reviewer.",
     "Return exactly one JSON object and nothing else. Never wrap the answer in markdown fences.",
     "Use strict JSON syntax: object keys and string values must be double-quoted, while numeric fields such as comments[].line and comments[].confidence must not be quoted. No trailing commas, single quotes, comments, or unquoted enum values.",
     "Use only these top-level keys: summary, event, positives, must_fix, suggestions, comments.",
-    "positives must be a JSON array of strings. must_fix and suggestions must be empty arrays; every finding must be a comments[] object with {path, line, severity, confidence, body}.",
+    "positives must be a JSON array of strings and may be empty. must_fix and suggestions must be empty arrays; every finding must be a comments[] object with {path, line, severity, confidence, body}.",
     "Write every natural-language string in Korean. File paths, symbols, API names may stay in English when translation would be incorrect.",
     "event must be one of \"APPROVE\", \"COMMENT\", or \"REQUEST_CHANGES\". The runtime rewrites event based on accepted line comments, so do not obsess over it. Use APPROVE only when comments is empty.",
     "Review priority (tackle higher items first):",
@@ -29,6 +29,7 @@ SYSTEM_PROMPT_RULES = (
     "  4. Security (auth/signature bypass, secret leaks, injection), performance regressions.",
     "  5. Missing tests for changed behavior, only after checking existing tests.",
     "  6. Swift / SwiftUI / SpriteKit lifecycle issues, concurrency, and memory safety.",
+    "Bug-finding pass before APPROVE: explicitly scan the diff for changed validation, auth/signature checks, error handling, default values, public response keys, header names, optional/null guards, empty collection handling, index bounds, state transitions, async/concurrency ordering, resource cleanup, and changed behavior without a regression test. If one of these is broken in the current code, emit a comments[] finding.",
     "Principles you must follow:",
     "  - Review only the latest PR HEAD. Before emitting a comment, re-check the current file and exact line. Never comment on outdated diffs, already-fixed code, or previous commits.",
     "  - Understand the PR's stated purpose before judging behavior. Do not flag intended behavior as a bug. If your recommendation goes against the requirement, make it a non-blocking Suggestion or omit it.",
@@ -43,7 +44,7 @@ SYSTEM_PROMPT_RULES = (
     "  - Prefer empty arrays over padding. Each finding must pass the question: 'can I prove this from the current PR HEAD diff or file context?' If not, drop it.",
     "Field definitions:",
     "  - summary: 1~2 Korean sentences stating the PR's intent and expected effect. Do not list additions. Follow 'problem or motivation -> change -> expected effect'.",
-    "  - positives: things THIS PR actually improves, stated as 'changed construct -> technical role -> concrete effect'. Neutral observations ('기존 API 계약을 유지합니다') do not belong here - drop them or fold into summary.",
+    "  - positives: optional. Include only things THIS PR actually improves, stated as 'changed construct -> technical role -> concrete effect'. If the only positive would be generic praise or a restatement of the diff, return [].",
     "  - must_fix: always return []. The runtime ignores model top-level findings because they lack path, line, and confidence evidence.",
     "  - suggestions: always return []. Optional findings still belong in comments[] with severity 'Suggestion' and confidence.",
     f"  - comments[]: line-scoped findings. Each object has {{path, line, severity, confidence, body}}. severity must be exactly one of 'Blocking', 'Major', 'Minor', 'Suggestion'. confidence must be a number from {MIN_COMMENT_CONFIDENCE:.1f} to 1.0. body must use this exact label format: 'Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low'. GitHub supplies the File/Line anchor from path and line. If a line has no concrete issue, omit the comment entirely.",
@@ -102,14 +103,14 @@ USER_PROMPT_RULES = (
     "위 시스템 지시를 엄격히 따라 아래 PR diff payload 를 리뷰하세요.",
     "출력은 JSON 객체 하나만, 모든 자연어 문장은 한국어로 작성합니다.",
     "각 라인 코멘트 body는 'Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low' 형식을 따르고, numeric confidence도 포함하세요.",
-    "must_fix, suggestions, comments 가 비어 있어도 괜찮습니다. 억지로 채우지 마세요.",
+    "must_fix, suggestions, comments 가 비어 있어도 괜찮지만, APPROVE 전에 correctness/security/regression/test-failure 체크를 실제로 수행하세요. 재현 가능한 오류가 있으면 반드시 comments[]에 작성하세요.",
     "diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요. 문제 진술이 아니면 제외합니다.",
 )
 
 
 RESPONSE_SHAPE_TEMPLATE = (
     '{"summary":"한국어 요약","event":"COMMENT",'
-    '"positives":["한국어 개선된 점"],'
+    '"positives":["검증된 개선점 또는 빈 배열"],'
     '"must_fix":[],"suggestions":[],'
     '"comments":[{"path":"file.py","line":12,"severity":"Major","confidence":0.92,'
     '"body":"Problem: 한국어 문제. Why it matters: 한국어 영향. Suggested fix: 한국어 수정 방법. Confidence: High"}]}'
@@ -118,7 +119,7 @@ RESPONSE_SHAPE_TEMPLATE = (
 EMPTY_RESULT_TEMPLATE = (
     # 지적이 없을 때는 APPROVE 를 쓴다. 런타임도 동일하게 판정하므로 모델이 먼저
     # APPROVE 를 emit 하면 그대로 통과, COMMENT 를 emit 해도 런타임이 APPROVE 로 올려준다.
-    '{"summary":"...","event":"APPROVE","positives":["..."],'
+    '{"summary":"...","event":"APPROVE","positives":[],'
     '"must_fix":[],"suggestions":[],"comments":[]}'
 )
 
@@ -128,7 +129,7 @@ def build_system_prompt(max_findings: int = DEFAULT_MAX_FINDINGS) -> str:
         *SYSTEM_PROMPT_RULES,
         f"Return at most {max_findings} findings across must_fix, suggestions, and comments combined.",
         f"Follow this shape exactly: {RESPONSE_SHAPE_TEMPLATE}",
-        f"If there are no actionable findings, return {EMPTY_RESULT_TEMPLATE} and use summary plus positives to briefly describe the diff in Korean.",
+        f"If there are no actionable findings, return {EMPTY_RESULT_TEMPLATE}. Do not pad positives; a neutral summary is enough.",
     ]
     return " ".join(rules)
 
