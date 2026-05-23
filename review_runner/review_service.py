@@ -645,14 +645,13 @@ def extract_finding_problem(body: str) -> str:
     return normalize_text(body_match.group("problem"))
 
 
-def extract_finding_confidence_score(body: str) -> float | None:
+def confidence_score_for_label(label: str | None) -> float | None:
     """본문 Confidence 라벨을 보수적인 numeric score 로 변환한다.
 
     top-level finding 복구 경로는 모델이 별도 numeric confidence 필드를 제공하지
     못하는 경우가 많다. 그래도 High 라벨과 line anchor 가 모두 있으면 0.9 로
     보수적으로 흡수하고, Medium/Low 는 기존 0.8 gate 를 넘지 못하게 둔다.
     """
-    label = extract_confidence_label(body)
     if label == "high":
         return 0.9
     if label == "medium":
@@ -1425,7 +1424,7 @@ def collect_line_anchored_top_level_findings(
                 increment_reason(stats.dropped_top_level_finding_reasons, "invalid_confidence_label")
                 continue
 
-            confidence = extract_finding_confidence_score(body)
+            confidence = confidence_score_for_label(confidence_label)
             if confidence is None or confidence < MIN_MODEL_COMMENT_CONFIDENCE:
                 increment_reason(stats.dropped_top_level_finding_reasons, "low_confidence")
                 continue
