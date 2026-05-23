@@ -1708,7 +1708,7 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
                 "positives": [],
                 "must_fix": [
                     (
-                        "fortune/service.py:1 [Major] Problem: status 키가 `staus`로 잘못 반환됩니다. "
+                        "fortune/service.py:1 [Major] - Problem: status 키가 `staus`로 잘못 반환됩니다. "
                         "Why it matters: 기존 클라이언트가 status 필드를 찾지 못해 실패합니다. "
                         "Suggested fix: 응답 키를 `status`로 되돌리세요. Confidence: High"
                     )
