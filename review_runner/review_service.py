@@ -1427,9 +1427,6 @@ def collect_line_anchored_top_level_findings(
                 continue
 
             severity = extract_top_level_finding_severity(raw_item, default_severity)
-            if severity in BLOCKING_SEVERITIES and confidence_label != "high":
-                increment_reason(stats.dropped_top_level_finding_reasons, "blocking_without_high_confidence")
-                continue
 
             key = (pr_file.filename, line, body)
             if key in seen_comment_keys:
