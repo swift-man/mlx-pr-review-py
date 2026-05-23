@@ -34,6 +34,8 @@ DEFAULT_NO_FINDINGS_SUMMARY = (
 )
 DEFAULT_FINDINGS_SUMMARY = "자동 리뷰에서 확인이 필요한 변경 사항이 발견되었습니다. 아래 코멘트와 개선점을 확인해 주세요."
 REVIEWBOT_CONFIG_PATH = ".reviewbot.yml"
+DEFAULT_MAX_MODEL_FINDINGS = 10
+MAX_MODEL_FINDINGS_ENV = "MLX_MAX_FINDINGS"
 FORCED_ALWAYS_REVIEW_PATTERNS = (REVIEWBOT_CONFIG_PATH, "AGENTS.md")
 DEFAULT_REVIEWBOT_EXCLUDE_PATTERNS = (
     # dependency / build output
@@ -1375,6 +1377,8 @@ def collect_line_anchored_top_level_findings(
     files: list[PullRequestFile],
     seen_comment_keys: set[tuple[str, int, str]],
     stats: CommentValidationStats,
+    *,
+    max_model_findings: int,
 ) -> list[ReviewComment]:
     """comments[] 형식에서 벗어난 실제 오류를 좁은 조건으로 라인 코멘트로 복구한다.
 
@@ -1431,6 +1435,9 @@ def collect_line_anchored_top_level_findings(
             key = (pr_file.filename, line, body)
             if key in seen_comment_keys:
                 increment_reason(stats.dropped_top_level_finding_reasons, "duplicate_top_level_finding")
+                continue
+            if model_finding_limit_reached(stats, max_model_findings):
+                increment_reason(stats.dropped_top_level_finding_reasons, "max_findings_exceeded")
                 continue
 
             seen_comment_keys.add(key)
@@ -1855,9 +1862,28 @@ def log_comment_validation_stats(stats: CommentValidationStats, log_prefix: str)
     )
 
 
+def configured_max_model_findings() -> int:
+    """서비스 검증 단계에서 허용할 모델 finding 총량을 읽는다."""
+    raw_value = os.environ.get(MAX_MODEL_FINDINGS_ENV)
+    if raw_value is None:
+        return DEFAULT_MAX_MODEL_FINDINGS
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return DEFAULT_MAX_MODEL_FINDINGS
+    return max(1, value)
+
+
+def model_finding_limit_reached(stats: CommentValidationStats, max_model_findings: int) -> bool:
+    """comments[]와 top-level 복구 finding이 공유하는 모델 finding 상한을 확인한다."""
+    return stats.accepted_model_comments + stats.accepted_top_level_findings >= max_model_findings
+
+
 def collect_validated_comments(
     result: dict[str, Any],
     files: list[PullRequestFile],
+    *,
+    max_model_findings: int | None = None,
 ) -> tuple[list[ReviewComment], CommentValidationStats]:
     """모델 코멘트와 규칙 기반 코멘트를 합치고 중복을 제거한다."""
     file_index = {f.filename: f for f in files}
@@ -1865,6 +1891,7 @@ def collect_validated_comments(
     seen_comment_keys: set[tuple[str, int, str]] = set()
     raw_comments = result.get("comments", [])
     stats = CommentValidationStats(raw_model_comments=len(raw_comments) if isinstance(raw_comments, list) else 0)
+    max_model_findings = max_model_findings or configured_max_model_findings()
 
     for raw in raw_comments if isinstance(raw_comments, list) else []:
         if not isinstance(raw, dict):
@@ -1919,6 +1946,9 @@ def collect_validated_comments(
         if key in seen_comment_keys:
             increment_reason(stats.dropped_model_comment_reasons, "duplicate_model_comment")
             continue
+        if model_finding_limit_reached(stats, max_model_findings):
+            increment_reason(stats.dropped_model_comment_reasons, "max_findings_exceeded")
+            continue
         seen_comment_keys.add(key)
         # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
         # 잘못된 Blocking 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
@@ -1927,7 +1957,15 @@ def collect_validated_comments(
         comments.append(ReviewComment(path=path, line=line, body=body, severity=severity, confidence=confidence))
         stats.accepted_model_comments += 1
 
-    comments.extend(collect_line_anchored_top_level_findings(result, files, seen_comment_keys, stats))
+    comments.extend(
+        collect_line_anchored_top_level_findings(
+            result,
+            files,
+            seen_comment_keys,
+            stats,
+            max_model_findings=max_model_findings,
+        )
+    )
 
     for comment in detect_rule_based_comments(files):
         key = (comment.path, comment.line, comment.body)

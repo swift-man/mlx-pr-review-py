@@ -1727,6 +1727,63 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         self.assertEqual(comment.body.split(" ", 1)[0], "Problem:")
         self.assertEqual(validated.event, "REQUEST_CHANGES")
 
+    def test_top_level_recovery_shares_model_finding_limit(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="fortune/service.py",
+            status="modified",
+            patch="@@ -0,0 +1,12 @@\n" + "\n".join(f"+x{i} = {i}" for i in range(1, 13)),
+            additions=12,
+            deletions=0,
+            right_side_lines=set(range(1, 13)),
+        )
+        top_level_findings = [
+            (
+                f"fortune/service.py:{line} Problem: 공개 응답 키 {line}이 잘못되었습니다. "
+                "Why it matters: 기존 클라이언트가 응답을 파싱하지 못합니다. "
+                "Suggested fix: 기존 응답 키로 되돌리세요. Confidence: High"
+            )
+            for line in range(3, 13)
+        ]
+
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": _finding_body(
+                            problem="첫 번째 오류입니다.",
+                            why="사용자 요청이 실패합니다.",
+                            fix="첫 번째 오류를 처리하세요.",
+                            confidence="High",
+                        ),
+                    },
+                    {
+                        "path": "fortune/service.py",
+                        "line": 2,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": _finding_body(
+                            problem="두 번째 오류입니다.",
+                            why="사용자 요청이 실패합니다.",
+                            fix="두 번째 오류를 처리하세요.",
+                            confidence="High",
+                        ),
+                    },
+                ],
+                "must_fix": top_level_findings,
+            },
+            [pr_file],
+            max_model_findings=5,
+        )
+
+        self.assertEqual(len(comments), 5)
+        self.assertEqual(stats.accepted_model_comments, 2)
+        self.assertEqual(stats.accepted_top_level_findings, 3)
+        self.assertEqual(stats.dropped_top_level_finding_reasons, {"max_findings_exceeded": 7})
+
     def test_top_level_finding_without_valid_line_anchor_is_still_ignored(self) -> None:
         comments, stats = review_service.collect_validated_comments(
             {
