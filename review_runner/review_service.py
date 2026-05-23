@@ -1333,7 +1333,7 @@ def strip_top_level_finding_anchor(text: str, path: str, line: int) -> str:
         + re.escape(path)
         + r":"
         + str(line)
-        + r"\s*(?:[-–—|:]\s*)?",
+        + r"\s*(?:[-–—|:]\s*)?(?:\[(?:Blocking|Critical|Major|Minor|Suggestion)\]\s*)?",
         re.IGNORECASE,
     )
     return normalize_text(prefix_re.sub("", text, count=1))

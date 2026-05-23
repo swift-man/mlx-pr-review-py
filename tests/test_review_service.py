@@ -1698,6 +1698,35 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         self.assertEqual(validated.must_fix, ["status 키가 `staus`로 잘못 반환됩니다."])
         self.assertEqual(validated.event, "REQUEST_CHANGES")
 
+    def test_line_anchored_top_level_finding_strips_post_anchor_severity(self) -> None:
+        # 모델이 ``path:line [Major] Problem: ...``처럼 등급을 line anchor 뒤에
+        # 붙여도 본문 검증은 표준 Problem 섹션부터 시작해야 한다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [
+                    (
+                        "fortune/service.py:1 [Major] Problem: status 키가 `staus`로 잘못 반환됩니다. "
+                        "Why it matters: 기존 클라이언트가 status 필드를 찾지 못해 실패합니다. "
+                        "Suggested fix: 응답 키를 `status`로 되돌리세요. Confidence: High"
+                    )
+                ],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        comment = validated.comments[0]
+        self.assertEqual(comment.path, "fortune/service.py")
+        self.assertEqual(comment.line, 1)
+        self.assertEqual(comment.severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(comment.body.split(" ", 1)[0], "Problem:")
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
     def test_top_level_finding_without_valid_line_anchor_is_still_ignored(self) -> None:
         comments, stats = review_service.collect_validated_comments(
             {
