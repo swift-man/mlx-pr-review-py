@@ -949,6 +949,31 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
         self.assertEqual(comments, [])
         self.assertEqual(stats.dropped_model_comment_reasons, {"invalid_confidence_label": 1})
 
+    def test_model_comment_accepts_trailing_punctuation_in_confidence_label(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": _finding_body(
+                            problem="잘못된 상태입니다.",
+                            why="요청이 실패합니다.",
+                            fix="검증을 추가하세요.",
+                            confidence="High.",
+                        ),
+                    }
+                ]
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(review_service.extract_confidence_label(comments[0].body), "high")
+        self.assertEqual(stats.dropped_model_comment_reasons, {})
+
     def test_model_comment_with_confidence_phrase_before_final_section_is_dropped(self) -> None:
         comments, stats = review_service.collect_validated_comments(
             {
@@ -1725,6 +1750,34 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         self.assertEqual(comment.line, 1)
         self.assertEqual(comment.severity, review_service.SEVERITY_MAJOR)
         self.assertEqual(comment.body.split(" ", 1)[0], "Problem:")
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_line_anchored_top_level_finding_accepts_trailing_confidence_punctuation(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [
+                    (
+                        "fortune/service.py:1 "
+                        + _finding_body(
+                            problem="status 키가 `staus`로 잘못 반환됩니다.",
+                            why="기존 클라이언트가 status 필드를 찾지 못해 실패합니다.",
+                            fix="응답 키를 `status`로 되돌리세요.",
+                            confidence="High.",
+                        )
+                    )
+                ],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].confidence, 0.9)
+        self.assertEqual(validated.must_fix, ["status 키가 `staus`로 잘못 반환됩니다."])
         self.assertEqual(validated.event, "REQUEST_CHANGES")
 
     def test_line_anchored_legacy_concern_defaults_to_minor_without_risk_marker(self) -> None:

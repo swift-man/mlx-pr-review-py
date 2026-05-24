@@ -648,7 +648,8 @@ def extract_confidence_label(body: str) -> str | None:
     body_match = FINDING_BODY_RE.match(body)
     if body_match is None:
         return None
-    label_match = CONFIDENCE_LABEL_RE.match(body_match.group("confidence").strip())
+    label = body_match.group("confidence").strip().rstrip(NARRATION_TRAILING_PUNCTUATION).strip()
+    label_match = CONFIDENCE_LABEL_RE.match(label)
     if label_match is None:
         return None
     return label_match.group(1).lower()
