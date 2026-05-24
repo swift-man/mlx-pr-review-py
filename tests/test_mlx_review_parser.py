@@ -68,11 +68,25 @@ class MlxReviewParserTests(unittest.TestCase):
         self.assertEqual(metadata["parse_mode"], "fallback_response")
         self.assertIn("did not contain a JSON object", metadata["parse_error"])
         self.assertEqual(normalized["summary"], mlx_review_parser.DEFAULT_SUMMARY)
-        self.assertEqual(normalized["positives"], mlx_review_parser.DEFAULT_POSITIVES)
+        self.assertEqual(normalized["positives"], [])
         self.assertEqual(normalized["must_fix"], [])
         self.assertEqual(normalized["suggestions"], [])
         self.assertEqual(normalized["legacy_concerns"], [])
         self.assertEqual(normalized["comments"], [])
+
+    def test_salvage_without_positive_section_keeps_empty_positives(self) -> None:
+        raw_output = """
+        summary: 인증 흐름을 검토했습니다.
+        concerns:
+        - fortune/service.py:1 Problem: 인증 우회 위험이 있습니다. Why it matters: 보호된 요청이 통과할 수 있습니다. Suggested fix: 서명 검증을 유지하세요. Confidence: High
+        event: COMMENT
+        """
+
+        normalized, metadata = mlx_review_parser.parse_and_normalize_model_output(raw_output)
+
+        self.assertEqual(metadata["parse_mode"], "salvaged_output")
+        self.assertEqual(normalized["positives"], [])
+        self.assertEqual(len(normalized["legacy_concerns"]), 1)
 
 
 class MlxReviewParserSeverityTests(unittest.TestCase):
@@ -162,6 +176,7 @@ class MlxReviewParserSeverityTests(unittest.TestCase):
 
         self.assertEqual(metadata["parse_mode"], "repaired_json")
         self.assertEqual(normalized["event"], "APPROVE")
+        self.assertEqual(normalized["positives"], [])
         self.assertEqual(normalized["comments"], [])
 
     def test_parse_and_normalize_carries_severity_end_to_end(self) -> None:

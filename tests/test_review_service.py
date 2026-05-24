@@ -1727,6 +1727,86 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         self.assertEqual(comment.body.split(" ", 1)[0], "Problem:")
         self.assertEqual(validated.event, "REQUEST_CHANGES")
 
+    def test_line_anchored_legacy_concern_defaults_to_minor_without_risk_marker(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "네이밍을 검토했습니다.",
+                "event": "REQUEST_CHANGES",
+                "positives": [],
+                "concerns": [
+                    (
+                        "fortune/service.py:1 "
+                        + _finding_body(
+                            problem="네이밍이 모호합니다.",
+                            why="반복 수정 때 코드 이해가 느려집니다.",
+                            fix="역할이 드러나는 이름으로 바꾸세요.",
+                        )
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        comment = validated.comments[0]
+        self.assertEqual(comment.severity, review_service.SEVERITY_MINOR)
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.suggestions, ["네이밍이 모호합니다."])
+        self.assertEqual(validated.event, "COMMENT")
+
+    def test_line_anchored_legacy_concern_honors_explicit_major_severity(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "네이밍을 검토했습니다.",
+                "event": "APPROVE",
+                "positives": [],
+                "legacy_concerns": [
+                    (
+                        "fortune/service.py:1 [Major] "
+                        + _finding_body(
+                            problem="네이밍이 모호합니다.",
+                            why="반복 수정 때 코드 이해가 느려집니다.",
+                            fix="역할이 드러나는 이름으로 바꾸세요.",
+                        )
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(validated.must_fix, ["네이밍이 모호합니다."])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_line_anchored_legacy_concern_promotes_only_strong_risk_marker(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "인증 흐름을 검토했습니다.",
+                "event": "APPROVE",
+                "positives": [],
+                "concerns": [
+                    (
+                        "fortune/service.py:1 "
+                        + _finding_body(
+                            problem="인증 우회 위험이 있습니다.",
+                            why="보호된 요청이 검증 없이 통과할 수 있습니다.",
+                            fix="서명 검증 guard 를 유지하세요.",
+                        )
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(validated.must_fix, ["인증 우회 위험이 있습니다."])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
     def test_top_level_recovery_shares_model_finding_limit(self) -> None:
         pr_file = review_service.PullRequestFile(
             filename="fortune/service.py",

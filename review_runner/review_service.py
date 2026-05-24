@@ -204,6 +204,23 @@ CONCERN_RISK_MARKERS = (
     "깨짐",
     "깨지",
 )
+CONCERN_BLOCKING_PROMOTION_MARKERS = (
+    "위험",
+    "누락",
+    "실패",
+    "버그",
+    "우회",
+    "취약",
+    "오류",
+    "에러",
+    "결함",
+    "크래시",
+    "빠져",
+    "놓치",
+    "깨짐",
+    "깨지",
+)
+LINE_ANCHORED_LEGACY_CONCERN_FIELDS = frozenset({"legacy_concerns", "concerns"})
 
 _MLX_RUN_LOCK = threading.Lock()
 
@@ -1356,8 +1373,8 @@ def extract_top_level_finding_anchor(
     return None
 
 
-def extract_top_level_finding_severity(text: str, default: str) -> str:
-    """top-level finding 에 명시된 severity 라벨을 읽고 없으면 bucket 기본값을 쓴다."""
+def extract_explicit_top_level_finding_severity(text: str) -> str | None:
+    """top-level finding 텍스트에 명시된 severity 라벨만 읽는다."""
     normalized = normalize_text(text)
     bracket_match = re.search(r"\[(Blocking|Critical|Major|Minor|Suggestion)\]", normalized, re.IGNORECASE)
     if bracket_match is not None:
@@ -1369,6 +1386,33 @@ def extract_top_level_finding_severity(text: str, default: str) -> str:
     )
     if field_match is not None:
         return normalize_severity(field_match.group(1))
+    return None
+
+
+def has_blocking_concern_marker(body: str) -> bool:
+    """legacy concern 본문의 Problem 섹션이 차단성 위험 신호를 담고 있는지 확인한다."""
+    problem = extract_finding_problem(body)
+    return any(marker in problem for marker in CONCERN_BLOCKING_PROMOTION_MARKERS)
+
+
+def extract_top_level_finding_severity(
+    text: str,
+    default: str,
+    *,
+    field_name: str | None = None,
+    body: str = "",
+) -> str:
+    """top-level finding severity 를 보수적으로 결정한다.
+
+    legacy concerns 계열은 구 스키마라 차단성 여부를 명확히 전달하지 못한다. 따라서
+    명시 severity 가 없으면 기본 Minor 로 두고, Problem 섹션에 강한 위험 신호가
+    있을 때만 Major 로 올린다.
+    """
+    explicit = extract_explicit_top_level_finding_severity(text)
+    if explicit is not None:
+        return explicit
+    if field_name in LINE_ANCHORED_LEGACY_CONCERN_FIELDS and has_blocking_concern_marker(body):
+        return SEVERITY_MAJOR
     return default
 
 
@@ -1392,8 +1436,8 @@ def collect_line_anchored_top_level_findings(
     buckets = (
         ("must_fix", SEVERITY_MAJOR),
         ("suggestions", SEVERITY_MINOR),
-        ("legacy_concerns", SEVERITY_MAJOR),
-        ("concerns", SEVERITY_MAJOR),
+        ("legacy_concerns", SEVERITY_MINOR),
+        ("concerns", SEVERITY_MINOR),
     )
 
     for field_name, default_severity in buckets:
@@ -1430,7 +1474,12 @@ def collect_line_anchored_top_level_findings(
                 increment_reason(stats.dropped_top_level_finding_reasons, "low_confidence")
                 continue
 
-            severity = extract_top_level_finding_severity(raw_item, default_severity)
+            severity = extract_top_level_finding_severity(
+                raw_item,
+                default_severity,
+                field_name=field_name,
+                body=body,
+            )
 
             key = (pr_file.filename, line, body)
             if key in seen_comment_keys:

@@ -9,9 +9,6 @@ from typing import Any
 
 
 DEFAULT_SUMMARY = "즉시 수정이 필요한 문제는 보이지 않습니다. 변경 범위가 명확하고 전체 흐름도 비교적 잘 드러납니다."
-DEFAULT_POSITIVES = [
-    "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
-]
 DEFAULT_PARSE_ERROR_SNIPPET = 2000
 DEFAULT_MAX_FINDINGS = 10
 MAX_SALVAGE_ITEMS = 5
@@ -334,12 +331,12 @@ def extract_freeform_summary(text: str) -> str:
 
 
 def fallback_response() -> dict[str, Any]:
-    # 파싱이 완전히 실패했을 때 GitHub 리뷰가 비어 보이지 않도록 최소 구조만 채운다.
+    # 파싱이 완전히 실패했을 때도 검증하지 않은 긍정 문구는 주입하지 않는다.
     # must_fix 와 suggestions 는 기본적으로 비어 있고 legacy_concerns 도 비워 둔다.
     return {
         "summary": DEFAULT_SUMMARY,
         "event": "COMMENT",
-        "positives": list(DEFAULT_POSITIVES),
+        "positives": [],
         "must_fix": [],
         "suggestions": [],
         "legacy_concerns": [],
@@ -406,7 +403,7 @@ def salvage_broken_output(text: str) -> dict[str, Any] | None:
     return {
         "summary": summary,
         "event": event,
-        "positives": positives or list(DEFAULT_POSITIVES),
+        "positives": positives,
         "must_fix": must_fix,
         "suggestions": suggestions,
         "legacy_concerns": legacy_concerns,
@@ -550,7 +547,7 @@ def normalize_response(raw_response: dict[str, Any], *, max_findings: int) -> tu
     normalized_response = {
         "summary": summary,
         "event": event,
-        "positives": positives or list(DEFAULT_POSITIVES),
+        "positives": positives,
         "must_fix": must_fix,
         "suggestions": suggestions,
         "legacy_concerns": legacy_concerns,
