@@ -86,12 +86,14 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("senior software engineer acting as a strict, evidence-driven", system_prompt)
         self.assertIn("accuracy, not finding many issues", system_prompt)
         self.assertIn("False positives are worse", system_prompt)
+        self.assertIn("missing a reproducible correctness", system_prompt)
 
         # 우선순위 리스트 (1~6번이 명시되는지)
         self.assertIn("Review priority", system_prompt)
         self.assertIn("Bugs, missing exception handling", system_prompt)
         self.assertIn("Concurrency, thread-safety", system_prompt)
         self.assertIn("Security", system_prompt)
+        self.assertIn("Bug-finding pass before APPROVE", system_prompt)
 
         # 새 스키마 키 계약
         self.assertIn("summary, event, positives, must_fix, suggestions, comments", system_prompt)
@@ -109,7 +111,11 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 필드 정의가 line-scoped finding 계약을 명시하는지
         self.assertIn("must_fix: always return []", system_prompt)
         self.assertIn("suggestions: always return []", system_prompt)
-        self.assertIn("positives: things THIS PR actually improves", system_prompt)
+        self.assertIn(
+            "positives: optional. Include only things THIS PR actually improves",
+            system_prompt,
+        )
+        self.assertIn("positives must be a JSON array of strings and may be empty", system_prompt)
 
         # event 규칙이 runtime 강제 안내를 포함
         self.assertIn("runtime rewrites event based on accepted line comments", system_prompt)
@@ -121,6 +127,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
 
         # 스키마 예시와 빈 결과 예시가 새 키로 갱신됐는지
         self.assertIn('"must_fix":[],"suggestions":[]', system_prompt)
+        self.assertIn('"event":"APPROVE","positives":[]', system_prompt)
 
         # 라인 코멘트 severity 4단계 정의가 프롬프트에 노출되는지
         self.assertIn("Severity levels for comments", system_prompt)
@@ -197,7 +204,7 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)
         self.assertIn("Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low", user_prompt)
-        self.assertIn("must_fix, suggestions, comments 가 비어 있어도 괜찮습니다", user_prompt)
+        self.assertIn("APPROVE 전에 correctness/security/regression/test-failure 체크", user_prompt)
         self.assertIn("diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요", user_prompt)
 
 

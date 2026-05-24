@@ -34,6 +34,8 @@ DEFAULT_NO_FINDINGS_SUMMARY = (
 )
 DEFAULT_FINDINGS_SUMMARY = "자동 리뷰에서 확인이 필요한 변경 사항이 발견되었습니다. 아래 코멘트와 개선점을 확인해 주세요."
 REVIEWBOT_CONFIG_PATH = ".reviewbot.yml"
+DEFAULT_MAX_MODEL_FINDINGS = 10
+MAX_MODEL_FINDINGS_ENV = "MLX_MAX_FINDINGS"
 FORCED_ALWAYS_REVIEW_PATTERNS = (REVIEWBOT_CONFIG_PATH, "AGENTS.md")
 DEFAULT_REVIEWBOT_EXCLUDE_PATTERNS = (
     # dependency / build output
@@ -202,6 +204,23 @@ CONCERN_RISK_MARKERS = (
     "깨짐",
     "깨지",
 )
+CONCERN_BLOCKING_PROMOTION_MARKERS = (
+    "위험",
+    "누락",
+    "실패",
+    "버그",
+    "우회",
+    "취약",
+    "오류",
+    "에러",
+    "결함",
+    "크래시",
+    "빠져",
+    "놓치",
+    "깨짐",
+    "깨지",
+)
+LINE_ANCHORED_LEGACY_CONCERN_FIELDS = frozenset({"legacy_concerns", "concerns"})
 
 _MLX_RUN_LOCK = threading.Lock()
 
@@ -629,7 +648,8 @@ def extract_confidence_label(body: str) -> str | None:
     body_match = FINDING_BODY_RE.match(body)
     if body_match is None:
         return None
-    label_match = CONFIDENCE_LABEL_RE.match(body_match.group("confidence").strip())
+    label = body_match.group("confidence").strip().rstrip(NARRATION_TRAILING_PUNCTUATION).strip()
+    label_match = CONFIDENCE_LABEL_RE.match(label)
     if label_match is None:
         return None
     return label_match.group(1).lower()
@@ -641,6 +661,22 @@ def extract_finding_problem(body: str) -> str:
     if body_match is None:
         return normalize_text(body)
     return normalize_text(body_match.group("problem"))
+
+
+def confidence_score_for_label(label: str | None) -> float | None:
+    """본문 Confidence 라벨을 보수적인 numeric score 로 변환한다.
+
+    top-level finding 복구 경로는 모델이 별도 numeric confidence 필드를 제공하지
+    못하는 경우가 많다. 그래도 High 라벨과 line anchor 가 모두 있으면 0.9 로
+    보수적으로 흡수하고, Medium/Low 는 기존 0.8 gate 를 넘지 못하게 둔다.
+    """
+    if label == "high":
+        return 0.9
+    if label == "medium":
+        return 0.7
+    if label == "low":
+        return 0.5
+    return None
 
 
 def format_finding_body(
@@ -723,6 +759,9 @@ class CommentValidationStats:
     raw_model_comments: int = 0
     accepted_model_comments: int = 0
     dropped_model_comment_reasons: dict[str, int] = field(default_factory=dict)
+    raw_top_level_findings: int = 0
+    accepted_top_level_findings: int = 0
+    dropped_top_level_finding_reasons: dict[str, int] = field(default_factory=dict)
     rule_based_added: int = 0
     rule_based_duplicates: int = 0
 
@@ -1306,6 +1345,166 @@ def detect_rule_based_comments(files: list[PullRequestFile]) -> list[ReviewComme
     return comments
 
 
+def strip_top_level_finding_anchor(text: str, path: str, line: int) -> str:
+    """``path:line`` 으로 시작하는 top-level finding 에서 라인 anchor 를 제거한다."""
+    prefix_re = re.compile(
+        r"^\s*(?:[-*]\s*)?(?:\[(?:Blocking|Critical|Major|Minor|Suggestion)\]\s*)?"
+        + re.escape(path)
+        + r":"
+        + str(line)
+        + r"\s*(?:[-–—|:]\s*)?(?:\[(?:Blocking|Critical|Major|Minor|Suggestion)\]\s*)?"
+        + r"(?:[-–—|:]\s*)?",
+        re.IGNORECASE,
+    )
+    return normalize_text(prefix_re.sub("", text, count=1))
+
+
+def extract_top_level_finding_anchor(
+    text: str,
+    file_index: dict[str, PullRequestFile],
+) -> tuple[PullRequestFile, int] | None:
+    """top-level finding 텍스트에서 현재 PR의 정확한 ``path:line`` anchor 를 찾는다."""
+    normalized = normalize_text(text)
+    for path, pr_file in sorted(file_index.items(), key=lambda item: len(item[0]), reverse=True):
+        match = re.search(rf"(?<![\w./-]){re.escape(path)}:(\d+)(?!\d)", normalized)
+        if match is None:
+            continue
+        line = int(match.group(1))
+        return pr_file, line
+    return None
+
+
+def extract_explicit_top_level_finding_severity(text: str) -> str | None:
+    """top-level finding 텍스트에 명시된 severity 라벨만 읽는다."""
+    normalized = normalize_text(text)
+    bracket_match = re.search(r"\[(Blocking|Critical|Major|Minor|Suggestion)\]", normalized, re.IGNORECASE)
+    if bracket_match is not None:
+        return normalize_severity(bracket_match.group(1))
+    field_match = re.search(
+        r"(?:severity|심각도)\s*[:=]\s*(Blocking|Critical|Major|Minor|Suggestion)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if field_match is not None:
+        return normalize_severity(field_match.group(1))
+    return None
+
+
+def has_blocking_concern_marker(body: str) -> bool:
+    """legacy concern 본문의 Problem 섹션이 차단성 위험 신호를 담고 있는지 확인한다."""
+    problem = extract_finding_problem(body)
+    return any(marker in problem for marker in CONCERN_BLOCKING_PROMOTION_MARKERS)
+
+
+def extract_top_level_finding_severity(
+    text: str,
+    default: str,
+    *,
+    field_name: str | None = None,
+    body: str = "",
+) -> str:
+    """top-level finding severity 를 보수적으로 결정한다.
+
+    legacy concerns 계열은 구 스키마라 차단성 여부를 명확히 전달하지 못한다. 따라서
+    명시 severity 가 없으면 기본 Minor 로 두고, Problem 섹션에 강한 위험 신호가
+    있을 때만 Major 로 올린다.
+    """
+    explicit = extract_explicit_top_level_finding_severity(text)
+    if explicit is not None:
+        return explicit
+    if field_name in LINE_ANCHORED_LEGACY_CONCERN_FIELDS and has_blocking_concern_marker(body):
+        return SEVERITY_MAJOR
+    return default
+
+
+def collect_line_anchored_top_level_findings(
+    result: dict[str, Any],
+    files: list[PullRequestFile],
+    seen_comment_keys: set[tuple[str, int, str]],
+    stats: CommentValidationStats,
+    *,
+    max_model_findings: int,
+) -> list[ReviewComment]:
+    """comments[] 형식에서 벗어난 실제 오류를 좁은 조건으로 라인 코멘트로 복구한다.
+
+    허용 조건은 일부러 빡빡하다: 현재 PR 파일의 정확한 ``path:line`` 이 있어야 하고,
+    그 line 이 GitHub RIGHT-side comment line 이어야 하며, 본문은 표준
+    Problem/Why/Suggested fix/Confidence 형식을 만족해야 한다. 이 조건을 통과한
+    항목만 복구하므로 top-level 자유문장 환각은 계속 버린다.
+    """
+    file_index = {f.filename: f for f in files}
+    recovered: list[ReviewComment] = []
+    buckets = (
+        ("must_fix", SEVERITY_MAJOR),
+        ("suggestions", SEVERITY_MINOR),
+        ("legacy_concerns", SEVERITY_MINOR),
+        ("concerns", SEVERITY_MINOR),
+    )
+
+    for field_name, default_severity in buckets:
+        for raw_item in normalize_text_list(result.get(field_name), max_items=10):
+            stats.raw_top_level_findings += 1
+            anchor = extract_top_level_finding_anchor(raw_item, file_index)
+            if anchor is None:
+                increment_reason(stats.dropped_top_level_finding_reasons, "missing_line_anchor")
+                continue
+
+            pr_file, line = anchor
+            if line not in pr_file.right_side_lines:
+                increment_reason(stats.dropped_top_level_finding_reasons, "invalid_right_side_line")
+                continue
+
+            body = strip_top_level_finding_anchor(raw_item, pr_file.filename, line)
+            if not body:
+                increment_reason(stats.dropped_top_level_finding_reasons, "empty_body")
+                continue
+            if looks_like_praise_only_comment(extract_finding_problem(body)):
+                increment_reason(stats.dropped_top_level_finding_reasons, "style_or_praise_only")
+                continue
+            if not has_required_finding_sections(body):
+                increment_reason(stats.dropped_top_level_finding_reasons, "missing_required_finding_sections")
+                continue
+
+            confidence_label = extract_confidence_label(body)
+            if confidence_label is None:
+                increment_reason(stats.dropped_top_level_finding_reasons, "invalid_confidence_label")
+                continue
+
+            confidence = confidence_score_for_label(confidence_label)
+            if confidence is None or confidence < MIN_MODEL_COMMENT_CONFIDENCE:
+                increment_reason(stats.dropped_top_level_finding_reasons, "low_confidence")
+                continue
+
+            severity = extract_top_level_finding_severity(
+                raw_item,
+                default_severity,
+                field_name=field_name,
+                body=body,
+            )
+
+            key = (pr_file.filename, line, body)
+            if key in seen_comment_keys:
+                increment_reason(stats.dropped_top_level_finding_reasons, "duplicate_top_level_finding")
+                continue
+            if model_finding_limit_reached(stats, max_model_findings):
+                increment_reason(stats.dropped_top_level_finding_reasons, "max_findings_exceeded")
+                continue
+
+            seen_comment_keys.add(key)
+            recovered.append(
+                ReviewComment(
+                    path=pr_file.filename,
+                    line=line,
+                    body=body,
+                    severity=severity,
+                    confidence=confidence,
+                )
+            )
+            stats.accepted_top_level_findings += 1
+
+    return recovered
+
+
 def is_placeholder_summary(summary: str) -> bool:
     normalized = normalize_text(summary)
     return not normalized or normalized in {
@@ -1472,8 +1671,8 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
             ],
             "summary_rules": [
                 "summary는 전체 변경을 한두 문장으로 요약하세요.",
-                "positives에는 좋은 점을 1~3개 정도 작성하세요.",
-                "문제가 없더라도 positives는 반드시 1개 이상 작성하세요.",
+                "positives에는 실제 기술적 개선점이 있을 때만 0~2개 작성하세요.",
+                "문제가 없더라도 positives를 억지로 채우지 마세요. 중립 summary만으로 충분합니다.",
                 "라인 코멘트와 summary 내용은 diff에 근거해야 합니다.",
                 "파일별 추가/삭제/변경 개수나 line 번호를 summary에 나열하지 마세요.",
             ],
@@ -1705,15 +1904,36 @@ def log_comment_validation_stats(stats: CommentValidationStats, log_prefix: str)
         log_prefix,
         "Comment validation "
         f"accepted_model_comments={stats.accepted_model_comments}/{stats.raw_model_comments} "
+        f"accepted_top_level_findings={stats.accepted_top_level_findings}/{stats.raw_top_level_findings} "
         f"rule_based_added={stats.rule_based_added} "
         f"rule_based_duplicates={stats.rule_based_duplicates} "
-        f"dropped_after_validation={format_reason_counts(stats.dropped_model_comment_reasons)}",
+        f"dropped_after_validation={format_reason_counts(stats.dropped_model_comment_reasons)} "
+        f"dropped_top_level={format_reason_counts(stats.dropped_top_level_finding_reasons)}",
     )
+
+
+def configured_max_model_findings() -> int:
+    """서비스 검증 단계에서 허용할 모델 finding 총량을 읽는다."""
+    raw_value = os.environ.get(MAX_MODEL_FINDINGS_ENV)
+    if raw_value is None:
+        return DEFAULT_MAX_MODEL_FINDINGS
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return DEFAULT_MAX_MODEL_FINDINGS
+    return max(1, value)
+
+
+def model_finding_limit_reached(stats: CommentValidationStats, max_model_findings: int) -> bool:
+    """comments[]와 top-level 복구 finding이 공유하는 모델 finding 상한을 확인한다."""
+    return stats.accepted_model_comments + stats.accepted_top_level_findings >= max_model_findings
 
 
 def collect_validated_comments(
     result: dict[str, Any],
     files: list[PullRequestFile],
+    *,
+    max_model_findings: int | None = None,
 ) -> tuple[list[ReviewComment], CommentValidationStats]:
     """모델 코멘트와 규칙 기반 코멘트를 합치고 중복을 제거한다."""
     file_index = {f.filename: f for f in files}
@@ -1721,6 +1941,7 @@ def collect_validated_comments(
     seen_comment_keys: set[tuple[str, int, str]] = set()
     raw_comments = result.get("comments", [])
     stats = CommentValidationStats(raw_model_comments=len(raw_comments) if isinstance(raw_comments, list) else 0)
+    max_model_findings = max_model_findings or configured_max_model_findings()
 
     for raw in raw_comments if isinstance(raw_comments, list) else []:
         if not isinstance(raw, dict):
@@ -1775,6 +1996,9 @@ def collect_validated_comments(
         if key in seen_comment_keys:
             increment_reason(stats.dropped_model_comment_reasons, "duplicate_model_comment")
             continue
+        if model_finding_limit_reached(stats, max_model_findings):
+            increment_reason(stats.dropped_model_comment_reasons, "max_findings_exceeded")
+            continue
         seen_comment_keys.add(key)
         # 모델이 severity 를 생략하거나 이상한 값을 실어도 Minor 로 폴백해
         # 잘못된 Blocking 승격으로 REQUEST_CHANGES 가 과발동하지 않도록 한다.
@@ -1782,6 +2006,16 @@ def collect_validated_comments(
         # 가 이미 위에서 코멘트를 drop 하므로 별도 severity 강등 단계는 두지 않는다.
         comments.append(ReviewComment(path=path, line=line, body=body, severity=severity, confidence=confidence))
         stats.accepted_model_comments += 1
+
+    comments.extend(
+        collect_line_anchored_top_level_findings(
+            result,
+            files,
+            seen_comment_keys,
+            stats,
+            max_model_findings=max_model_findings,
+        )
+    )
 
     for comment in detect_rule_based_comments(files):
         key = (comment.path, comment.line, comment.body)
@@ -1930,7 +2164,8 @@ def validate_mlx_output(
     if log_prefix and (raw_must_fix or raw_suggestions or raw_legacy_concerns):
         log_progress(
             log_prefix,
-            "Ignoring model top-level finding buckets without line confidence "
+            "Ignoring model top-level finding buckets as standalone items; "
+            "line-anchored high-confidence entries may already be recovered as comments "
             f"must_fix={len(raw_must_fix)} suggestions={len(raw_suggestions)} "
             f"legacy_concerns={len(raw_legacy_concerns)}",
         )
@@ -1973,12 +2208,8 @@ def validate_mlx_output(
 
     if not has_findings:
         summary = sanitize_summary(summary, has_findings=False)
-        if not positives:
-            positives = list(DEFAULT_FALLBACK_POSITIVES)
     else:
         summary = sanitize_summary(summary, has_findings=True)
-        if not positives:
-            positives = ["핵심 변경 의도가 diff 안에서 비교적 명확하게 드러납니다."]
 
     return ValidatedReview(
         comments=comments,
@@ -2031,9 +2262,9 @@ def build_review_payload(
         body_lines.extend(["", "### 권장 개선사항"])
         body_lines.extend(f"- {item}" for item in suggestions)
 
-    positive_items = positives or list(DEFAULT_FALLBACK_POSITIVES)
-    body_lines.extend(["", "### 개선된 점"])
-    body_lines.extend(f"- {item}" for item in positive_items)
+    if positives:
+        body_lines.extend(["", "### 개선된 점"])
+        body_lines.extend(f"- {item}" for item in positives)
 
     body_lines.extend(["", "### 라인 단위 코멘트"])
     if comments:

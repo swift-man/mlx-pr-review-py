@@ -426,8 +426,9 @@ class ReviewNormalizationTests(unittest.TestCase):
             lines,
         )
         self.assertIn(
-            "[delivery=test] Comment validation accepted_model_comments=1/3 rule_based_added=0 "
-            "rule_based_duplicates=0 dropped_after_validation=path_mismatch=1, style_or_praise_only=1",
+            "[delivery=test] Comment validation accepted_model_comments=1/3 accepted_top_level_findings=0/0 "
+            "rule_based_added=0 rule_based_duplicates=0 "
+            "dropped_after_validation=path_mismatch=1, style_or_praise_only=1 dropped_top_level=none",
             lines,
         )
         self.assertEqual(len(validated.comments), 1)
@@ -947,6 +948,31 @@ class SeverityRoutingAndRenderingTests(unittest.TestCase):
 
         self.assertEqual(comments, [])
         self.assertEqual(stats.dropped_model_comment_reasons, {"invalid_confidence_label": 1})
+
+    def test_model_comment_accepts_trailing_punctuation_in_confidence_label(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": _finding_body(
+                            problem="잘못된 상태입니다.",
+                            why="요청이 실패합니다.",
+                            fix="검증을 추가하세요.",
+                            confidence="High.",
+                        ),
+                    }
+                ]
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(review_service.extract_confidence_label(comments[0].body), "high")
+        self.assertEqual(stats.dropped_model_comment_reasons, {})
 
     def test_model_comment_with_confidence_phrase_before_final_section_is_dropped(self) -> None:
         comments, stats = review_service.collect_validated_comments(
@@ -1667,6 +1693,249 @@ class ValidateMlxOutputMustFixRoutingTests(unittest.TestCase):
         self.assertEqual(validated.suggestions, [])
         self.assertEqual(validated.event, "APPROVE")
 
+    def test_line_anchored_top_level_must_fix_is_recovered_as_comment(self) -> None:
+        # 모델이 comments[] 형식을 놓쳐도 path:line + 표준 finding 본문이 있으면
+        # 검증 가능한 실제 버그 신호로 복구한다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [
+                    (
+                        "fortune/service.py:1 Problem: status 키가 `staus`로 잘못 반환됩니다. "
+                        "Why it matters: 기존 클라이언트가 status 필드를 찾지 못해 실패합니다. "
+                        "Suggested fix: 응답 키를 `status`로 되돌리세요. Confidence: High"
+                    )
+                ],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        comment = validated.comments[0]
+        self.assertEqual(comment.path, "fortune/service.py")
+        self.assertEqual(comment.line, 1)
+        self.assertEqual(comment.severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(comment.confidence, 0.9)
+        self.assertEqual(validated.must_fix, ["status 키가 `staus`로 잘못 반환됩니다."])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_line_anchored_top_level_finding_strips_post_anchor_severity(self) -> None:
+        # 모델이 ``path:line [Major] Problem: ...``처럼 등급을 line anchor 뒤에
+        # 붙여도 본문 검증은 표준 Problem 섹션부터 시작해야 한다.
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [
+                    (
+                        "fortune/service.py:1 [Major] - Problem: status 키가 `staus`로 잘못 반환됩니다. "
+                        "Why it matters: 기존 클라이언트가 status 필드를 찾지 못해 실패합니다. "
+                        "Suggested fix: 응답 키를 `status`로 되돌리세요. Confidence: High"
+                    )
+                ],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        comment = validated.comments[0]
+        self.assertEqual(comment.path, "fortune/service.py")
+        self.assertEqual(comment.line, 1)
+        self.assertEqual(comment.severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(comment.body.split(" ", 1)[0], "Problem:")
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_line_anchored_top_level_finding_accepts_trailing_confidence_punctuation(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "응답 처리 변경.",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [
+                    (
+                        "fortune/service.py:1 "
+                        + _finding_body(
+                            problem="status 키가 `staus`로 잘못 반환됩니다.",
+                            why="기존 클라이언트가 status 필드를 찾지 못해 실패합니다.",
+                            fix="응답 키를 `status`로 되돌리세요.",
+                            confidence="High.",
+                        )
+                    )
+                ],
+                "suggestions": [],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].confidence, 0.9)
+        self.assertEqual(validated.must_fix, ["status 키가 `staus`로 잘못 반환됩니다."])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_line_anchored_legacy_concern_defaults_to_minor_without_risk_marker(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "네이밍을 검토했습니다.",
+                "event": "REQUEST_CHANGES",
+                "positives": [],
+                "concerns": [
+                    (
+                        "fortune/service.py:1 "
+                        + _finding_body(
+                            problem="네이밍이 모호합니다.",
+                            why="반복 수정 때 코드 이해가 느려집니다.",
+                            fix="역할이 드러나는 이름으로 바꾸세요.",
+                        )
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        comment = validated.comments[0]
+        self.assertEqual(comment.severity, review_service.SEVERITY_MINOR)
+        self.assertEqual(validated.must_fix, [])
+        self.assertEqual(validated.suggestions, ["네이밍이 모호합니다."])
+        self.assertEqual(validated.event, "COMMENT")
+
+    def test_line_anchored_legacy_concern_honors_explicit_major_severity(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "네이밍을 검토했습니다.",
+                "event": "APPROVE",
+                "positives": [],
+                "legacy_concerns": [
+                    (
+                        "fortune/service.py:1 [Major] "
+                        + _finding_body(
+                            problem="네이밍이 모호합니다.",
+                            why="반복 수정 때 코드 이해가 느려집니다.",
+                            fix="역할이 드러나는 이름으로 바꾸세요.",
+                        )
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(validated.must_fix, ["네이밍이 모호합니다."])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_line_anchored_legacy_concern_promotes_only_strong_risk_marker(self) -> None:
+        validated = review_service.validate_mlx_output(
+            {
+                "summary": "인증 흐름을 검토했습니다.",
+                "event": "APPROVE",
+                "positives": [],
+                "concerns": [
+                    (
+                        "fortune/service.py:1 "
+                        + _finding_body(
+                            problem="인증 우회 위험이 있습니다.",
+                            why="보호된 요청이 검증 없이 통과할 수 있습니다.",
+                            fix="서명 검증 guard 를 유지하세요.",
+                        )
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(len(validated.comments), 1)
+        self.assertEqual(validated.comments[0].severity, review_service.SEVERITY_MAJOR)
+        self.assertEqual(validated.must_fix, ["인증 우회 위험이 있습니다."])
+        self.assertEqual(validated.event, "REQUEST_CHANGES")
+
+    def test_top_level_recovery_shares_model_finding_limit(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="fortune/service.py",
+            status="modified",
+            patch="@@ -0,0 +1,12 @@\n" + "\n".join(f"+x{i} = {i}" for i in range(1, 13)),
+            additions=12,
+            deletions=0,
+            right_side_lines=set(range(1, 13)),
+        )
+        top_level_findings = [
+            (
+                f"fortune/service.py:{line} Problem: 공개 응답 키 {line}이 잘못되었습니다. "
+                "Why it matters: 기존 클라이언트가 응답을 파싱하지 못합니다. "
+                "Suggested fix: 기존 응답 키로 되돌리세요. Confidence: High"
+            )
+            for line in range(3, 13)
+        ]
+
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "comments": [
+                    {
+                        "path": "fortune/service.py",
+                        "line": 1,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": _finding_body(
+                            problem="첫 번째 오류입니다.",
+                            why="사용자 요청이 실패합니다.",
+                            fix="첫 번째 오류를 처리하세요.",
+                            confidence="High",
+                        ),
+                    },
+                    {
+                        "path": "fortune/service.py",
+                        "line": 2,
+                        "severity": "Major",
+                        "confidence": 0.95,
+                        "body": _finding_body(
+                            problem="두 번째 오류입니다.",
+                            why="사용자 요청이 실패합니다.",
+                            fix="두 번째 오류를 처리하세요.",
+                            confidence="High",
+                        ),
+                    },
+                ],
+                "must_fix": top_level_findings,
+            },
+            [pr_file],
+            max_model_findings=5,
+        )
+
+        self.assertEqual(len(comments), 5)
+        self.assertEqual(stats.accepted_model_comments, 2)
+        self.assertEqual(stats.accepted_top_level_findings, 3)
+        self.assertEqual(stats.dropped_top_level_finding_reasons, {"max_findings_exceeded": 7})
+
+    def test_top_level_finding_without_valid_line_anchor_is_still_ignored(self) -> None:
+        comments, stats = review_service.collect_validated_comments(
+            {
+                "must_fix": [
+                    (
+                        "fortune/service.py:999 Problem: 잘못된 라인입니다. "
+                        "Why it matters: GitHub 코멘트 등록이 실패합니다. "
+                        "Suggested fix: 실제 diff 라인을 사용하세요. Confidence: High"
+                    )
+                ],
+                "comments": [],
+            },
+            [self._make_pr_file()],
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(stats.accepted_top_level_findings, 0)
+        self.assertEqual(stats.dropped_top_level_finding_reasons, {"invalid_right_side_line": 1})
+
     def test_legacy_concerns_without_risk_marker_are_ignored(self) -> None:
         # 낮은 위험의 legacy concern 도 라인 근거가 없으면 COMMENT 로 남기지 않는다.
         validated = review_service.validate_mlx_output(
@@ -1923,6 +2192,20 @@ class BuildReviewPayloadTests(unittest.TestCase):
         self.assertNotIn("### 반드시 수정할 사항", body)
         self.assertIn("### 권장 개선사항", body)
         self.assertIn("### 개선된 점", body)
+
+    def test_body_omits_positive_section_when_no_specific_positives(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="APPROVE",
+            comments=[],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+        )
+
+        body = payload["body"]
+        self.assertNotIn("### 개선된 점", body)
+        self.assertIn("### 라인 단위 코멘트", body)
 
 
 if __name__ == "__main__":
