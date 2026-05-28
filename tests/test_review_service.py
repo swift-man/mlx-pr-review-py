@@ -828,6 +828,7 @@ class ExistingReviewContextTests(unittest.TestCase):
         rules = prompt["instructions"]["existing_review_context_rules"]
         self.assertTrue(any("false positive" in rule for rule in rules))
         self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
+        self.assertTrue(any("Copilot" in rule and "중복" in rule for rule in rules))
 
 
 class NormalizeSeverityTests(unittest.TestCase):
@@ -2196,6 +2197,55 @@ class ExtractModelNameFromResultTests(unittest.TestCase):
 
 
 class BuildReviewPayloadTests(unittest.TestCase):
+    def test_body_separates_mlx_and_copilot_review_sections(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+            existing_review_context=[
+                {
+                    "source": "review_comment",
+                    "author": "copilot-pull-request-reviewer[bot]",
+                    "path": "Sources/App.swift",
+                    "line": 42,
+                    "body": "Problem: nil guard가 빠졌습니다. Why it matters: 특정 입력에서 crash가 납니다.",
+                },
+                {
+                    "source": "review_comment",
+                    "author": "swift-man",
+                    "path": "Sources/App.swift",
+                    "line": 42,
+                    "body": "작성자 답변은 Copilot 섹션 집계 대상이 아닙니다.",
+                },
+            ],
+        )
+
+        body = payload["body"]
+        self.assertIn("## MLX 리뷰", body)
+        self.assertIn("## Copilot 리뷰", body)
+        self.assertIn("기존 Copilot 리뷰 코멘트 1건", body)
+        self.assertIn("`Sources/App.swift:42`", body)
+        self.assertIn("nil guard", body)
+
+    def test_body_reports_when_copilot_review_context_is_absent(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="APPROVE",
+            comments=[],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+            existing_review_context=[],
+        )
+
+        body = payload["body"]
+        self.assertIn("## Copilot 리뷰", body)
+        self.assertIn("기존 Copilot 리뷰 코멘트를 찾지 못했습니다.", body)
+        self.assertIn("자동 요청하지 않습니다.", body)
+
     def test_body_appends_model_name_footer_when_provided(self) -> None:
         payload = review_service.build_review_payload(
             summary="요약",

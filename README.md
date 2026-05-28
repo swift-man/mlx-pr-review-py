@@ -117,8 +117,10 @@ gh pr edit 123 --add-reviewer @copilot
 
 이 봇은 리뷰 생성 전에 PR의 review comments, issue comments, review thread 대댓글을 읽어
 프롬프트에 함께 넣습니다. Copilot이나 다른 봇이 이미 지적했거나 작성자가 반박한 내용은 최신 PR
-HEAD 기준으로 다시 증명될 때만 코멘트하도록 유도해, 같은 false positive를 반복하는 일을 줄입니다.
-댓글 조회 권한이 부족하면 해당 context는 건너뛰고 로그에 이유를 남긴 뒤 diff 리뷰는 계속 진행합니다.
+HEAD 기준으로 다시 증명될 때만 MLX 라인 코멘트로 남기도록 유도해, 같은 false positive를 반복하는
+일을 줄입니다. 리뷰 본문은 `MLX 리뷰`와 `Copilot 리뷰` 섹션으로 나뉘며, Copilot이 직접 단
+라인 코멘트는 다시 복사하지 않고 Copilot 섹션에 상태와 요약만 표시합니다. 댓글 조회 권한이
+부족하면 해당 context는 건너뛰고 로그에 이유를 남긴 뒤 diff 리뷰는 계속 진행합니다.
 
 매번 `export`를 다시 입력하기 귀찮다면 `/Users/runner/pr-review/scripts/local_review_env.example.sh`를
 `/Users/runner/pr-review/scripts/local_review_env.sh`로 복사해 실제 값만 넣어두면 됩니다.

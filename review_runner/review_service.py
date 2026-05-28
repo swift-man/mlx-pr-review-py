@@ -579,6 +579,8 @@ ALL_SEVERITIES = (SEVERITY_BLOCKING, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SU
 MIN_MODEL_COMMENT_CONFIDENCE = 0.8
 MAX_EXISTING_REVIEW_CONTEXT_ITEMS = 30
 MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS = 900
+MAX_COPILOT_REVIEW_SECTION_ITEMS = 5
+MAX_COPILOT_REVIEW_SECTION_BODY_CHARS = 220
 REVIEW_CONTEXT_ISSUE_COMMENT_SKIP_MARKERS = (
     "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->",
     "<!-- walkthrough_start -->",
@@ -1000,6 +1002,52 @@ def build_review_comment_context(raw_comment: dict[str, Any]) -> PullRequestDisc
         reply_to_comment_id=coerce_optional_int(raw_comment.get("in_reply_to_id")),
         created_at=normalize_text(raw_comment.get("created_at")),
     )
+
+
+def is_copilot_review_context_item(item: dict[str, Any]) -> bool:
+    author = normalize_text(item.get("author")).lower()
+    return "copilot" in author
+
+
+def truncate_copilot_review_section_body(value: Any) -> str:
+    normalized = normalize_text(value)
+    if len(normalized) <= MAX_COPILOT_REVIEW_SECTION_BODY_CHARS:
+        return normalized
+    return normalized[: MAX_COPILOT_REVIEW_SECTION_BODY_CHARS - 3].rstrip() + "..."
+
+
+def format_copilot_review_context_item(item: dict[str, Any]) -> str:
+    body = truncate_copilot_review_section_body(item.get("body"))
+    path = normalize_text(item.get("path"))
+    line = coerce_optional_int(item.get("line"))
+    if path and line is not None:
+        return f"- `{path}:{line}` {body}"
+    return f"- {body}"
+
+
+def build_copilot_review_section(existing_review_context: list[dict[str, Any]] | None) -> list[str]:
+    context = existing_review_context or []
+    copilot_items = [item for item in context if is_copilot_review_context_item(item)]
+    body_lines = ["", "## Copilot 리뷰"]
+
+    if not copilot_items:
+        body_lines.extend(
+            [
+                "- 상태: 기존 Copilot 리뷰 코멘트를 찾지 못했습니다.",
+                "- 참고: Free 한도 보호를 위해 이 봇은 Copilot 리뷰를 자동 요청하지 않습니다.",
+            ]
+        )
+        return body_lines
+
+    body_lines.append(f"- 상태: 기존 Copilot 리뷰 코멘트 {len(copilot_items)}건을 확인했습니다.")
+    body_lines.append("- 참고: Copilot이 직접 남긴 라인 코멘트는 중복 게시하지 않고 아래에 요약만 표시합니다.")
+    body_lines.extend(
+        format_copilot_review_context_item(item)
+        for item in copilot_items[:MAX_COPILOT_REVIEW_SECTION_ITEMS]
+    )
+    if len(copilot_items) > MAX_COPILOT_REVIEW_SECTION_ITEMS:
+        body_lines.append(f"- 그 외 {len(copilot_items) - MAX_COPILOT_REVIEW_SECTION_ITEMS}건은 PR 대화에서 확인하세요.")
+    return body_lines
 
 
 def load_existing_review_context(
@@ -1858,6 +1906,7 @@ def make_prompt(
             "existing_review_context_rules": [
                 "existing_review_context가 있으면 Copilot, 다른 봇, 사용자 댓글과 대댓글의 최근 논의를 참고하세요.",
                 "이미 제기된 지적은 최신 PR HEAD의 diff와 파일 컨텍스트로 다시 증명될 때만 반복하세요.",
+                "동일한 path/line의 동일한 문제가 Copilot 리뷰 코멘트에 이미 있으면 comments에 중복 작성하지 마세요.",
                 "이미 반박되었거나 해결된 false positive를 다시 코멘트하지 마세요.",
                 "다른 리뷰어의 코멘트를 그대로 복사하지 말고, 코드 증거와 재현 가능한 조건이 있을 때만 comments에 작성하세요.",
             ],
@@ -2439,14 +2488,15 @@ def build_review_payload(
     suggestions: list[str],
     *,
     model_name: str | None = None,
+    existing_review_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """GitHub Review API가 기대하는 본문/인라인 코멘트 구조를 만든다.
 
-    섹션 순서는 '반드시 수정할 사항 → 권장 개선사항 → 개선된 점' 이다. 훑을 때
-    가장 먼저 눈에 들어와야 할 차단성 항목을 상단에 둔다. 각 섹션은 내용이 있을
-    때만 출력해서 빈 bullet 플레이스홀더가 노이즈가 되지 않도록 한다.
+    본문은 MLX 리뷰와 Copilot 리뷰를 분리해서 출처를 명확히 한다. MLX 섹션 안에서는
+    '반드시 수정할 사항 → 권장 개선사항 → 개선된 점' 순서로 배치해 차단성 항목이
+    먼저 보이게 한다. Copilot 섹션은 이미 PR에 달린 Copilot 코멘트 요약만 표시한다.
     """
-    body_lines: list[str] = [normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY]
+    body_lines: list[str] = ["## MLX 리뷰", "", normalize_text(summary) or DEFAULT_NO_FINDINGS_SUMMARY]
 
     if must_fix:
         body_lines.extend(["", "### 반드시 수정할 사항"])
@@ -2465,6 +2515,8 @@ def build_review_payload(
         body_lines.append(f"- 자동 리뷰에서 {len(comments)}개의 라인 단위 개선 사항을 남겼습니다.")
     else:
         body_lines.append("- 라인 단위로 남길 개선 사항은 발견되지 않았습니다.")
+
+    body_lines.extend(build_copilot_review_section(existing_review_context))
 
     # 어떤 모델 구성이 이 리뷰를 생성했는지 추적하기 위한 푸터. 모델 정보가 없는 경우는 생략.
     # normalize_text 는 None, 빈 문자열, 공백만 있는 값을 모두 "" 로 정규화하므로 별도 가드가 필요 없다.
@@ -2637,6 +2689,7 @@ def generate_review_artifacts(
         validated_review.must_fix,
         validated_review.suggestions,
         model_name=extract_model_name_from_result(mlx_result),
+        existing_review_context=existing_review_context,
     )
     return ReviewGenerationArtifacts(
         prompt=prompt,
