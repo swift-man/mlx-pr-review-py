@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import calendar
 import contextlib
 import fnmatch
 import json
@@ -48,11 +49,13 @@ COPILOT_REVIEWER_ENV = "COPILOT_REVIEWER"
 COPILOT_REVIEW_MONTHLY_BUDGET_ENV = "COPILOT_REVIEW_MONTHLY_BUDGET"
 COPILOT_REVIEW_REQUEST_COST_ENV = "COPILOT_REVIEW_REQUEST_COST"
 COPILOT_REVIEW_BUDGET_FILE_ENV = "COPILOT_REVIEW_BUDGET_FILE"
+COPILOT_REVIEW_PENDING_TTL_SECONDS_ENV = "COPILOT_REVIEW_PENDING_TTL_SECONDS"
 DEFAULT_COPILOT_REVIEWER = "copilot"
 DEFAULT_COPILOT_REVIEW_MONTHLY_BUDGET = 50
 # GitHub announced a Copilot code review multiplier of 13 from 2026-06-01.
 # Keep the default conservative; operators can lower this to 1 if their plan still bills that way.
 DEFAULT_COPILOT_REVIEW_REQUEST_COST = 13
+DEFAULT_COPILOT_REVIEW_PENDING_TTL_SECONDS = 10 * 60
 _COPILOT_REVIEW_BUDGET_LOCK = threading.Lock()
 FORCED_ALWAYS_REVIEW_PATTERNS = (REVIEWBOT_CONFIG_PATH, "AGENTS.md")
 DEFAULT_REVIEWBOT_EXCLUDE_PATTERNS = (
@@ -1136,6 +1139,44 @@ def current_copilot_review_budget_month() -> str:
     return time.strftime("%Y-%m", time.gmtime())
 
 
+def current_utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_utc_timestamp_seconds(value: Any) -> int | None:
+    normalized = normalize_text(value)
+    if not normalized:
+        return None
+    try:
+        return calendar.timegm(time.strptime(normalized, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def get_copilot_request_status(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return normalize_text(entry.get("status")).lower()
+
+
+def is_recent_copilot_pending_request(entry: Any, *, ttl_seconds: int) -> bool:
+    if get_copilot_request_status(entry) != "pending":
+        return False
+    requested_at_seconds = parse_utc_timestamp_seconds(entry.get("requested_at") if isinstance(entry, dict) else None)
+    if requested_at_seconds is None:
+        return False
+    return time.time() - requested_at_seconds < ttl_seconds
+
+
+def get_copilot_request_entry_cost(entry: Any, default: int) -> int:
+    if not isinstance(entry, dict):
+        return default
+    cost = coerce_optional_int(entry.get("cost"))
+    if cost is None or cost <= 0:
+        return default
+    return cost
+
+
 def get_copilot_month_entry(state: dict[str, Any], month: str) -> dict[str, Any]:
     raw_entry = state.get(month)
     if not isinstance(raw_entry, dict):
@@ -1171,11 +1212,10 @@ def record_copilot_review_budget_request(
     month: str,
     status: str,
 ) -> dict[str, Any]:
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     entry = {
         "cost": cost,
         "month": month,
-        "requested_at": now,
+        "requested_at": current_utc_timestamp(),
         "reviewer": reviewer,
         "status": status,
     }
@@ -1195,6 +1235,61 @@ def remove_copilot_review_budget_request(
     get_copilot_request_history(state).pop(request_key, None)
     month_entry["requests"].pop(request_key, None)
     month_entry["used"] = max(0, month_entry["used"] - cost)
+
+
+def rollback_copilot_review_budget_request(
+    *,
+    budget_file: str,
+    month: str,
+    request_key: str,
+    default_cost: int,
+    log_prefix: str,
+    reason: str,
+) -> int | None:
+    try:
+        with locked_copilot_review_budget_state(budget_file):
+            state = load_copilot_review_budget_state(budget_file)
+            month_entry = get_copilot_month_entry(state, month)
+            history_entry = get_copilot_request_history(state).get(request_key)
+            month_entry_request = month_entry["requests"].get(request_key)
+            entry_cost = get_copilot_request_entry_cost(history_entry or month_entry_request, default_cost)
+            remove_copilot_review_budget_request(
+                state=state,
+                month_entry=month_entry,
+                request_key=request_key,
+                cost=entry_cost,
+            )
+            save_copilot_review_budget_state(budget_file, state)
+            return month_entry["used"]
+    except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+        log_progress(log_prefix, f"Copilot budget rollback failed after {reason}: {exc}")
+        return None
+
+
+def mark_copilot_review_budget_request_confirmed(
+    *,
+    budget_file: str,
+    month: str,
+    request_key: str,
+    log_prefix: str,
+) -> int | None:
+    try:
+        with locked_copilot_review_budget_state(budget_file):
+            state = load_copilot_review_budget_state(budget_file)
+            month_entry = get_copilot_month_entry(state, month)
+            request_history = get_copilot_request_history(state)
+            confirmed_at = current_utc_timestamp()
+
+            for entry in (request_history.get(request_key), month_entry["requests"].get(request_key)):
+                if isinstance(entry, dict):
+                    entry["status"] = "requested"
+                    entry["confirmed_at"] = confirmed_at
+
+            save_copilot_review_budget_state(budget_file, state)
+            return month_entry["used"]
+    except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+        log_progress(log_prefix, f"Copilot review was requested but final budget state could not be saved: {exc}")
+        return None
 
 
 def is_copilot_requested_reviewer(raw_reviewer: dict[str, Any], reviewer: str) -> bool:
@@ -1248,6 +1343,10 @@ def maybe_request_copilot_review(
 
     budget = parse_positive_int_env(COPILOT_REVIEW_MONTHLY_BUDGET_ENV, DEFAULT_COPILOT_REVIEW_MONTHLY_BUDGET)
     cost = parse_positive_int_env(COPILOT_REVIEW_REQUEST_COST_ENV, DEFAULT_COPILOT_REVIEW_REQUEST_COST)
+    pending_ttl_seconds = parse_positive_int_env(
+        COPILOT_REVIEW_PENDING_TTL_SECONDS_ENV,
+        DEFAULT_COPILOT_REVIEW_PENDING_TTL_SECONDS,
+    )
     budget_file = default_copilot_review_budget_file()
     month = current_copilot_review_budget_month()
     request_key = f"{github.repository}#{pull_number}"
@@ -1258,7 +1357,27 @@ def maybe_request_copilot_review(
             month_entry = get_copilot_month_entry(state, month)
             request_history = get_copilot_request_history(state)
 
-            if request_key in request_history or request_key in month_entry["requests"]:
+            existing_entry = request_history.get(request_key) or month_entry["requests"].get(request_key)
+            if get_copilot_request_status(existing_entry) == "pending":
+                if is_recent_copilot_pending_request(existing_entry, ttl_seconds=pending_ttl_seconds):
+                    return build_copilot_review_request_result(
+                        status="skipped",
+                        reviewer=reviewer,
+                        reason="request_pending",
+                        budget=budget,
+                        used=month_entry["used"],
+                        cost=cost,
+                        budget_file=budget_file,
+                    )
+
+                remove_copilot_review_budget_request(
+                    state=state,
+                    month_entry=month_entry,
+                    request_key=request_key,
+                    cost=get_copilot_request_entry_cost(existing_entry, cost),
+                )
+                save_copilot_review_budget_state(budget_file, state)
+            elif request_key in request_history or request_key in month_entry["requests"]:
                 return build_copilot_review_request_result(
                     status="skipped",
                     reviewer=reviewer,
@@ -1285,43 +1404,7 @@ def maybe_request_copilot_review(
                     budget_file=budget_file,
                 )
 
-            try:
-                requested_reviewers = github.list_requested_reviewers(pull_number)
-            except GitHubApiError as exc:
-                log_progress(log_prefix, f"Copilot requested-reviewers lookup was rejected by GitHub: {exc.status} {exc.response_body}")
-                return build_copilot_review_request_result(
-                    status="failed",
-                    reviewer=reviewer,
-                    reason=f"github_api_{exc.status}",
-                    budget=budget,
-                    used=month_entry["used"],
-                    cost=cost,
-                    budget_file=budget_file,
-                )
-            except (AttributeError, OSError, RuntimeError) as exc:
-                log_progress(log_prefix, f"Copilot requested-reviewers lookup failed; continuing with MLX review: {exc}")
-                return build_copilot_review_request_result(
-                    status="failed",
-                    reviewer=reviewer,
-                    reason="request_failed",
-                    budget=budget,
-                    used=month_entry["used"],
-                    cost=cost,
-                    budget_file=budget_file,
-                )
-
-            if any(is_copilot_requested_reviewer(raw_reviewer, reviewer) for raw_reviewer in requested_reviewers):
-                return build_copilot_review_request_result(
-                    status="skipped",
-                    reviewer=reviewer,
-                    reason="already_requested_on_github",
-                    budget=budget,
-                    used=month_entry["used"],
-                    cost=cost,
-                    budget_file=budget_file,
-                )
-
-            request_record = record_copilot_review_budget_request(
+            record_copilot_review_budget_request(
                 state=state,
                 month_entry=month_entry,
                 request_key=request_key,
@@ -1331,80 +1414,7 @@ def maybe_request_copilot_review(
                 status="pending",
             )
             save_copilot_review_budget_state(budget_file, state)
-
-            try:
-                github.request_reviewers(pull_number, [reviewer])
-            except GitHubApiError as exc:
-                remove_copilot_review_budget_request(
-                    state=state,
-                    month_entry=month_entry,
-                    request_key=request_key,
-                    cost=cost,
-                )
-                try:
-                    save_copilot_review_budget_state(budget_file, state)
-                except OSError as rollback_exc:
-                    log_progress(log_prefix, f"Copilot budget rollback failed after GitHub rejection: {rollback_exc}")
-                log_progress(log_prefix, f"Copilot review request was rejected by GitHub: {exc.status} {exc.response_body}")
-                return build_copilot_review_request_result(
-                    status="failed",
-                    reviewer=reviewer,
-                    reason=f"github_api_{exc.status}",
-                    budget=budget,
-                    used=month_entry["used"],
-                    cost=cost,
-                    budget_file=budget_file,
-                )
-            except (AttributeError, OSError, RuntimeError) as exc:
-                remove_copilot_review_budget_request(
-                    state=state,
-                    month_entry=month_entry,
-                    request_key=request_key,
-                    cost=cost,
-                )
-                try:
-                    save_copilot_review_budget_state(budget_file, state)
-                except OSError as rollback_exc:
-                    log_progress(log_prefix, f"Copilot budget rollback failed after request error: {rollback_exc}")
-                log_progress(log_prefix, f"Copilot review request failed; continuing with MLX review: {exc}")
-                return build_copilot_review_request_result(
-                    status="failed",
-                    reviewer=reviewer,
-                    reason="request_failed",
-                    budget=budget,
-                    used=month_entry["used"],
-                    cost=cost,
-                    budget_file=budget_file,
-                )
-
-            request_record["status"] = "requested"
-            request_record["confirmed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            try:
-                save_copilot_review_budget_state(budget_file, state)
-            except OSError as exc:
-                log_progress(log_prefix, f"Copilot review was requested but final budget state could not be saved: {exc}")
-                return build_copilot_review_request_result(
-                    status="requested_budget_record_failed",
-                    reviewer=reviewer,
-                    reason="budget_state_save_failed",
-                    budget=budget,
-                    used=month_entry["used"],
-                    cost=cost,
-                    budget_file=budget_file,
-                )
-
-            log_progress(
-                log_prefix,
-                f"Requested Copilot review from @{reviewer}; local monthly budget usage is {month_entry['used']}/{budget}",
-            )
-            return build_copilot_review_request_result(
-                status="requested",
-                reviewer=reviewer,
-                budget=budget,
-                used=month_entry["used"],
-                cost=cost,
-                budget_file=budget_file,
-            )
+            reserved_used = month_entry["used"]
     except (OSError, json.JSONDecodeError, RuntimeError) as exc:
         log_progress(log_prefix, f"Skipping Copilot review request because budget state is unavailable: {exc}")
         return build_copilot_review_request_result(
@@ -1415,6 +1425,137 @@ def maybe_request_copilot_review(
             cost=cost,
             budget_file=budget_file,
         )
+
+    try:
+        requested_reviewers = github.list_requested_reviewers(pull_number)
+    except GitHubApiError as exc:
+        used = rollback_copilot_review_budget_request(
+            budget_file=budget_file,
+            month=month,
+            request_key=request_key,
+            default_cost=cost,
+            log_prefix=log_prefix,
+            reason="GitHub requested-reviewers lookup rejection",
+        )
+        log_progress(log_prefix, f"Copilot requested-reviewers lookup was rejected by GitHub: {exc.status} {exc.response_body}")
+        return build_copilot_review_request_result(
+            status="failed",
+            reviewer=reviewer,
+            reason=f"github_api_{exc.status}",
+            budget=budget,
+            used=used,
+            cost=cost,
+            budget_file=budget_file,
+        )
+    except (AttributeError, OSError, RuntimeError) as exc:
+        used = rollback_copilot_review_budget_request(
+            budget_file=budget_file,
+            month=month,
+            request_key=request_key,
+            default_cost=cost,
+            log_prefix=log_prefix,
+            reason="requested-reviewers lookup error",
+        )
+        log_progress(log_prefix, f"Copilot requested-reviewers lookup failed; continuing with MLX review: {exc}")
+        return build_copilot_review_request_result(
+            status="failed",
+            reviewer=reviewer,
+            reason="request_failed",
+            budget=budget,
+            used=used,
+            cost=cost,
+            budget_file=budget_file,
+        )
+
+    if any(is_copilot_requested_reviewer(raw_reviewer, reviewer) for raw_reviewer in requested_reviewers):
+        used = rollback_copilot_review_budget_request(
+            budget_file=budget_file,
+            month=month,
+            request_key=request_key,
+            default_cost=cost,
+            log_prefix=log_prefix,
+            reason="existing GitHub reviewer",
+        )
+        return build_copilot_review_request_result(
+            status="skipped",
+            reviewer=reviewer,
+            reason="already_requested_on_github",
+            budget=budget,
+            used=used,
+            cost=cost,
+            budget_file=budget_file,
+        )
+
+    try:
+        github.request_reviewers(pull_number, [reviewer])
+    except GitHubApiError as exc:
+        used = rollback_copilot_review_budget_request(
+            budget_file=budget_file,
+            month=month,
+            request_key=request_key,
+            default_cost=cost,
+            log_prefix=log_prefix,
+            reason="GitHub rejection",
+        )
+        log_progress(log_prefix, f"Copilot review request was rejected by GitHub: {exc.status} {exc.response_body}")
+        return build_copilot_review_request_result(
+            status="failed",
+            reviewer=reviewer,
+            reason=f"github_api_{exc.status}",
+            budget=budget,
+            used=used,
+            cost=cost,
+            budget_file=budget_file,
+        )
+    except (AttributeError, OSError, RuntimeError) as exc:
+        used = rollback_copilot_review_budget_request(
+            budget_file=budget_file,
+            month=month,
+            request_key=request_key,
+            default_cost=cost,
+            log_prefix=log_prefix,
+            reason="request error",
+        )
+        log_progress(log_prefix, f"Copilot review request failed; continuing with MLX review: {exc}")
+        return build_copilot_review_request_result(
+            status="failed",
+            reviewer=reviewer,
+            reason="request_failed",
+            budget=budget,
+            used=used,
+            cost=cost,
+            budget_file=budget_file,
+        )
+
+    confirmed_used = mark_copilot_review_budget_request_confirmed(
+        budget_file=budget_file,
+        month=month,
+        request_key=request_key,
+        log_prefix=log_prefix,
+    )
+    if confirmed_used is None:
+        return build_copilot_review_request_result(
+            status="requested_budget_record_failed",
+            reviewer=reviewer,
+            reason="budget_state_save_failed",
+            budget=budget,
+            used=reserved_used,
+            cost=cost,
+            budget_file=budget_file,
+        )
+
+    log_progress(
+        log_prefix,
+        f"Requested Copilot review from @{reviewer}; local monthly budget usage is {confirmed_used}/{budget}",
+    )
+    return build_copilot_review_request_result(
+        status="requested",
+        reviewer=reviewer,
+        budget=budget,
+        used=confirmed_used,
+        cost=cost,
+        budget_file=budget_file,
+    )
 
 
 def truncate_copilot_review_section_body(value: Any) -> str:
