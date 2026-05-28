@@ -255,9 +255,9 @@ pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 ```
 
 이 스크립트는 LaunchAgent `com.swiftman.pr-review`가 이미 등록되어 있으면 최신 소스를
-`/Users/runner/pr-review`로 다시 복사한 뒤 `launchctl kickstart -k`로 기존 서버를 종료하고
-새 프로세스를 띄웁니다. 이 경로에서는 서버를 포그라운드로 다시 실행하지 않으므로
-`address already in use` 충돌을 피할 수 있습니다.
+`/Users/runner/pr-review`로 다시 복사한 뒤 tail 없이 `kickstart_local_review.sh`를 호출해
+LaunchAgent 재시동과 `/healthz` 확인까지 수행합니다. 이 경로에서는 서버를 포그라운드로
+다시 실행하지 않으므로 `address already in use` 충돌을 피할 수 있습니다.
 단, 로드된 LaunchAgent가 실제로 전달한 배포 대상 경로를 가리키는지 먼저 확인합니다.
 경로가 다르면 다른 설치본을 재시동할 수 있으므로 실패 메시지를 내고 중단합니다.
 
@@ -267,10 +267,13 @@ LaunchAgent가 등록되어 있지 않은 개발 환경에서는 기존 uvicorn 
 LaunchAgent 기준으로 재시동만 필요하면 아래 명령을 사용합니다.
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.swiftman.pr-review
-curl http://127.0.0.1:8000/healthz
-tail -f /tmp/mlx-pr-review-webhook.log /tmp/mlx-pr-review-webhook.err.log
+zsh /Users/runner/pr-review/scripts/kickstart_local_review.sh
 ```
+
+이 스크립트는 `launchctl kickstart -k`, `/healthz` 확인, 로그 tail을 순서대로 실행합니다.
+자동화에서 로그 tail 없이 종료해야 하면 `LOCAL_REVIEW_TAIL_LOGS=0`을 함께 넘깁니다.
+
+### 포그라운드 수동 재시작 (LaunchAgent 미사용 시)
 
 ```bash
 pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
