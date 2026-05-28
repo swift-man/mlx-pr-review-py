@@ -1978,7 +1978,11 @@ def build_current_file_context(
 
     if mode in {"auto", "full", "full_repo"}:
         full_context = build_line_numbered_file_context(file_text, max_chars=max_chars)
-        if full_context and (mode == "full" or "full file context truncated" not in full_context):
+        full_context_truncated = "full file context truncated" in full_context
+        if mode == "full" and full_context:
+            context_mode = "full_file_truncated" if full_context_truncated else "full_file"
+            return full_context, context_mode
+        if full_context and not full_context_truncated:
             return full_context, "full_file"
 
     excerpt = build_current_file_context_excerpt(
@@ -2172,7 +2176,7 @@ def build_review_focus_hints(files: list[PullRequestFile]) -> list[str]:
         hints.append(
             "cooldown 설정과 asyncio.gather/동시 작업이 함께 보이면, 한 작업이 429/5xx를 감지한 뒤 이미 예약된 나머지 작업이 계속 외부 API를 호출하는지 확인하세요."
         )
-    if touches_cooldown and re.search(r"\b[a-zA-Z_][\w]*error_count\s*=\s*0\b", combined):
+    if touches_cooldown and re.search(r"\b(?:[a-zA-Z_]\w*)?error_count\s*=\s*0\b", combined):
         hints.append(
             "cooldown 발동 기준이 error_count 같은 지역 변수라면, 한 번의 함수 호출 안에서만 누적되고 다음 호출에서 0으로 초기화되어 단건/소량 반복 실패를 놓치는지 확인하세요."
         )
@@ -2957,7 +2961,7 @@ def make_prompt(
                 f"confidence가 {MIN_MODEL_COMMENT_CONFIDENCE:.2f} 미만이면 코멘트를 작성하지 마세요.",
             ],
             "file_context_rules": [
-                "patch는 GitHub에 실제 코멘트를 달 수 있는 diff이고, current_file_context는 최신 PR HEAD의 변경 파일 전체 또는 큰 파일의 변경 hunk 주변 excerpt입니다.",
+                "patch는 GitHub에 실제 코멘트를 달 수 있는 diff이고, current_file_context는 최신 PR HEAD의 변경 파일 전체, 명시적 full 모드의 잘린 전체 파일(full_file_truncated), 또는 큰 파일의 변경 hunk 주변 excerpt입니다.",
                 "repository_context는 최신 PR HEAD에서 예산 안에 들어온 변경 외 파일들의 읽기 전용 컨텍스트입니다. diff 밖 함수, 기존 호출자, 공용 helper와의 상호작용은 current_file_context와 repository_context로 확인하세요.",
                 "문제가 current_file_context의 unchanged line에서 드러나더라도, comments[].line은 반드시 valid_comment_lines 중 이 문제를 새로 만든 changed/context line으로 선택하세요. 적절한 valid line이 없으면 코멘트를 작성하지 마세요.",
             ],

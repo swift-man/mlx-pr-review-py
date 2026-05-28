@@ -922,6 +922,20 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertIn("1: def a():", context)
         self.assertIn("2:     return 1", context)
 
+    def test_current_file_context_full_mode_marks_truncated_file(self) -> None:
+        file_text = "\n".join(f"line {line_number}" for line_number in range(1, 200))
+
+        context, mode = review_service.build_current_file_context(
+            file_text,
+            "@@ -100,1 +100,2 @@\n line 100\n+line new\n",
+            mode="full",
+            line_radius=1,
+            max_chars=120,
+        )
+
+        self.assertEqual(mode, "full_file_truncated")
+        self.assertIn("full file context truncated", context)
+
     def test_current_file_context_auto_falls_back_to_excerpt_for_large_files(self) -> None:
         file_text = "\n".join(f"line {line_number}" for line_number in range(1, 200))
         context, mode = review_service.build_current_file_context(
@@ -972,6 +986,26 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertTrue(any("asyncio.gather" in hint for hint in hints))
         self.assertTrue(any("지역 변수" in hint for hint in hints))
         self.assertTrue(any("RequestError" in hint for hint in hints))
+
+    def test_review_focus_hints_detect_plain_error_count_reset(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch=(
+                "@@ -20,0 +20,4 @@\n"
+                "+error_count = 0\n"
+                "+if status == 429:\n"
+                "+    error_count += 1\n"
+                "+    self._pause_until = now\n"
+            ),
+            additions=4,
+            deletions=0,
+            right_side_lines=set(range(20, 24)),
+        )
+
+        hints = review_service.build_review_focus_hints([pr_file])
+
+        self.assertTrue(any("지역 변수" in hint for hint in hints))
 
     def test_make_prompt_includes_repository_context(self) -> None:
         pr_file = review_service.PullRequestFile(

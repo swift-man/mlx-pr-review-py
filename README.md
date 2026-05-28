@@ -546,7 +546,8 @@ false positive 방지를 위해 게시하지 않습니다. `Blocking`/`Major`는
 
 프롬프트의 `files[]`에는 GitHub diff patch와 함께 `current_file_context`가 들어갑니다. 작은 변경 파일은
 최신 PR HEAD의 전체 파일을 line-numbered 형태로 넣고, 큰 파일은 모든 hunk 주변을 보존하도록 반경을 줄인
-excerpt를 넣습니다. 기본 `full_repo` 모드에서는 변경 파일 외 repo 파일도 `.reviewbot.yml`/built-in 필터와
+excerpt를 넣습니다. 명시적 `full` 모드에서 최대 길이 때문에 잘린 파일은 `full_file_truncated`로 표시합니다.
+기본 `full_repo` 모드에서는 변경 파일 외 repo 파일도 `.reviewbot.yml`/built-in 필터와
 Apple Silicon 64GB급 운영 예산 안에서 `repository_context`로 추가합니다. 모델은 이 context로 diff 밖 호출자와 helper 흐름을 검증하지만,
 GitHub Review API 제약 때문에 실제 코멘트 line은 여전히 `valid_comment_lines` 안에서만 선택해야 합니다.
 [`review_runner/sample_mlx_client.py`](/Users/m4_25/develop/codereview/review_runner/sample_mlx_client.py)는
