@@ -108,6 +108,20 @@ remote backend 요청 body가 `MLX_GENERATE_CLIENT_MAX_BODY_BYTES`를 넘으면 
 또는 내장 generated-file 필터로 빌드 산출물과 생성 문서를 제외하는 쪽을 우선합니다.
 실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client` 같은 커스텀 커맨드로 바꿔서 테스트할 수 있습니다.
 
+Copilot과 함께 리뷰하려면 먼저 GitHub PR에서 Copilot 리뷰어를 요청한 뒤 이 봇을 실행하면 됩니다.
+예를 들어 Copilot PR 리뷰 권한이 있는 계정에서는 아래처럼 수동으로 붙일 수 있습니다.
+
+```bash
+gh pr edit 123 --add-reviewer @copilot
+```
+
+이 봇은 리뷰 생성 전에 PR의 review comments, issue comments, review thread 대댓글을 읽어
+프롬프트에 함께 넣습니다. Copilot이나 다른 봇이 이미 지적했거나 작성자가 반박한 내용은 최신 PR
+HEAD 기준으로 다시 증명될 때만 MLX 라인 코멘트로 남기도록 유도해, 같은 false positive를 반복하는
+일을 줄입니다. 리뷰 본문은 `MLX 리뷰`와 `Copilot 리뷰` 섹션으로 나뉘며, Copilot이 직접 단
+라인 코멘트는 다시 복사하지 않고 Copilot 섹션에 상태와 요약만 표시합니다. 댓글 조회 권한이
+부족하면 해당 context는 건너뛰고 로그에 이유를 남긴 뒤 diff 리뷰는 계속 진행합니다.
+
 매번 `export`를 다시 입력하기 귀찮다면 `/Users/runner/pr-review/scripts/local_review_env.example.sh`를
 `/Users/runner/pr-review/scripts/local_review_env.sh`로 복사해 실제 값만 넣어두면 됩니다.
 이 파일은 [`scripts/run_webhook_server.sh`](/Users/m4_25/develop/codereview/scripts/run_webhook_server.sh)와

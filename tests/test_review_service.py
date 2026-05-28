@@ -742,6 +742,214 @@ review:
         self.assertFalse(result.default_filter_applied)
 
 
+class ExistingReviewContextTests(unittest.TestCase):
+    def test_load_existing_review_context_includes_review_comments_replies_and_user_notes(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return [
+                    {
+                        "id": 10,
+                        "body": "Problem: nil guard가 빠졌습니다. Why it matters: 특정 입력에서 crash가 납니다.",
+                        "path": "Sources/App.swift",
+                        "line": 42,
+                        "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                        "created_at": "2026-05-28T01:00:00Z",
+                    },
+                    {
+                        "id": 11,
+                        "body": "현재 PR HEAD에는 guard가 추가되어 이 경로는 재현되지 않습니다.",
+                        "path": "Sources/App.swift",
+                        "line": 42,
+                        "in_reply_to_id": 10,
+                        "user": {"login": "swift-man"},
+                        "created_at": "2026-05-28T01:01:00Z",
+                    },
+                ]
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return [
+                    {
+                        "id": 20,
+                        "body": "<!-- walkthrough_start --> 자동 요약은 프롬프트에 넣지 않습니다.",
+                        "user": {"login": "coderabbitai[bot]"},
+                        "created_at": "2026-05-28T01:02:00Z",
+                    },
+                    {
+                        "id": 21,
+                        "body": "리뷰 코멘트는 최신 HEAD 기준으로만 다시 확인해 주세요.",
+                        "user": {"login": "swift-man"},
+                        "created_at": "2026-05-28T01:03:00Z",
+                    },
+                ]
+
+        context = review_service.load_existing_review_context(FakeGitHub(), 4)
+
+        self.assertEqual([item["comment_id"] for item in context], [10, 11, 21])
+        self.assertEqual(context[0]["source"], "review_comment")
+        self.assertEqual(context[0]["author"], "copilot-pull-request-reviewer[bot]")
+        self.assertEqual(context[0]["path"], "Sources/App.swift")
+        self.assertEqual(context[0]["line"], 42)
+        self.assertEqual(context[1]["reply_to_comment_id"], 10)
+        self.assertEqual(context[2]["source"], "issue_comment")
+
+    def test_load_existing_review_context_tolerates_comment_lookup_network_errors(self) -> None:
+        case = self
+
+        class ReviewCommentsFailGitHub:
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                raise review_service.urllib.error.URLError("connection reset")
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return [
+                    {
+                        "id": 30,
+                        "body": "Copilot 한도 초과로 수동 확인이 필요합니다.",
+                        "user": {"login": "swift-man"},
+                        "created_at": "2026-05-28T01:04:00Z",
+                    }
+                ]
+
+        class IssueCommentsFailGitHub:
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 5)
+                return [
+                    {
+                        "id": 40,
+                        "body": "Problem: 실제 리뷰 코멘트입니다. Why it matters: 컨텍스트에 남아야 합니다.",
+                        "path": "Sources/App.swift",
+                        "line": 7,
+                        "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                        "created_at": "2026-05-28T01:05:00Z",
+                    }
+                ]
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 5)
+                raise TimeoutError("timed out")
+
+        review_failed_context = review_service.load_existing_review_context(ReviewCommentsFailGitHub(), 4)
+        issue_failed_context = review_service.load_existing_review_context(IssueCommentsFailGitHub(), 5)
+
+        self.assertEqual([item["comment_id"] for item in review_failed_context], [30])
+        self.assertEqual(review_failed_context[0]["source"], "issue_comment")
+        self.assertEqual([item["comment_id"] for item in issue_failed_context], [40])
+        self.assertEqual(issue_failed_context[0]["source"], "review_comment")
+
+    def test_make_prompt_includes_existing_review_context_rules_and_payload(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="Sources/App.swift",
+            status="modified",
+            patch="@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+            additions=1,
+            deletions=1,
+            right_side_lines={1},
+        )
+        context = [
+            {
+                "source": "review_comment",
+                "author": "copilot-pull-request-reviewer[bot]",
+                "path": "Sources/App.swift",
+                "line": 1,
+                "body": "이미 제기된 코멘트입니다.",
+            }
+        ]
+
+        prompt = json.loads(
+            review_service.make_prompt(
+                "swift-man/app",
+                4,
+                [pr_file],
+                existing_review_context=context,
+            )
+        )
+
+        self.assertEqual(prompt["existing_review_context"], context)
+        rules = prompt["instructions"]["existing_review_context_rules"]
+        self.assertTrue(any("false positive" in rule for rule in rules))
+        self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
+        self.assertTrue(any("Copilot" in rule and "중복" in rule for rule in rules))
+
+
+class ReviewPullRequestFlowTests(unittest.TestCase):
+    def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            instances: list["FakeGitHub"] = []
+
+            def __init__(self, token: str, repository: str, api_url: str) -> None:
+                self.token = token
+                self.repository = repository
+                self.api_url = api_url
+                self.post_review_called = False
+                FakeGitHub.instances.append(self)
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return [
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+                        "additions": 1,
+                        "deletions": 1,
+                    }
+                ]
+
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                self._assert_pull_number(pull_number)
+                return "abc123"
+
+            def get_file_text(self, path: str, *, ref: str) -> str:
+                case.assertEqual((path, ref), (review_service.REVIEWBOT_CONFIG_PATH, "abc123"))
+                raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+                self.post_review_called = True
+                raise AssertionError("dry_run=True must not post a GitHub review")
+
+            def _assert_pull_number(self, pull_number: int) -> None:
+                if pull_number != 4:
+                    raise AssertionError(f"unexpected pull number: {pull_number}")
+
+        mlx_result = {
+            "summary": "요약",
+            "event": "COMMENT",
+            "positives": [],
+            "must_fix": [],
+            "suggestions": [],
+            "comments": [],
+        }
+
+        with mock.patch("review_runner.review_service.GitHubApi", FakeGitHub):
+            with mock.patch("review_runner.review_service.run_mlx", return_value=mlx_result):
+                result = review_service.review_pull_request(
+                    "swift-man/app",
+                    4,
+                    token="token",
+                    dry_run=True,
+                )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["repository"], "swift-man/app")
+        self.assertEqual(len(FakeGitHub.instances), 1)
+        self.assertFalse(FakeGitHub.instances[0].post_review_called)
+
+
 class NormalizeSeverityTests(unittest.TestCase):
     def test_recognizes_all_four_severities_case_insensitively(self) -> None:
         cases = {
@@ -2108,6 +2316,55 @@ class ExtractModelNameFromResultTests(unittest.TestCase):
 
 
 class BuildReviewPayloadTests(unittest.TestCase):
+    def test_body_separates_mlx_and_copilot_review_sections(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+            existing_review_context=[
+                {
+                    "source": "review_comment",
+                    "author": "copilot-pull-request-reviewer[bot]",
+                    "path": "Sources/App.swift",
+                    "line": 42,
+                    "body": "Problem: nil guard가 빠졌습니다. Why it matters: 특정 입력에서 crash가 납니다.",
+                },
+                {
+                    "source": "review_comment",
+                    "author": "swift-man",
+                    "path": "Sources/App.swift",
+                    "line": 42,
+                    "body": "작성자 답변은 Copilot 섹션 집계 대상이 아닙니다.",
+                },
+            ],
+        )
+
+        body = payload["body"]
+        self.assertIn("## MLX 리뷰", body)
+        self.assertIn("## Copilot 리뷰", body)
+        self.assertIn("기존 Copilot 리뷰 코멘트 1건", body)
+        self.assertIn("`Sources/App.swift:42`", body)
+        self.assertIn("nil guard", body)
+
+    def test_body_reports_when_copilot_review_context_is_absent(self) -> None:
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="APPROVE",
+            comments=[],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+            existing_review_context=[],
+        )
+
+        body = payload["body"]
+        self.assertIn("## Copilot 리뷰", body)
+        self.assertIn("기존 Copilot 리뷰 코멘트를 찾지 못했습니다.", body)
+        self.assertIn("자동 요청하지 않습니다.", body)
+
     def test_body_appends_model_name_footer_when_provided(self) -> None:
         payload = review_service.build_review_payload(
             summary="요약",
