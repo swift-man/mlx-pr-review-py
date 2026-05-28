@@ -127,7 +127,9 @@ COPILOT_REVIEW_REQUEST_COST=13
 이 상태에서 봇은 PR마다 한 번만 Copilot을 reviewer로 요청하고, 로컬 budget 파일
 `$LOCAL_REVIEW_HOME/.copilot_review_budget.json`에 월별 사용량을 기록합니다. GitHub가 현재 계정,
 조직 정책, Copilot 플랜 또는 권한 때문에 Copilot 리뷰 요청을 거절하면 MLX 리뷰는 계속 진행하고
-로그에 실패 이유만 남깁니다. GitHub 문서상 Copilot Free는 GitHub.com PR code review가 기본 제공되는
+로그에 실패 이유만 남깁니다. 요청 POST 이후 timeout처럼 GitHub 처리 여부가 모호한 경우에는 requested
+reviewer를 다시 조회하고, 확인도 실패하면 budget 기록을 pending으로 유지해 이후 TTL 재처리에서 보수적으로
+판단합니다. GitHub 문서상 Copilot Free는 GitHub.com PR code review가 기본 제공되는
 플랜이 아니므로, Free 계정에서는 조직 정책이나 권한 설정에 따라 요청이 거절될 수 있습니다.
 임시로 끄거나 예산을 조정해야 할 때만 `local_review_env.sh`에 `export` 없이 값만 지정하면 됩니다.
 

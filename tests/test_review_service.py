@@ -1078,9 +1078,13 @@ class CopilotReviewRequestTests(unittest.TestCase):
         class TimeoutGitHub:
             repository = "swift-man/app"
 
+            def __init__(self) -> None:
+                self.list_calls = 0
+
             def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 case.assertEqual(pull_number, 4)
                 case.assertEqual(timeout, 3)
+                self.list_calls += 1
                 return []
 
             def request_reviewers(
@@ -1104,17 +1108,123 @@ class CopilotReviewRequestTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                result = review_service.maybe_request_copilot_review(TimeoutGitHub(), 4)
+                github = TimeoutGitHub()
+                result = review_service.maybe_request_copilot_review(github, 4)
 
             with open(budget_file, "r", encoding="utf-8") as fh:
                 budget_state = json.load(fh)
 
         month_entry = budget_state[review_service.current_copilot_review_budget_month()]
+        self.assertEqual(github.list_calls, 2)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "request_failed")
         self.assertEqual(month_entry["used"], 0)
         self.assertNotIn("swift-man/app#4", budget_state["requests"])
         self.assertNotIn("swift-man/app#4", month_entry["requests"])
+
+    def test_keeps_pending_budget_when_copilot_request_timeout_cannot_be_confirmed(self) -> None:
+        case = self
+
+        class AmbiguousTimeoutGitHub:
+            repository = "swift-man/app"
+
+            def __init__(self) -> None:
+                self.list_calls = 0
+
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                case.assertEqual(timeout, 3)
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    return []
+                raise TimeoutError("confirm timed out")
+
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
+                case.assertEqual((pull_number, reviewers, timeout), (4, ["copilot"], 3))
+                raise TimeoutError("request timed out")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            budget_file = os.path.join(tmpdir, "copilot-budget.json")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    review_service.COPILOT_REVIEW_REQUEST_ENV: "1",
+                    review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: budget_file,
+                    review_service.COPILOT_REVIEW_API_TIMEOUT_SECONDS_ENV: "3",
+                },
+                clear=False,
+            ):
+                github = AmbiguousTimeoutGitHub()
+                result = review_service.maybe_request_copilot_review(github, 4)
+
+            with open(budget_file, "r", encoding="utf-8") as fh:
+                budget_state = json.load(fh)
+
+        month_entry = budget_state[review_service.current_copilot_review_budget_month()]
+        self.assertEqual(github.list_calls, 2)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["reason"], "request_outcome_unknown")
+        self.assertEqual(month_entry["used"], 13)
+        self.assertEqual(budget_state["requests"]["swift-man/app#4"]["status"], "pending")
+        self.assertEqual(month_entry["requests"]["swift-man/app#4"]["status"], "pending")
+
+    def test_confirms_budget_when_copilot_request_timeout_added_reviewer(self) -> None:
+        case = self
+
+        class ConfirmedTimeoutGitHub:
+            repository = "swift-man/app"
+
+            def __init__(self) -> None:
+                self.list_calls = 0
+
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                case.assertEqual(timeout, 3)
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    return []
+                return [{"login": "copilot"}]
+
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
+                case.assertEqual((pull_number, reviewers, timeout), (4, ["copilot"], 3))
+                raise TimeoutError("request timed out")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            budget_file = os.path.join(tmpdir, "copilot-budget.json")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    review_service.COPILOT_REVIEW_REQUEST_ENV: "1",
+                    review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: budget_file,
+                    review_service.COPILOT_REVIEW_API_TIMEOUT_SECONDS_ENV: "3",
+                },
+                clear=False,
+            ):
+                github = ConfirmedTimeoutGitHub()
+                result = review_service.maybe_request_copilot_review(github, 4)
+
+            with open(budget_file, "r", encoding="utf-8") as fh:
+                budget_state = json.load(fh)
+
+        month_entry = budget_state[review_service.current_copilot_review_budget_month()]
+        self.assertEqual(github.list_calls, 2)
+        self.assertEqual(result["status"], "requested")
+        self.assertEqual(result["reason"], "confirmed_after_request_error")
+        self.assertEqual(month_entry["used"], 13)
+        self.assertEqual(budget_state["requests"]["swift-man/app#4"]["status"], "requested")
+        self.assertEqual(month_entry["requests"]["swift-man/app#4"]["status"], "requested")
 
     def test_rollback_ignores_missing_copilot_request(self) -> None:
         month = review_service.current_copilot_review_budget_month()

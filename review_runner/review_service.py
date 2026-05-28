@@ -1532,7 +1532,7 @@ def maybe_request_copilot_review(
             cost=cost,
             budget_file=budget_file,
         )
-    except (AttributeError, OSError, RuntimeError) as exc:
+    except AttributeError as exc:
         used = rollback_copilot_review_budget_request(
             budget_file=budget_file,
             month=month,
@@ -1540,6 +1540,74 @@ def maybe_request_copilot_review(
             default_cost=cost,
             log_prefix=log_prefix,
             reason="request error",
+        )
+        log_progress(log_prefix, f"Copilot review request failed; continuing with MLX review: {exc}")
+        return build_copilot_review_request_result(
+            status="failed",
+            reviewer=reviewer,
+            reason="request_failed",
+            budget=budget,
+            used=used,
+            cost=cost,
+            budget_file=budget_file,
+        )
+    except (OSError, RuntimeError) as exc:
+        try:
+            requested_reviewers = github.list_requested_reviewers(pull_number, timeout=api_timeout_seconds)
+        except (GitHubApiError, AttributeError, OSError, RuntimeError) as confirm_exc:
+            log_progress(
+                log_prefix,
+                "Copilot review request outcome is unknown after request error; "
+                f"leaving pending budget state: {exc}; confirmation failed: {confirm_exc}",
+            )
+            return build_copilot_review_request_result(
+                status="pending",
+                reviewer=reviewer,
+                reason="request_outcome_unknown",
+                budget=budget,
+                used=reserved_used,
+                cost=cost,
+                budget_file=budget_file,
+            )
+
+        if any(is_copilot_requested_reviewer(raw_reviewer, reviewer) for raw_reviewer in requested_reviewers):
+            confirmed_used = mark_copilot_review_budget_request_confirmed(
+                budget_file=budget_file,
+                month=month,
+                request_key=request_key,
+                log_prefix=log_prefix,
+            )
+            if confirmed_used is None:
+                return build_copilot_review_request_result(
+                    status="requested_budget_record_failed",
+                    reviewer=reviewer,
+                    reason="budget_state_save_failed",
+                    budget=budget,
+                    used=reserved_used,
+                    cost=cost,
+                    budget_file=budget_file,
+                )
+            log_progress(
+                log_prefix,
+                f"Confirmed Copilot review request after request error; local monthly budget usage is {confirmed_used}/{budget}",
+            )
+            return build_copilot_review_request_result(
+                status="requested",
+                reviewer=reviewer,
+                reason="confirmed_after_request_error",
+                budget=budget,
+                used=confirmed_used,
+                cost=cost,
+                budget_file=budget_file,
+            )
+
+        used = rollback_copilot_review_budget_request(
+            budget_file=budget_file,
+            month=month,
+            request_key=request_key,
+            default_cost=cost,
+            log_prefix=log_prefix,
+            reason="request error without GitHub reviewer",
         )
         log_progress(log_prefix, f"Copilot review request failed; continuing with MLX review: {exc}")
         return build_copilot_review_request_result(
