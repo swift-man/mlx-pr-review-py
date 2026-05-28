@@ -84,19 +84,19 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_REVIEW_BACKEND=local` 또는 `remote` (옵션, 기본값은 `local`)
 - `MLX_GENERATE_URL=http://127.0.0.1:8002/v1/generate` (remote backend용)
 - `MLX_GENERATE_AUTH_TOKEN=...` (옵션, remote generate 서버가 Bearer 인증을 쓸 때)
-- `MLX_GENERATE_TIMEOUT=240` (옵션, remote generate 응답 timeout 초. 초과 시 같은 장기 생성 요청을 재시도하지 않고 명확한 timeout 오류를 남김)
-- `MLX_GENERATE_CLIENT_MAX_BODY_BYTES=1048576` (옵션, remote generate 요청 body 상한. 서버의 `MLX_HTTP_BODY_MAX_BYTES`와 맞춰 설정)
+- `MLX_GENERATE_TIMEOUT=360` (옵션, remote generate 응답 timeout 초. 초과 시 같은 장기 생성 요청을 재시도하지 않고 명확한 timeout 오류를 남김)
+- `MLX_GENERATE_CLIENT_MAX_BODY_BYTES=4194304` (옵션, remote generate 요청 body 상한. 서버의 `MLX_HTTP_BODY_MAX_BYTES`와 맞춰 설정)
 - `MLX_MODEL=mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` (운영 예시값. local 클라이언트 코드 기본값은 7B)
 - `MLX_DEVICE=cpu` (옵션, Metal 장애 시 fallback. 비워두면 MLX 기본 장치 사용)
 - `GITHUB_API_URL=https://api.github.com` (옵션)
-- `MLX_MAX_TOKENS=900` (옵션, webhook 리뷰가 MLX generate를 오래 점유하지 않도록 운영 예시는 보수적인 상한을 권장)
+- `MLX_MAX_TOKENS=1600` (옵션, 모델 출력 토큰 상한. Apple Silicon 64GB급 로컬 운영은 품질 우선으로 넉넉하게 둠)
 - `MLX_MAX_FINDINGS=10` (옵션)
 - `MLX_REVIEW_CONTEXT_MODE=full_repo` (옵션, 기본값. 변경 파일 context에 더해 예산 안의 repo 파일을 `repository_context`로 추가. `auto`, `full`, `excerpt`, `off` 가능)
-- `MLX_REVIEW_CONTEXT_MAX_CHARS=20000` (옵션, 파일별 current code context 최대 길이)
-- `MLX_REVIEW_CONTEXT_LINE_RADIUS=80` (옵션, 큰 파일 excerpt에서 hunk 앞뒤로 포함할 기본 줄 수)
-- `MLX_REVIEW_REPO_CONTEXT_MAX_FILES=80` (옵션, `full_repo` 모드에서 추가로 읽을 변경 외 repo 파일 수 상한)
-- `MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=160000` (옵션, `repository_context` 전체 문자 상한)
-- `MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS=12000` (옵션, `repository_context` 파일별 문자 상한)
+- `MLX_REVIEW_CONTEXT_MAX_CHARS=30000` (옵션, 파일별 current code context 최대 길이)
+- `MLX_REVIEW_CONTEXT_LINE_RADIUS=120` (옵션, 큰 파일 excerpt에서 hunk 앞뒤로 포함할 기본 줄 수)
+- `MLX_REVIEW_REPO_CONTEXT_MAX_FILES=120` (옵션, `full_repo` 모드에서 추가로 읽을 변경 외 repo 파일 수 상한)
+- `MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=320000` (옵션, `repository_context` 전체 문자 상한)
+- `MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS=18000` (옵션, `repository_context` 파일별 문자 상한)
 - `MLX_TRUST_REMOTE_CODE=0` (옵션)
 - `COPILOT_REVIEW_BUDGET_FILE=/absolute/path/to/copilot-budget.json` (옵션, Copilot 요청 budget 파일 경로 직접 지정)
 - `COPILOT_REVIEW_API_TIMEOUT_SECONDS=10` (옵션, Copilot reviewer 조회/요청 GitHub API timeout)
@@ -547,7 +547,7 @@ false positive 방지를 위해 게시하지 않습니다. `Blocking`/`Major`는
 프롬프트의 `files[]`에는 GitHub diff patch와 함께 `current_file_context`가 들어갑니다. 작은 변경 파일은
 최신 PR HEAD의 전체 파일을 line-numbered 형태로 넣고, 큰 파일은 모든 hunk 주변을 보존하도록 반경을 줄인
 excerpt를 넣습니다. 기본 `full_repo` 모드에서는 변경 파일 외 repo 파일도 `.reviewbot.yml`/built-in 필터와
-예산 안에서 `repository_context`로 추가합니다. 모델은 이 context로 diff 밖 호출자와 helper 흐름을 검증하지만,
+Apple Silicon 64GB급 운영 예산 안에서 `repository_context`로 추가합니다. 모델은 이 context로 diff 밖 호출자와 helper 흐름을 검증하지만,
 GitHub Review API 제약 때문에 실제 코멘트 line은 여전히 `valid_comment_lines` 안에서만 선택해야 합니다.
 [`review_runner/sample_mlx_client.py`](/Users/m4_25/develop/codereview/review_runner/sample_mlx_client.py)는
 기존 경로 호환을 위한 래퍼만 남겨뒀습니다.

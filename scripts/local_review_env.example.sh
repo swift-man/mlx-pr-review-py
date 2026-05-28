@@ -26,18 +26,17 @@ export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/mlx-review-bot.2026-0
 export GITHUB_WEBHOOK_SECRET=replace-me
 export GITHUB_REPOSITORY=swift-man/review.gorani.me
 export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
-# webhook 백그라운드 작업이 MLX generate 를 오래 점유하면 리뷰가 게시되지 않은 것처럼
-# 보일 수 있으므로 운영 예시는 응답 상한을 보수적으로 둔다.
-export MLX_MAX_TOKENS=900
+# Apple Silicon 64GB급 로컬 운영은 품질 우선으로 출력 상한을 넉넉하게 둔다.
+export MLX_MAX_TOKENS=1600
 # PR 리뷰 입력은 diff만 보지 않고 최신 PR HEAD의 변경 파일과 repo context도 함께 봅니다.
 # 기본 full_repo: 변경 파일 full/excerpt + 예산 안의 변경 외 repo 파일을 추가합니다.
 # timeout/body limit 이 부담되면 auto(변경 파일만) 또는 off 로 낮출 수 있습니다.
 # export MLX_REVIEW_CONTEXT_MODE=full_repo
-# export MLX_REVIEW_CONTEXT_MAX_CHARS=20000
-# export MLX_REVIEW_CONTEXT_LINE_RADIUS=80
-# export MLX_REVIEW_REPO_CONTEXT_MAX_FILES=80
-# export MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=160000
-# export MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS=12000
+# export MLX_REVIEW_CONTEXT_MAX_CHARS=30000
+# export MLX_REVIEW_CONTEXT_LINE_RADIUS=120
+# export MLX_REVIEW_REPO_CONTEXT_MAX_FILES=120
+# export MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=320000
+# export MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS=18000
 # Metal/MLX abort가 반복되면 주석을 해제해 CPU fallback으로 확인하세요.
 # export MLX_DEVICE=cpu
 
@@ -62,9 +61,9 @@ export MLX_MAX_TOKENS=900
 # Bearer 인증을 사용한다면 mlx-final-py 와 같은 토큰을 export.
 # export MLX_GENERATE_AUTH_TOKEN=replace-me
 # 응답 timeout (초). 초과하면 같은 장기 생성 요청을 다시 보내지 않고 timeout 으로 실패 처리한다.
-export MLX_GENERATE_TIMEOUT=240
-# 요청 body 상한 (bytes). mlx-final-py 의 MLX_HTTP_BODY_MAX_BYTES 와 맞춰서 올리세요.
-# export MLX_GENERATE_CLIENT_MAX_BODY_BYTES=1048576
+export MLX_GENERATE_TIMEOUT=360
+# 요청 body 상한 (bytes). mlx-final-py 의 MLX_HTTP_BODY_MAX_BYTES 와 같은 값으로 맞추세요.
+export MLX_GENERATE_CLIENT_MAX_BODY_BYTES=4194304
 
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
