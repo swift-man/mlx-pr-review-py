@@ -921,6 +921,19 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertIn("13: line 13", excerpt)
         self.assertNotIn("7: line 7", excerpt)
 
+    def test_review_context_settings_uses_slots(self) -> None:
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=120,
+            max_chars=30_000,
+            repository_max_files=120,
+            repository_max_chars=320_000,
+            repository_file_max_chars=18_000,
+            api_timeout_seconds=20,
+        )
+
+        self.assertFalse(hasattr(settings, "__dict__"))
+
     def test_current_file_context_uses_full_file_when_it_fits(self) -> None:
         context, mode = review_service.build_current_file_context(
             "def a():\n    return 1\n",
@@ -3230,6 +3243,11 @@ class DescriptiveChangeNarrationTests(unittest.TestCase):
         self.assertTrue(
             review_service.looks_like_praise_only_comment("새로운 테스트 파일이 추가되었습니다.")
         )
+
+    def test_looks_like_praise_only_comment_drops_fallback_positive_markers(self) -> None:
+        for marker in review_service.LOW_SIGNAL_FALLBACK_POSITIVE_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertTrue(review_service.looks_like_praise_only_comment(marker))
 
     def test_strips_trailing_non_period_punctuation(self) -> None:
         # MLX 가 간혹 마침표 대신 !/?/~ 를 붙여도 동일하게 필터되어야 한다.

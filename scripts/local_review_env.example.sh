@@ -62,7 +62,7 @@ export MLX_MAX_TOKENS=1600
 # Bearer 인증을 사용한다면 mlx-final-py 와 같은 토큰을 export.
 # export MLX_GENERATE_AUTH_TOKEN=replace-me
 # 응답 timeout (초). 초과하면 같은 장기 생성 요청을 다시 보내지 않고 timeout 으로 실패 처리한다.
-export MLX_GENERATE_TIMEOUT=360
+export MLX_GENERATE_TIMEOUT=900
 # 요청 body 상한 (bytes). mlx-final-py 의 MLX_HTTP_BODY_MAX_BYTES 와 같은 값으로 맞추세요.
 export MLX_GENERATE_CLIENT_MAX_BODY_BYTES=4194304
 

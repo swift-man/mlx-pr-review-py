@@ -118,15 +118,16 @@ NO_FINDINGS_SUMMARY_MARKERS = (
     "별도 개선 필요 사항은 발견되지 않았습니다.",
     "개선이 필요한 점은 발견되지 않았습니다.",
 )
-DEFAULT_FALLBACK_POSITIVES = [
-    "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
-]
 DEFAULT_NO_CONCERNS_TEXT = "이번 diff 기준으로 별도 개선 필요 사항은 발견되지 않았습니다."
 LOW_SIGNAL_POSITIVE_MARKERS = (
     "pr diff가 잘 작성",
     "pr diff의 내용이 잘 정리",
     "변경 내용이 잘 정리",
     "모든 파일이 잘 수정",
+)
+LOW_SIGNAL_FALLBACK_POSITIVE_MARKERS = (
+    "핵심 변경 의도가 diff 안에서 비교적 명확하게 드러납니다.",
+    "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
 )
 LOW_SIGNAL_MODEL_CHANGE_MARKERS = (
     "mlx_model의 값이 변경",
@@ -410,10 +411,7 @@ def looks_like_praise_only_comment(text: str) -> bool:
     lowered = normalized.lower()
     return any(
         marker in lowered
-        for marker in (
-            "핵심 변경 의도가 diff 안에서 비교적 명확하게 드러납니다.",
-            "변경 범위가 비교적 집중되어 있어 의도를 따라가기 쉽습니다.",
-        )
+        for marker in LOW_SIGNAL_FALLBACK_POSITIVE_MARKERS
     )
 
 
@@ -772,7 +770,7 @@ class RepositoryContextEntry:
     mode: str = "full_file"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReviewContextSettings:
     mode: str
     line_radius: int
