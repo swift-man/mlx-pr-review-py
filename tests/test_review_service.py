@@ -973,6 +973,85 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertTrue(any("지역 변수" in hint for hint in hints))
         self.assertTrue(any("RequestError" in hint for hint in hints))
 
+    def test_make_prompt_includes_repository_context(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        repo_context = [
+            review_service.RepositoryContextEntry(
+                path="price_proxy/models.py",
+                content="1: class WatchItem:\n2:     pass",
+                mode="full_file",
+            )
+        ]
+
+        prompt = json.loads(
+            review_service.make_prompt(
+                "swift-man/app",
+                4,
+                [pr_file],
+                repository_context=repo_context,
+            )
+        )
+
+        self.assertEqual(prompt["repository_context"][0]["path"], "price_proxy/models.py")
+        self.assertIn("repository_context", " ".join(prompt["instructions"]["file_context_rules"]))
+
+    def test_collect_repository_context_uses_full_repo_mode_budget_and_filters(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(
+            include=("**/*.py",),
+            exclude=("vendor/**",),
+            always_review=(),
+            loaded=True,
+        )
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str) -> list[dict[str, object]]:
+                case.assertEqual(ref, "abc123")
+                return [
+                    {"type": "blob", "path": "price_proxy/service.py", "size": 100},
+                    {"type": "blob", "path": "price_proxy/models.py", "size": 100},
+                    {"type": "blob", "path": "vendor/generated.py", "size": 100},
+                    {"type": "blob", "path": "README.md", "size": 100},
+                ]
+
+            def get_file_text(self, path: str, *, ref: str) -> str:
+                case.assertEqual(ref, "abc123")
+                return f"# {path}\nvalue = 1\n"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.CURRENT_FILE_CONTEXT_MODE_ENV: "full_repo",
+                review_service.REPOSITORY_CONTEXT_MAX_FILES_ENV: "5",
+                review_service.REPOSITORY_CONTEXT_MAX_CHARS_ENV: "2000",
+                review_service.REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV: "1000",
+            },
+            clear=False,
+        ):
+            entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config)
+
+        self.assertEqual([entry.path for entry in entries], ["price_proxy/models.py"])
+        self.assertIn("1: # price_proxy/models.py", entries[0].content)
+
 
 class CopilotReviewRequestTests(unittest.TestCase):
     def test_requests_copilot_review_when_enabled_and_budget_available(self) -> None:

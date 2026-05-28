@@ -49,7 +49,13 @@ CURRENT_FILE_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_CONTEXT_MAX_CHARS"
 DEFAULT_CURRENT_FILE_CONTEXT_LINE_RADIUS = 80
 DEFAULT_CURRENT_FILE_CONTEXT_MAX_CHARS = 20_000
 CURRENT_FILE_CONTEXT_MODE_ENV = "MLX_REVIEW_CONTEXT_MODE"
-DEFAULT_CURRENT_FILE_CONTEXT_MODE = "auto"
+DEFAULT_CURRENT_FILE_CONTEXT_MODE = "full_repo"
+REPOSITORY_CONTEXT_MAX_FILES_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_FILES"
+REPOSITORY_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_CHARS"
+REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS"
+DEFAULT_REPOSITORY_CONTEXT_MAX_FILES = 80
+DEFAULT_REPOSITORY_CONTEXT_MAX_CHARS = 160_000
+DEFAULT_REPOSITORY_CONTEXT_FILE_MAX_CHARS = 12_000
 COPILOT_REVIEW_REQUEST_ENV = "COPILOT_REVIEW_REQUEST"
 COPILOT_REVIEWER_ENV = "COPILOT_REVIEWER"
 COPILOT_REVIEW_MONTHLY_BUDGET_ENV = "COPILOT_REVIEW_MONTHLY_BUDGET"
@@ -757,6 +763,13 @@ class PullRequestFile:
     current_file_context_mode: str = ""
 
 
+@dataclass
+class RepositoryContextEntry:
+    path: str
+    content: str
+    mode: str = "full_file"
+
+
 @dataclass(frozen=True)
 class PullRequestDiscussionItem:
     source: str
@@ -803,6 +816,7 @@ class ReviewBotConfig:
 class PullRequestFileLoadResult:
     files: list[PullRequestFile]
     patchable_count: int
+    repository_context: list[RepositoryContextEntry] = field(default_factory=list)
     skipped_by_reviewbot: int = 0
     reviewbot_config_loaded: bool = False
     default_filter_applied: bool = False
@@ -964,6 +978,19 @@ class GitHubApi:
         if not normalized_sha:
             raise RuntimeError(f"GitHub pull request response did not include head.sha for #{pull_number}")
         return normalized_sha
+
+    def list_repo_tree(self, ref: str) -> list[dict[str, Any]]:
+        response = self.request_json(
+            "GET",
+            f"/repos/{self.repository}/git/trees/{ref}",
+            params={"recursive": "1"},
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError(f"GitHub tree response for {ref} was not an object")
+        tree = response.get("tree")
+        if not isinstance(tree, list):
+            raise RuntimeError(f"GitHub tree response for {ref} did not include tree[]")
+        return [item for item in tree if isinstance(item, dict)]
 
     def get_file_text(self, path: str, *, ref: str) -> str:
         encoded_path = urllib.parse.quote(path, safe="/")
@@ -1836,11 +1863,34 @@ def configured_current_file_context_mode() -> str:
     mode = normalize_text(os.environ.get(CURRENT_FILE_CONTEXT_MODE_ENV)).lower()
     if mode in {"off", "none", "disabled", "0"}:
         return "off"
+    if mode in {"full_repo", "full-repo", "repo", "repository"}:
+        return "full_repo"
     if mode in {"full", "full_file", "full-file"}:
         return "full"
     if mode == "excerpt":
         return "excerpt"
     return DEFAULT_CURRENT_FILE_CONTEXT_MODE
+
+
+def configured_repository_context_max_files() -> int:
+    return parse_non_negative_int_env(
+        REPOSITORY_CONTEXT_MAX_FILES_ENV,
+        DEFAULT_REPOSITORY_CONTEXT_MAX_FILES,
+    )
+
+
+def configured_repository_context_max_chars() -> int:
+    return parse_non_negative_int_env(
+        REPOSITORY_CONTEXT_MAX_CHARS_ENV,
+        DEFAULT_REPOSITORY_CONTEXT_MAX_CHARS,
+    )
+
+
+def configured_repository_context_file_max_chars() -> int:
+    return parse_non_negative_int_env(
+        REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV,
+        DEFAULT_REPOSITORY_CONTEXT_FILE_MAX_CHARS,
+    )
 
 
 def truncate_context(text: str, max_chars: int, *, suffix: str) -> str:
@@ -1926,7 +1976,7 @@ def build_current_file_context(
     if mode == "off" or max_chars <= 0:
         return "", "off"
 
-    if mode in {"auto", "full"}:
+    if mode in {"auto", "full", "full_repo"}:
         full_context = build_line_numbered_file_context(file_text, max_chars=max_chars)
         if full_context and (mode == "full" or "full file context truncated" not in full_context):
             return full_context, "full_file"
@@ -1988,6 +2038,111 @@ def enrich_pr_files_with_current_context(
 
     if loaded_count:
         log_progress(log_prefix, f"Loaded current file context for {loaded_count} patchable file(s) mode={mode}")
+
+
+def repository_context_enabled(mode: str) -> bool:
+    return mode == "full_repo"
+
+
+def tree_item_path(item: dict[str, Any]) -> str:
+    return normalize_text(item.get("path"))
+
+
+def tree_item_size(item: dict[str, Any]) -> int:
+    value = item.get("size")
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def repository_context_priority(path: str, changed_paths: set[str]) -> tuple[int, str]:
+    dirname = path.rsplit("/", 1)[0] if "/" in path else ""
+    changed_dirs = {changed.rsplit("/", 1)[0] if "/" in changed else "" for changed in changed_paths}
+    filename = path.rsplit("/", 1)[-1]
+    first_segment = path.split("/", 1)[0]
+
+    if dirname in changed_dirs:
+        return (0, path)
+    if filename in {"pyproject.toml", "package.json", "Package.swift", "Project.swift", "tsconfig.json"}:
+        return (1, path)
+    if first_segment in {"review_runner", "src", "app", "lib", "pkg", "internal", "Sources"}:
+        return (2, path)
+    if first_segment in {"tests", "test"} or filename.startswith("test_"):
+        return (3, path)
+    return (4, path)
+
+
+def collect_repository_context(
+    github: GitHubApi,
+    pull_number: int,
+    changed_files: list[PullRequestFile],
+    config: ReviewBotConfig,
+    *,
+    log_prefix: str = "",
+) -> list[RepositoryContextEntry]:
+    """품질 우선 리뷰를 위해 PR HEAD의 repo 파일 일부를 읽기 전용 컨텍스트로 수집한다."""
+    mode = configured_current_file_context_mode()
+    if not repository_context_enabled(mode):
+        return []
+
+    max_files = configured_repository_context_max_files()
+    max_chars = configured_repository_context_max_chars()
+    file_max_chars = configured_repository_context_file_max_chars()
+    if max_files <= 0 or max_chars <= 0 or file_max_chars <= 0:
+        return []
+
+    changed_paths = {pr_file.filename for pr_file in changed_files}
+    try:
+        head_sha = github.get_pull_head_sha(pull_number)
+        tree = github.list_repo_tree(head_sha)
+    except (RuntimeError, OSError, AttributeError) as exc:
+        log_progress(log_prefix, f"Skipping repository context: {exc}")
+        return []
+
+    candidates: list[tuple[tuple[int, str], str, int]] = []
+    for item in tree:
+        if item.get("type") != "blob":
+            continue
+        path = tree_item_path(item)
+        if not path or path in changed_paths:
+            continue
+        if not should_review_file(path, config):
+            continue
+        size = tree_item_size(item)
+        if size and size > file_max_chars * 4:
+            continue
+        candidates.append((repository_context_priority(path, changed_paths), path, size))
+
+    entries: list[RepositoryContextEntry] = []
+    total_chars = 0
+    for _priority, path, _size in sorted(candidates):
+        if len(entries) >= max_files or total_chars >= max_chars:
+            break
+        try:
+            file_text = github.get_file_text(path, ref=head_sha)
+        except (RuntimeError, OSError) as exc:
+            log_progress(log_prefix, f"Skipping repository context for {path}: {exc}")
+            continue
+
+        context = build_line_numbered_file_context(file_text, max_chars=file_max_chars)
+        if not context:
+            continue
+        entry_cost = len(path) + len(context) + 32
+        if total_chars + entry_cost > max_chars:
+            break
+        mode_name = "full_file" if "full file context truncated" not in context else "truncated_file"
+        entries.append(RepositoryContextEntry(path=path, content=context, mode=mode_name))
+        total_chars += entry_cost
+
+    if entries:
+        log_progress(
+            log_prefix,
+            f"Loaded repository context files={len(entries)} chars={total_chars}/{max_chars}",
+        )
+    return entries
 
 
 def build_review_focus_hints(files: list[PullRequestFile]) -> list[str]:
@@ -2767,6 +2922,7 @@ def make_prompt(
     pull_number: int,
     files: list[PullRequestFile],
     *,
+    repository_context: list[RepositoryContextEntry] | None = None,
     existing_review_context: list[dict[str, Any]] | None = None,
 ) -> str:
     """모델이 바로 읽을 수 있는 JSON 프롬프트를 조립한다."""
@@ -2802,7 +2958,7 @@ def make_prompt(
             ],
             "file_context_rules": [
                 "patch는 GitHub에 실제 코멘트를 달 수 있는 diff이고, current_file_context는 최신 PR HEAD의 변경 파일 전체 또는 큰 파일의 변경 hunk 주변 excerpt입니다.",
-                "diff 밖 함수, 기존 호출자, 공용 helper와의 상호작용은 current_file_context로 확인하세요.",
+                "repository_context는 최신 PR HEAD에서 예산 안에 들어온 변경 외 파일들의 읽기 전용 컨텍스트입니다. diff 밖 함수, 기존 호출자, 공용 helper와의 상호작용은 current_file_context와 repository_context로 확인하세요.",
                 "문제가 current_file_context의 unchanged line에서 드러나더라도, comments[].line은 반드시 valid_comment_lines 중 이 문제를 새로 만든 changed/context line으로 선택하세요. 적절한 valid line이 없으면 코멘트를 작성하지 마세요.",
             ],
             "existing_review_context_rules": [
@@ -2854,6 +3010,15 @@ def make_prompt(
     }
     if review_focus_hints:
         prompt_payload["instructions"]["review_focus_hints"] = review_focus_hints
+    if repository_context:
+        prompt_payload["repository_context"] = [
+            {
+                "path": entry.path,
+                "mode": entry.mode,
+                "content": entry.content,
+            }
+            for entry in repository_context
+        ]
     if existing_review_context:
         prompt_payload["existing_review_context"] = existing_review_context
     return json.dumps(prompt_payload, ensure_ascii=False, indent=2)
@@ -3553,9 +3718,17 @@ def load_patchable_pr_files_result(
     else:
         log_progress(log_prefix, f"Loaded {len(filtered_files)} patchable file(s)")
     enrich_pr_files_with_current_context(github, pull_number, filtered_files, log_prefix=log_prefix)
+    repository_context = collect_repository_context(
+        github,
+        pull_number,
+        filtered_files,
+        config,
+        log_prefix=log_prefix,
+    )
     return PullRequestFileLoadResult(
         files=filtered_files,
         patchable_count=len(pr_files),
+        repository_context=repository_context,
         skipped_by_reviewbot=skipped_by_reviewbot,
         reviewbot_config_loaded=config.loaded,
         default_filter_applied=not config.loaded and config.has_filters,
@@ -3571,6 +3744,7 @@ def generate_review_artifacts(
     pull_number: int,
     pr_files: list[PullRequestFile],
     *,
+    repository_context: list[RepositoryContextEntry] | None = None,
     existing_review_context: list[dict[str, Any]] | None = None,
     log_prefix: str = "",
 ) -> ReviewGenerationArtifacts:
@@ -3578,6 +3752,7 @@ def generate_review_artifacts(
         repository,
         pull_number,
         pr_files,
+        repository_context=repository_context,
         existing_review_context=existing_review_context,
     )
     if os.environ.get("WRITE_PROMPT_DEBUG") == "1":
@@ -3686,6 +3861,7 @@ def review_pull_request(
         repository,
         pull_number,
         pr_files,
+        repository_context=file_load_result.repository_context,
         existing_review_context=existing_review_context,
         log_prefix=log_prefix,
     )
@@ -3697,6 +3873,7 @@ def review_pull_request(
         auth_source,
     )
     result["existing_review_context_count"] = len(existing_review_context)
+    result["repository_context_count"] = len(file_load_result.repository_context)
     result["copilot_review_request"] = copilot_review_request
 
     if dry_run:
