@@ -5,8 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOCAL_REVIEW_HOME="${LOCAL_REVIEW_HOME:-$DEFAULT_HOME}"
 ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$LOCAL_REVIEW_HOME/scripts/local_review_env.sh}"
-LAUNCH_AGENT_LABEL="${LOCAL_REVIEW_LAUNCH_AGENT_LABEL:-com.swiftman.pr-review}"
-LAUNCH_AGENT_SERVICE="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
 
 if [[ -f "$ENV_FILE" ]]; then
   set +u
@@ -14,6 +12,8 @@ if [[ -f "$ENV_FILE" ]]; then
   set -u
 fi
 
+LAUNCH_AGENT_LABEL="${LOCAL_REVIEW_LAUNCH_AGENT_LABEL:-com.swiftman.pr-review}"
+LAUNCH_AGENT_SERVICE="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
 PORT="${PORT:-8000}"
 HEALTH_HOST="${LOCAL_REVIEW_HEALTH_HOST:-127.0.0.1}"
 HEALTH_URL="${LOCAL_REVIEW_HEALTH_URL:-http://$HEALTH_HOST:$PORT/healthz}"
