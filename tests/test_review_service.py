@@ -624,7 +624,7 @@ review:
                 case.assertEqual(pull_number, 7)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 self.loaded_paths.append((path, ref))
                 if path != review_service.REVIEWBOT_CONFIG_PATH:
                     return "line 1\nline 2\n"
@@ -690,7 +690,7 @@ review:
                 case.assertEqual(pull_number, 7)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 self.loaded_paths.append((path, ref))
                 raise RuntimeError("GitHub API GET https://api.github.com/repos/swift-man/app/contents/.reviewbot.yml failed: 404 Not Found")
 
@@ -746,7 +746,7 @@ review:
                 case.assertEqual(pull_number, 7)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 case.assertEqual((path, ref), (review_service.REVIEWBOT_CONFIG_PATH, "abc123"))
                 return raw_config
 
@@ -950,6 +950,18 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertIn("Lines 99-102:", context)
         self.assertNotIn("Lines 1-", context)
 
+    def test_configured_context_mode_auto_disables_repository_context(self) -> None:
+        with mock.patch.dict(os.environ, {review_service.CURRENT_FILE_CONTEXT_MODE_ENV: "auto"}, clear=False):
+            mode = review_service.configured_current_file_context_mode()
+
+        self.assertEqual(mode, "auto")
+        self.assertFalse(review_service.repository_context_enabled(mode))
+
+    def test_repository_context_priority_does_not_promote_all_root_files_for_root_change(self) -> None:
+        priority, path = review_service.repository_context_priority("LICENSE", {"README.md"})
+
+        self.assertEqual((priority, path), (4, "LICENSE"))
+
     def test_make_prompt_includes_current_file_context_and_cooldown_focus_hints(self) -> None:
         pr_file = review_service.PullRequestFile(
             filename="price_proxy/service.py",
@@ -1058,8 +1070,9 @@ class ExistingReviewContextTests(unittest.TestCase):
                 case.assertEqual(pull_number, 4)
                 return "abc123"
 
-            def list_repo_tree(self, ref: str) -> list[dict[str, object]]:
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
                 case.assertEqual(ref, "abc123")
+                case.assertEqual(timeout, 7)
                 return [
                     {"type": "blob", "path": "price_proxy/service.py", "size": 100},
                     {"type": "blob", "path": "price_proxy/models.py", "size": 100},
@@ -1067,8 +1080,9 @@ class ExistingReviewContextTests(unittest.TestCase):
                     {"type": "blob", "path": "README.md", "size": 100},
                 ]
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 case.assertEqual(ref, "abc123")
+                case.assertEqual(timeout, 7)
                 return f"# {path}\nvalue = 1\n"
 
         with mock.patch.dict(
@@ -1078,6 +1092,7 @@ class ExistingReviewContextTests(unittest.TestCase):
                 review_service.REPOSITORY_CONTEXT_MAX_FILES_ENV: "5",
                 review_service.REPOSITORY_CONTEXT_MAX_CHARS_ENV: "2000",
                 review_service.REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV: "1000",
+                review_service.REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV: "7",
             },
             clear=False,
         ):
@@ -1696,7 +1711,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 case.assertEqual(ref, "abc123")
                 if path == review_service.REVIEWBOT_CONFIG_PATH:
                     raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")

@@ -97,6 +97,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_REVIEW_REPO_CONTEXT_MAX_FILES=120` (옵션, `full_repo` 모드에서 추가로 읽을 변경 외 repo 파일 수 상한)
 - `MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=320000` (옵션, `repository_context` 전체 문자 상한)
 - `MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS=18000` (옵션, `repository_context` 파일별 문자 상한)
+- `MLX_REVIEW_CONTEXT_API_TIMEOUT_SECONDS=20` (옵션, current/repository context 수집용 GitHub contents/tree API 호출 timeout)
 - `MLX_TRUST_REMOTE_CODE=0` (옵션)
 - `COPILOT_REVIEW_BUDGET_FILE=/absolute/path/to/copilot-budget.json` (옵션, Copilot 요청 budget 파일 경로 직접 지정)
 - `COPILOT_REVIEW_API_TIMEOUT_SECONDS=10` (옵션, Copilot reviewer 조회/요청 GitHub API timeout)

@@ -53,9 +53,11 @@ DEFAULT_CURRENT_FILE_CONTEXT_MODE = "full_repo"
 REPOSITORY_CONTEXT_MAX_FILES_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_FILES"
 REPOSITORY_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_CHARS"
 REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS"
+REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV = "MLX_REVIEW_CONTEXT_API_TIMEOUT_SECONDS"
 DEFAULT_REPOSITORY_CONTEXT_MAX_FILES = 120
 DEFAULT_REPOSITORY_CONTEXT_MAX_CHARS = 320_000
 DEFAULT_REPOSITORY_CONTEXT_FILE_MAX_CHARS = 18_000
+DEFAULT_REVIEW_CONTEXT_API_TIMEOUT_SECONDS = 20
 COPILOT_REVIEW_REQUEST_ENV = "COPILOT_REVIEW_REQUEST"
 COPILOT_REVIEWER_ENV = "COPILOT_REVIEWER"
 COPILOT_REVIEW_MONTHLY_BUDGET_ENV = "COPILOT_REVIEW_MONTHLY_BUDGET"
@@ -979,11 +981,12 @@ class GitHubApi:
             raise RuntimeError(f"GitHub pull request response did not include head.sha for #{pull_number}")
         return normalized_sha
 
-    def list_repo_tree(self, ref: str) -> list[dict[str, Any]]:
+    def list_repo_tree(self, ref: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
         response = self.request_json(
             "GET",
             f"/repos/{self.repository}/git/trees/{ref}",
             params={"recursive": "1"},
+            timeout=timeout,
         )
         if not isinstance(response, dict):
             raise RuntimeError(f"GitHub tree response for {ref} was not an object")
@@ -992,12 +995,13 @@ class GitHubApi:
             raise RuntimeError(f"GitHub tree response for {ref} did not include tree[]")
         return [item for item in tree if isinstance(item, dict)]
 
-    def get_file_text(self, path: str, *, ref: str) -> str:
+    def get_file_text(self, path: str, *, ref: str, timeout: float | None = None) -> str:
         encoded_path = urllib.parse.quote(path, safe="/")
         response = self.request_json(
             "GET",
             f"/repos/{self.repository}/contents/{encoded_path}",
             params={"ref": ref},
+            timeout=timeout,
         )
         if not isinstance(response, dict):
             raise RuntimeError(f"GitHub contents response for {path} was not a file")
@@ -1867,6 +1871,8 @@ def configured_current_file_context_mode() -> str:
         return "full_repo"
     if mode in {"full", "full_file", "full-file"}:
         return "full"
+    if mode == "auto":
+        return "auto"
     if mode == "excerpt":
         return "excerpt"
     return DEFAULT_CURRENT_FILE_CONTEXT_MODE
@@ -1890,6 +1896,13 @@ def configured_repository_context_file_max_chars() -> int:
     return parse_non_negative_int_env(
         REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV,
         DEFAULT_REPOSITORY_CONTEXT_FILE_MAX_CHARS,
+    )
+
+
+def configured_review_context_api_timeout_seconds() -> int:
+    return parse_positive_int_env(
+        REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV,
+        DEFAULT_REVIEW_CONTEXT_API_TIMEOUT_SECONDS,
     )
 
 
@@ -2008,6 +2021,7 @@ def enrich_pr_files_with_current_context(
     line_radius = configured_current_file_context_line_radius()
     max_chars = configured_current_file_context_max_chars()
     mode = configured_current_file_context_mode()
+    api_timeout_seconds = configured_review_context_api_timeout_seconds()
     if mode == "off" or max_chars <= 0:
         return
 
@@ -2022,7 +2036,7 @@ def enrich_pr_files_with_current_context(
         if pr_file.status.lower() in {"removed", "deleted"}:
             continue
         try:
-            file_text = github.get_file_text(pr_file.filename, ref=head_sha)
+            file_text = github.get_file_text(pr_file.filename, ref=head_sha, timeout=api_timeout_seconds)
         except (RuntimeError, OSError) as exc:
             log_progress(log_prefix, f"Skipping current file context for {pr_file.filename}: {exc}")
             continue
@@ -2068,7 +2082,7 @@ def repository_context_priority(path: str, changed_paths: set[str]) -> tuple[int
     filename = path.rsplit("/", 1)[-1]
     first_segment = path.split("/", 1)[0]
 
-    if dirname in changed_dirs:
+    if dirname and dirname in changed_dirs:
         return (0, path)
     if filename in {"pyproject.toml", "package.json", "Package.swift", "Project.swift", "tsconfig.json"}:
         return (1, path)
@@ -2095,13 +2109,14 @@ def collect_repository_context(
     max_files = configured_repository_context_max_files()
     max_chars = configured_repository_context_max_chars()
     file_max_chars = configured_repository_context_file_max_chars()
+    api_timeout_seconds = configured_review_context_api_timeout_seconds()
     if max_files <= 0 or max_chars <= 0 or file_max_chars <= 0:
         return []
 
     changed_paths = {pr_file.filename for pr_file in changed_files}
     try:
         head_sha = github.get_pull_head_sha(pull_number)
-        tree = github.list_repo_tree(head_sha)
+        tree = github.list_repo_tree(head_sha, timeout=api_timeout_seconds)
     except (RuntimeError, OSError, AttributeError) as exc:
         log_progress(log_prefix, f"Skipping repository context: {exc}")
         return []
@@ -2126,7 +2141,7 @@ def collect_repository_context(
         if len(entries) >= max_files or total_chars >= max_chars:
             break
         try:
-            file_text = github.get_file_text(path, ref=head_sha)
+            file_text = github.get_file_text(path, ref=head_sha, timeout=api_timeout_seconds)
         except (RuntimeError, OSError) as exc:
             log_progress(log_prefix, f"Skipping repository context for {path}: {exc}")
             continue
