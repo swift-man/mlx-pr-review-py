@@ -273,6 +273,8 @@ zsh /Users/runner/pr-review/scripts/kickstart_local_review.sh
 이 스크립트는 `launchctl kickstart -k`, `/healthz` 확인, 로그 tail을 순서대로 실행합니다.
 자동화에서 로그 tail 없이 종료해야 하면 `LOCAL_REVIEW_TAIL_LOGS=0`을 함께 넘깁니다.
 
+### 포그라운드 수동 재시작 (LaunchAgent 미사용 시)
+
 ```bash
 pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 
