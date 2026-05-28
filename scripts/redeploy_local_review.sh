@@ -94,6 +94,82 @@ EOF
   exit 1
 }
 
+resolve_server_port() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "${PORT:-8000}"
+    return
+  fi
+
+  (
+    set +e
+    set +u
+    source "$ENV_FILE" >/dev/null 2>&1
+    echo "${PORT:-8000}"
+  )
+}
+
+review_server_command_matches() {
+  local command_line="$1"
+
+  [[ "$command_line" == *"$TARGET_ROOT/venv/bin/uvicorn"* ]] ||
+    [[ "$command_line" == *"$TARGET_ROOT/scripts/run_webhook_server.sh"* ]] ||
+    ([[ "$command_line" == *"$TARGET_ROOT"* ]] && [[ "$command_line" == *"review_runner.webhook_app:app"* ]])
+}
+
+stop_process() {
+  local pid="$1"
+  local command_line="$2"
+
+  echo "Stopping existing webhook server process on target port: pid=$pid"
+  echo "  $command_line"
+  kill "$pid" 2>/dev/null || return
+
+  for _ in {1..10}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+    sleep 0.2
+  done
+
+  echo "Process $pid did not exit after TERM; sending KILL"
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+stop_target_port_listener() {
+  local port="$1"
+  local pid
+  local command_line
+  local pids
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "lsof not found; skipping target port listener check"
+    return
+  fi
+
+  pids="$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -z "$pids" ]]; then
+    return
+  fi
+
+  for pid in ${(f)pids}; do
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if review_server_command_matches "$command_line"; then
+      stop_process "$pid" "$command_line"
+      continue
+    fi
+
+    cat <<EOF >&2
+Port $port is already in use by a process that does not look like this review server:
+  pid: $pid
+  command: $command_line
+
+Refusing to stop an unrelated process. Stop it manually or change PORT in:
+  $ENV_FILE
+EOF
+    exit 1
+  done
+}
+
 print_launchagent_followup() {
   cat <<EOF
 LaunchAgent restart requested:
@@ -122,10 +198,12 @@ fi
 echo "No loaded LaunchAgent found for $LAUNCH_AGENT_SERVICE"
 echo "Stopping existing foreground webhook server from $TARGET_ROOT"
 pkill -f "$TARGET_ROOT/venv/bin/uvicorn" || true
+stop_target_port_listener "$(resolve_server_port)"
 
 echo "Installing latest source from $SOURCE_ROOT into $TARGET_ROOT"
 PYTHON_BIN="$PYTHON_BIN_RESOLVED" "$SOURCE_ROOT/scripts/install_local_review.sh" "$TARGET_ROOT"
 ensure_env_file_exists
+stop_target_port_listener "$(resolve_server_port)"
 
 echo "Starting webhook server using env file $ENV_FILE"
 export LOCAL_REVIEW_HOME="$TARGET_ROOT"

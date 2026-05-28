@@ -267,10 +267,11 @@ LaunchAgent가 등록되어 있지 않은 개발 환경에서는 기존 uvicorn 
 LaunchAgent 기준으로 재시동만 필요하면 아래 명령을 사용합니다.
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.swiftman.pr-review
-curl http://127.0.0.1:8000/healthz
-tail -f /tmp/mlx-pr-review-webhook.log /tmp/mlx-pr-review-webhook.err.log
+zsh /Users/runner/pr-review/scripts/kickstart_local_review.sh
 ```
+
+이 스크립트는 `launchctl kickstart -k`, `/healthz` 확인, 로그 tail을 순서대로 실행합니다.
+자동화에서 로그 tail 없이 종료해야 하면 `LOCAL_REVIEW_TAIL_LOGS=0`을 함께 넘깁니다.
 
 ```bash
 pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
