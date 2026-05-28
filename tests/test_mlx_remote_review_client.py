@@ -196,7 +196,7 @@ class PostGenerateTests(unittest.TestCase):
         with self._patch_env(), mock.patch("urllib.request.urlopen", urlopen):
             client._post_generate(self.messages)
 
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 360.0)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 900.0)
 
     def test_http_4xx_raises_immediately_no_retry(self) -> None:
         body = b'{"ok":false,"error":"bad request"}'
