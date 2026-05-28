@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_ROOT="${1:-/Users/runner/pr-review}"
+if [[ "$TARGET_ROOT" != "/" ]]; then
+  TARGET_ROOT="${TARGET_ROOT%/}"
+fi
 ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$TARGET_ROOT/scripts/local_review_env.sh}"
 LAUNCH_AGENT_LABEL="${LOCAL_REVIEW_LAUNCH_AGENT_LABEL:-com.swiftman.pr-review}"
 LAUNCH_AGENT_SERVICE="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
@@ -43,6 +46,37 @@ launchagent_is_loaded() {
   command -v launchctl >/dev/null 2>&1 && launchctl print "$LAUNCH_AGENT_SERVICE" >/dev/null 2>&1
 }
 
+launchagent_matches_target() {
+  local launchagent_details="$1"
+  local expected_home_line="LOCAL_REVIEW_HOME => $TARGET_ROOT"
+
+  [[ "$launchagent_details" == *"$TARGET_ROOT/scripts/run_webhook_server.sh"* ]] ||
+    [[ "$launchagent_details" == *"$expected_home_line"$'\n'* ]] ||
+    [[ "$launchagent_details" == *"$expected_home_line" ]]
+}
+
+ensure_launchagent_matches_target() {
+  local launchagent_details
+  launchagent_details="$(launchctl print "$LAUNCH_AGENT_SERVICE" 2>/dev/null || true)"
+
+  if launchagent_matches_target "$launchagent_details"; then
+    return
+  fi
+
+  cat <<EOF >&2
+LaunchAgent $LAUNCH_AGENT_SERVICE is loaded, but it does not point at this deploy target:
+  TARGET_ROOT: $TARGET_ROOT
+
+Expected LaunchAgent to reference one of:
+  $TARGET_ROOT/scripts/run_webhook_server.sh
+  LOCAL_REVIEW_HOME => $TARGET_ROOT
+
+Refusing to redeploy because kickstart would restart a different installation.
+Update ~/Library/LaunchAgents/$LAUNCH_AGENT_LABEL.plist or rerun with the matching target path.
+EOF
+  exit 1
+}
+
 ensure_env_file_exists() {
   if [[ -f "$ENV_FILE" ]]; then
     return
@@ -74,6 +108,7 @@ EOF
 }
 
 if launchagent_is_loaded; then
+  ensure_launchagent_matches_target
   echo "LaunchAgent $LAUNCH_AGENT_SERVICE is loaded; installing latest source before restart"
   PYTHON_BIN="$PYTHON_BIN_RESOLVED" "$SOURCE_ROOT/scripts/install_local_review.sh" "$TARGET_ROOT"
   ensure_env_file_exists

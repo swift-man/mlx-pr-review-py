@@ -233,6 +233,8 @@ pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 `/Users/runner/pr-review`로 다시 복사한 뒤 `launchctl kickstart -k`로 기존 서버를 종료하고
 새 프로세스를 띄웁니다. 이 경로에서는 서버를 포그라운드로 다시 실행하지 않으므로
 `address already in use` 충돌을 피할 수 있습니다.
+단, 로드된 LaunchAgent가 실제로 전달한 배포 대상 경로를 가리키는지 먼저 확인합니다.
+경로가 다르면 다른 설치본을 재시동할 수 있으므로 실패 메시지를 내고 중단합니다.
 
 LaunchAgent가 등록되어 있지 않은 개발 환경에서는 기존 uvicorn 프로세스를 종료한 뒤
 `/Users/runner/pr-review/scripts/local_review_env.sh`를 읽어 서버를 포그라운드로 다시 띄웁니다.
