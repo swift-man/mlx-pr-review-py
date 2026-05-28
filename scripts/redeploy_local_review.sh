@@ -112,8 +112,7 @@ review_server_command_matches() {
   local command_line="$1"
 
   [[ "$command_line" == *"$TARGET_ROOT/venv/bin/uvicorn"* ]] ||
-    [[ "$command_line" == *"$TARGET_ROOT/scripts/run_webhook_server.sh"* ]] ||
-    ([[ "$command_line" == *"$TARGET_ROOT"* ]] && [[ "$command_line" == *"review_runner.webhook_app:app"* ]])
+    [[ "$command_line" == *"$TARGET_ROOT/scripts/run_webhook_server.sh"* ]]
 }
 
 stop_process() {
