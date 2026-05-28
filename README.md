@@ -92,6 +92,9 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_MAX_TOKENS=900` (옵션, webhook 리뷰가 MLX generate를 오래 점유하지 않도록 운영 예시는 보수적인 상한을 권장)
 - `MLX_MAX_FINDINGS=10` (옵션)
 - `MLX_TRUST_REMOTE_CODE=0` (옵션)
+- `COPILOT_REVIEW_BUDGET_FILE=/absolute/path/to/copilot-budget.json` (옵션, Copilot 요청 budget 파일 경로 직접 지정)
+- `COPILOT_REVIEW_API_TIMEOUT_SECONDS=10` (옵션, Copilot reviewer 조회/요청 GitHub API timeout)
+- `COPILOT_REVIEW_PENDING_TTL_SECONDS=600` (옵션, 결과가 모호한 pending 요청을 재처리하기 전 대기 시간)
 - `DRY_RUN=1` (옵션, 실제 GitHub 리뷰를 남기지 않고 흐름만 확인할 때)
 
 `GITHUB_WEBHOOK_SECRET`는 GitHub 저장소 Webhook 설정의 Secret과 반드시 같은 값이어야 합니다.
@@ -124,12 +127,15 @@ COPILOT_REVIEW_MONTHLY_BUDGET=50
 COPILOT_REVIEW_REQUEST_COST=13
 ```
 
-이 상태에서 봇은 PR마다 한 번만 Copilot을 reviewer로 요청하고, 로컬 budget 파일
-`$LOCAL_REVIEW_HOME/.copilot_review_budget.json`에 월별 사용량을 기록합니다. GitHub가 현재 계정,
+이 상태에서 봇은 PR마다 한 번만 Copilot을 reviewer로 요청하고, 로컬 budget 파일에 월별 사용량을
+기록합니다. budget 파일 경로는 `COPILOT_REVIEW_BUDGET_FILE`, `$LOCAL_REVIEW_HOME/.copilot_review_budget.json`,
+`~/.mlx-pr-review-copilot-budget.json` 순서로 결정됩니다. GitHub가 현재 계정,
 조직 정책, Copilot 플랜 또는 권한 때문에 Copilot 리뷰 요청을 거절하면 MLX 리뷰는 계속 진행하고
 로그에 실패 이유만 남깁니다. 요청 POST 이후 timeout처럼 GitHub 처리 여부가 모호한 경우에는 requested
-reviewer를 다시 조회하고, 확인도 실패하면 budget 기록을 pending으로 유지해 이후 TTL 재처리에서 보수적으로
-판단합니다. GitHub 문서상 Copilot Free는 GitHub.com PR code review가 기본 제공되는
+reviewer를 다시 조회합니다. timeout 기본값은 10초이며 `COPILOT_REVIEW_API_TIMEOUT_SECONDS`로 조정할 수 있습니다.
+확인도 실패하면 budget 기록을 pending으로 유지해 이후 TTL 재처리에서 보수적으로 판단합니다.
+pending TTL 기본값은 10분이며 `COPILOT_REVIEW_PENDING_TTL_SECONDS`로 조정할 수 있습니다.
+GitHub 문서상 Copilot Free는 GitHub.com PR code review가 기본 제공되는
 플랜이 아니므로, Free 계정에서는 조직 정책이나 권한 설정에 따라 요청이 거절될 수 있습니다.
 임시로 끄거나 예산을 조정해야 할 때만 `local_review_env.sh`에 `export` 없이 값만 지정하면 됩니다.
 
