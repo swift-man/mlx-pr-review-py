@@ -3231,6 +3231,11 @@ class DescriptiveChangeNarrationTests(unittest.TestCase):
             review_service.looks_like_praise_only_comment("새로운 테스트 파일이 추가되었습니다.")
         )
 
+    def test_looks_like_praise_only_comment_drops_fallback_positive_markers(self) -> None:
+        for marker in review_service.LOW_SIGNAL_FALLBACK_POSITIVE_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertTrue(review_service.looks_like_praise_only_comment(marker))
+
     def test_strips_trailing_non_period_punctuation(self) -> None:
         # MLX 가 간혹 마침표 대신 !/?/~ 를 붙여도 동일하게 필터되어야 한다.
         for text in (
