@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -874,6 +875,107 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertTrue(any("false positive" in rule for rule in rules))
         self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
         self.assertTrue(any("Copilot" in rule and "중복" in rule for rule in rules))
+
+
+class CopilotReviewRequestTests(unittest.TestCase):
+    def test_requests_copilot_review_when_enabled_and_budget_available(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            repository = "swift-man/app"
+
+            def __init__(self) -> None:
+                self.requested_reviewers: list[str] = []
+
+            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return []
+
+            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+                case.assertEqual(pull_number, 4)
+                self.requested_reviewers.extend(reviewers)
+                return {"requested_reviewers": [{"login": reviewers[0]}]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            budget_file = os.path.join(tmpdir, "copilot-budget.json")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    review_service.COPILOT_REVIEW_REQUEST_ENV: "1",
+                    review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: budget_file,
+                    review_service.COPILOT_REVIEW_MONTHLY_BUDGET_ENV: "50",
+                    review_service.COPILOT_REVIEW_REQUEST_COST_ENV: "13",
+                },
+                clear=False,
+            ):
+                github = FakeGitHub()
+                result = review_service.maybe_request_copilot_review(github, 4)
+
+            self.assertEqual(result["status"], "requested")
+            self.assertEqual(github.requested_reviewers, ["copilot"])
+            self.assertEqual(result["used"], 13)
+            with open(budget_file, "r", encoding="utf-8") as fh:
+                budget_state = json.load(fh)
+
+        month_entry = budget_state[review_service.current_copilot_review_budget_month()]
+        self.assertEqual(month_entry["used"], 13)
+        self.assertIn("swift-man/app#4", month_entry["requests"])
+
+    def test_skips_copilot_review_when_monthly_budget_would_be_exceeded(self) -> None:
+        class FakeGitHub:
+            repository = "swift-man/app"
+
+            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+                raise AssertionError("budget check should happen before GitHub reviewer lookup")
+
+            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+                raise AssertionError("budget-exhausted requests must not call GitHub")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    review_service.COPILOT_REVIEW_REQUEST_ENV: "1",
+                    review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: os.path.join(tmpdir, "copilot-budget.json"),
+                    review_service.COPILOT_REVIEW_MONTHLY_BUDGET_ENV: "10",
+                    review_service.COPILOT_REVIEW_REQUEST_COST_ENV: "13",
+                },
+                clear=False,
+            ):
+                result = review_service.maybe_request_copilot_review(FakeGitHub(), 4)
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "monthly_budget_exhausted")
+
+    def test_skips_copilot_review_when_copilot_context_already_exists(self) -> None:
+        class FakeGitHub:
+            repository = "swift-man/app"
+
+            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+                raise AssertionError("existing Copilot comments should skip reviewer requests")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    review_service.COPILOT_REVIEW_REQUEST_ENV: "1",
+                    review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: os.path.join(tmpdir, "copilot-budget.json"),
+                },
+                clear=False,
+            ):
+                result = review_service.maybe_request_copilot_review(
+                    FakeGitHub(),
+                    4,
+                    existing_review_context=[
+                        {
+                            "author": "copilot-pull-request-reviewer[bot]",
+                            "body": "이미 Copilot이 리뷰했습니다.",
+                        }
+                    ],
+                )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "copilot_context_already_exists")
 
 
 class ReviewPullRequestFlowTests(unittest.TestCase):
@@ -2349,7 +2451,7 @@ class BuildReviewPayloadTests(unittest.TestCase):
         self.assertIn("`Sources/App.swift:42`", body)
         self.assertIn("nil guard", body)
 
-    def test_body_reports_when_copilot_review_context_is_absent(self) -> None:
+    def test_body_omits_copilot_section_when_copilot_review_context_is_absent(self) -> None:
         payload = review_service.build_review_payload(
             summary="요약",
             event="APPROVE",
@@ -2361,9 +2463,9 @@ class BuildReviewPayloadTests(unittest.TestCase):
         )
 
         body = payload["body"]
-        self.assertIn("## Copilot 리뷰", body)
-        self.assertIn("기존 Copilot 리뷰 코멘트를 찾지 못했습니다.", body)
-        self.assertIn("자동 요청하지 않습니다.", body)
+        self.assertNotIn("## Copilot 리뷰", body)
+        self.assertNotIn("기존 Copilot 리뷰 코멘트를 찾지 못했습니다.", body)
+        self.assertNotIn("자동 요청하지 않습니다.", body)
 
     def test_body_appends_model_name_footer_when_provided(self) -> None:
         payload = review_service.build_review_payload(
