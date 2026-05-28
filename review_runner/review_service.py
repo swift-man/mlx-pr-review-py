@@ -1947,13 +1947,19 @@ def truncate_context(text: str, max_chars: int, *, suffix: str) -> str:
 
 def build_line_numbered_file_context(file_text: str, *, max_chars: int) -> str:
     """현재 PR HEAD 파일 전체를 line-numbered context로 만든다."""
+    context, _truncated = build_line_numbered_file_context_with_truncation(file_text, max_chars=max_chars)
+    return context
+
+
+def build_line_numbered_file_context_with_truncation(file_text: str, *, max_chars: int) -> tuple[str, bool]:
+    """현재 PR HEAD 파일 전체 context와 실제 truncation 여부를 함께 반환한다."""
     if max_chars <= 0:
-        return ""
+        return "", False
     lines = file_text.splitlines()
     if not lines:
-        return ""
+        return "", False
     context = "\n".join(f"{line_number}: {line}" for line_number, line in enumerate(lines, start=1))
-    return truncate_context(context, max_chars, suffix="full file context truncated")
+    return truncate_context(context, max_chars, suffix="full file context truncated"), len(context) > max_chars
 
 
 def build_current_file_context_excerpt(
@@ -2018,8 +2024,10 @@ def build_current_file_context(
         return "", "off"
 
     if mode in {"auto", "full", "full_repo"}:
-        full_context = build_line_numbered_file_context(file_text, max_chars=max_chars)
-        full_context_truncated = "full file context truncated" in full_context
+        full_context, full_context_truncated = build_line_numbered_file_context_with_truncation(
+            file_text,
+            max_chars=max_chars,
+        )
         if mode == "full" and full_context:
             context_mode = "full_file_truncated" if full_context_truncated else "full_file"
             return full_context, context_mode
@@ -2191,13 +2199,16 @@ def collect_repository_context(
             log_progress(log_prefix, f"Skipping repository context for {path}: {exc}")
             continue
 
-        context = build_line_numbered_file_context(file_text, max_chars=file_max_chars)
+        context, context_truncated = build_line_numbered_file_context_with_truncation(
+            file_text,
+            max_chars=file_max_chars,
+        )
         if not context:
             continue
         entry_cost = len(path) + len(context) + 32
         if total_chars + entry_cost > max_chars:
             break
-        mode_name = "full_file" if "full file context truncated" not in context else "truncated_file"
+        mode_name = "truncated_file" if context_truncated else "full_file"
         entries.append(RepositoryContextEntry(path=path, content=context, mode=mode_name))
         total_chars += entry_cost
 

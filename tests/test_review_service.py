@@ -948,6 +948,18 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertEqual(mode, "full_file_truncated")
         self.assertIn("full file context truncated", context)
 
+    def test_current_file_context_literal_truncation_marker_does_not_force_excerpt(self) -> None:
+        context, mode = review_service.build_current_file_context(
+            "def marker():\n    return 'full file context truncated'\n",
+            "@@ -2,1 +2,1 @@\n-    return ''\n+    return 'full file context truncated'\n",
+            mode="full_repo",
+            line_radius=0,
+            max_chars=10_000,
+        )
+
+        self.assertEqual(mode, "full_file")
+        self.assertIn("1: def marker():", context)
+
     def test_current_file_context_auto_falls_back_to_excerpt_for_large_files(self) -> None:
         file_text = "\n".join(f"line {line_number}" for line_number in range(1, 200))
         context, mode = review_service.build_current_file_context(
@@ -1118,6 +1130,45 @@ class ExistingReviewContextTests(unittest.TestCase):
 
         self.assertEqual([entry.path for entry in entries], ["price_proxy/models.py"])
         self.assertIn("1: # price_proxy/models.py", entries[0].content)
+
+    def test_collect_repository_context_literal_truncation_marker_stays_full_file(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(include=("**/*.py",), loaded=True)
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=1,
+            max_chars=1000,
+            repository_max_files=5,
+            repository_max_chars=2000,
+            repository_file_max_chars=1000,
+            api_timeout_seconds=7,
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                return [{"type": "blob", "path": "price_proxy/models.py", "size": 100}]
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual((path, ref, timeout), ("price_proxy/models.py", "abc123", 7))
+                return "# full file context truncated\nvalue = 1\n"
+
+        entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config, settings=settings)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].mode, "full_file")
 
     def test_collect_repository_context_skips_fetch_when_remaining_budget_cannot_fit_path(self) -> None:
         case = self
