@@ -796,6 +796,51 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertEqual(context[1]["reply_to_comment_id"], 10)
         self.assertEqual(context[2]["source"], "issue_comment")
 
+    def test_load_existing_review_context_tolerates_comment_lookup_network_errors(self) -> None:
+        case = self
+
+        class ReviewCommentsFailGitHub:
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                raise review_service.urllib.error.URLError("connection reset")
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return [
+                    {
+                        "id": 30,
+                        "body": "Copilot 한도 초과로 수동 확인이 필요합니다.",
+                        "user": {"login": "swift-man"},
+                        "created_at": "2026-05-28T01:04:00Z",
+                    }
+                ]
+
+        class IssueCommentsFailGitHub:
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 5)
+                return [
+                    {
+                        "id": 40,
+                        "body": "Problem: 실제 리뷰 코멘트입니다. Why it matters: 컨텍스트에 남아야 합니다.",
+                        "path": "Sources/App.swift",
+                        "line": 7,
+                        "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                        "created_at": "2026-05-28T01:05:00Z",
+                    }
+                ]
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 5)
+                raise TimeoutError("timed out")
+
+        review_failed_context = review_service.load_existing_review_context(ReviewCommentsFailGitHub(), 4)
+        issue_failed_context = review_service.load_existing_review_context(IssueCommentsFailGitHub(), 5)
+
+        self.assertEqual([item["comment_id"] for item in review_failed_context], [30])
+        self.assertEqual(review_failed_context[0]["source"], "issue_comment")
+        self.assertEqual([item["comment_id"] for item in issue_failed_context], [40])
+        self.assertEqual(issue_failed_context[0]["source"], "review_comment")
+
     def test_make_prompt_includes_existing_review_context_rules_and_payload(self) -> None:
         pr_file = review_service.PullRequestFile(
             filename="Sources/App.swift",
@@ -829,6 +874,80 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertTrue(any("false positive" in rule for rule in rules))
         self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
         self.assertTrue(any("Copilot" in rule and "중복" in rule for rule in rules))
+
+
+class ReviewPullRequestFlowTests(unittest.TestCase):
+    def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            instances: list["FakeGitHub"] = []
+
+            def __init__(self, token: str, repository: str, api_url: str) -> None:
+                self.token = token
+                self.repository = repository
+                self.api_url = api_url
+                self.post_review_called = False
+                FakeGitHub.instances.append(self)
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return [
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+                        "additions": 1,
+                        "deletions": 1,
+                    }
+                ]
+
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                self._assert_pull_number(pull_number)
+                return "abc123"
+
+            def get_file_text(self, path: str, *, ref: str) -> str:
+                case.assertEqual((path, ref), (review_service.REVIEWBOT_CONFIG_PATH, "abc123"))
+                raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+                self.post_review_called = True
+                raise AssertionError("dry_run=True must not post a GitHub review")
+
+            def _assert_pull_number(self, pull_number: int) -> None:
+                if pull_number != 4:
+                    raise AssertionError(f"unexpected pull number: {pull_number}")
+
+        mlx_result = {
+            "summary": "요약",
+            "event": "COMMENT",
+            "positives": [],
+            "must_fix": [],
+            "suggestions": [],
+            "comments": [],
+        }
+
+        with mock.patch("review_runner.review_service.GitHubApi", FakeGitHub):
+            with mock.patch("review_runner.review_service.run_mlx", return_value=mlx_result):
+                result = review_service.review_pull_request(
+                    "swift-man/app",
+                    4,
+                    token="token",
+                    dry_run=True,
+                )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["repository"], "swift-man/app")
+        self.assertEqual(len(FakeGitHub.instances), 1)
+        self.assertFalse(FakeGitHub.instances[0].post_review_called)
 
 
 class NormalizeSeverityTests(unittest.TestCase):

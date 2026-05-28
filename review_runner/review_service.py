@@ -1061,7 +1061,7 @@ def load_existing_review_context(
 
     try:
         raw_review_comments = github.list_review_comments(pull_number)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         log_progress(log_prefix, f"Skipping existing review comments context: {exc}")
         raw_review_comments = []
 
@@ -1074,7 +1074,7 @@ def load_existing_review_context(
 
     try:
         raw_issue_comments = github.list_issue_comments(pull_number)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         log_progress(log_prefix, f"Skipping existing issue comments context: {exc}")
         raw_issue_comments = []
 
