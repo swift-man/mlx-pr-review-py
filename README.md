@@ -255,9 +255,9 @@ pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 ```
 
 이 스크립트는 LaunchAgent `com.swiftman.pr-review`가 이미 등록되어 있으면 최신 소스를
-`/Users/runner/pr-review`로 다시 복사한 뒤 `launchctl kickstart -k`로 기존 서버를 종료하고
-새 프로세스를 띄웁니다. 이 경로에서는 서버를 포그라운드로 다시 실행하지 않으므로
-`address already in use` 충돌을 피할 수 있습니다.
+`/Users/runner/pr-review`로 다시 복사한 뒤 tail 없이 `kickstart_local_review.sh`를 호출해
+LaunchAgent 재시동과 `/healthz` 확인까지 수행합니다. 이 경로에서는 서버를 포그라운드로
+다시 실행하지 않으므로 `address already in use` 충돌을 피할 수 있습니다.
 단, 로드된 LaunchAgent가 실제로 전달한 배포 대상 경로를 가리키는지 먼저 확인합니다.
 경로가 다르면 다른 설치본을 재시동할 수 있으므로 실패 메시지를 내고 중단합니다.
 

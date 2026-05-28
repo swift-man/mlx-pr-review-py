@@ -153,6 +153,10 @@ stop_target_port_listener() {
 
   for pid in ${(f)pids}; do
     command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ -z "$command_line" ]]; then
+      continue
+    fi
+
     if review_server_command_matches "$command_line"; then
       stop_process "$pid" "$command_line"
       continue
@@ -172,14 +176,10 @@ EOF
 
 print_launchagent_followup() {
   cat <<EOF
-LaunchAgent restart requested:
-  launchctl kickstart -k $LAUNCH_AGENT_SERVICE
+LaunchAgent restart completed and health check passed.
 
-Check server health:
-  curl http://127.0.0.1:8000/healthz
-
-Watch logs:
-  tail -f /tmp/mlx-pr-review-webhook.log /tmp/mlx-pr-review-webhook.err.log
+Watch logs with:
+  zsh $TARGET_ROOT/scripts/kickstart_local_review.sh
 EOF
 }
 
@@ -189,8 +189,10 @@ if launchagent_is_loaded; then
   PYTHON_BIN="$PYTHON_BIN_RESOLVED" "$SOURCE_ROOT/scripts/install_local_review.sh" "$TARGET_ROOT"
   ensure_env_file_exists
 
-  echo "Restarting webhook server through LaunchAgent $LAUNCH_AGENT_SERVICE"
-  launchctl kickstart -k "$LAUNCH_AGENT_SERVICE"
+  LOCAL_REVIEW_HOME="$TARGET_ROOT" \
+    LOCAL_REVIEW_ENV_FILE="$ENV_FILE" \
+    LOCAL_REVIEW_TAIL_LOGS=0 \
+    zsh "$TARGET_ROOT/scripts/kickstart_local_review.sh"
   print_launchagent_followup
   exit 0
 fi
