@@ -2207,7 +2207,7 @@ def collect_repository_context(
             continue
         entry_cost = len(path) + len(context) + 32
         if total_chars + entry_cost > max_chars:
-            break
+            continue
         mode_name = "truncated_file" if context_truncated else "full_file"
         entries.append(RepositoryContextEntry(path=path, content=context, mode=mode_name))
         total_chars += entry_cost

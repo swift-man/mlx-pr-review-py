@@ -1170,6 +1170,49 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].mode, "full_file")
 
+    def test_collect_repository_context_skips_oversized_candidate_and_keeps_later_fit(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(include=("**/*.py",), loaded=True)
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=1,
+            max_chars=1000,
+            repository_max_files=5,
+            repository_max_chars=120,
+            repository_file_max_chars=1000,
+            api_timeout_seconds=7,
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                return [
+                    {"type": "blob", "path": "price_proxy/a_large.py", "size": 100},
+                    {"type": "blob", "path": "price_proxy/z_small.py", "size": 100},
+                ]
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                if path == "price_proxy/a_large.py":
+                    return "\n".join(f"value_{index} = {index}" for index in range(100))
+                return "value = 1\n"
+
+        entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config, settings=settings)
+
+        self.assertEqual([entry.path for entry in entries], ["price_proxy/z_small.py"])
+
     def test_collect_repository_context_skips_fetch_when_remaining_budget_cannot_fit_path(self) -> None:
         case = self
         config = review_service.ReviewBotConfig(include=("**/*.py",), loaded=True)
