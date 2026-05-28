@@ -3,9 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOCAL_REVIEW_HOME="${LOCAL_REVIEW_HOME:-$DEFAULT_HOME}"
+REQUESTED_LOCAL_REVIEW_HOME="${LOCAL_REVIEW_HOME:-}"
+LOCAL_REVIEW_HOME="${REQUESTED_LOCAL_REVIEW_HOME:-$DEFAULT_HOME}"
 ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$LOCAL_REVIEW_HOME/scripts/local_review_env.sh}"
-SOURCE_ROOT_FILE="$LOCAL_REVIEW_HOME/.local_review_source_root"
 
 if [[ -f "$ENV_FILE" ]]; then
   set +u
@@ -13,6 +13,13 @@ if [[ -f "$ENV_FILE" ]]; then
   set -u
 fi
 
+if [[ -n "$REQUESTED_LOCAL_REVIEW_HOME" ]]; then
+  LOCAL_REVIEW_HOME="$REQUESTED_LOCAL_REVIEW_HOME"
+else
+  LOCAL_REVIEW_HOME="${LOCAL_REVIEW_HOME:-$DEFAULT_HOME}"
+fi
+
+SOURCE_ROOT_FILE="$LOCAL_REVIEW_HOME/.local_review_source_root"
 LAUNCH_AGENT_LABEL="${LOCAL_REVIEW_LAUNCH_AGENT_LABEL:-com.swiftman.pr-review}"
 LAUNCH_AGENT_SERVICE="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
 PORT="${PORT:-8000}"
