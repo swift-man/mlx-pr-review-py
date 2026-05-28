@@ -770,7 +770,7 @@ class RepositoryContextEntry:
     mode: str = "full_file"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReviewContextSettings:
     mode: str
     line_radius: int

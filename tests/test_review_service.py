@@ -921,6 +921,19 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertIn("13: line 13", excerpt)
         self.assertNotIn("7: line 7", excerpt)
 
+    def test_review_context_settings_uses_slots(self) -> None:
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=120,
+            max_chars=30_000,
+            repository_max_files=120,
+            repository_max_chars=320_000,
+            repository_file_max_chars=18_000,
+            api_timeout_seconds=20,
+        )
+
+        self.assertFalse(hasattr(settings, "__dict__"))
+
     def test_current_file_context_uses_full_file_when_it_fits(self) -> None:
         context, mode = review_service.build_current_file_context(
             "def a():\n    return 1\n",
