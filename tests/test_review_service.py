@@ -1116,6 +1116,44 @@ class CopilotReviewRequestTests(unittest.TestCase):
         self.assertNotIn("swift-man/app#4", budget_state["requests"])
         self.assertNotIn("swift-man/app#4", month_entry["requests"])
 
+    def test_rollback_ignores_missing_copilot_request(self) -> None:
+        month = review_service.current_copilot_review_budget_month()
+        other_entry = {
+            "cost": 13,
+            "month": month,
+            "requested_at": review_service.current_utc_timestamp(),
+            "reviewer": "copilot",
+            "status": "pending",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            budget_file = os.path.join(tmpdir, "copilot-budget.json")
+            with open(budget_file, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "requests": {"swift-man/app#5": other_entry},
+                        month: {"used": 13, "requests": {"swift-man/app#5": other_entry}},
+                    },
+                    fh,
+                )
+
+            used = review_service.rollback_copilot_review_budget_request(
+                budget_file=budget_file,
+                month=month,
+                request_key="swift-man/app#4",
+                default_cost=13,
+                log_prefix="[test]",
+                reason="duplicate rollback",
+            )
+            with open(budget_file, "r", encoding="utf-8") as fh:
+                budget_state = json.load(fh)
+
+        month_entry = budget_state[month]
+        self.assertEqual(used, 13)
+        self.assertEqual(month_entry["used"], 13)
+        self.assertIn("swift-man/app#5", budget_state["requests"])
+        self.assertIn("swift-man/app#5", month_entry["requests"])
+
     def test_skips_recent_pending_copilot_request_without_github_lookup(self) -> None:
         class FakeGitHub:
             repository = "swift-man/app"

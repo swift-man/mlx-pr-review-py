@@ -1253,7 +1253,7 @@ def remove_copilot_review_budget_request(
         raw_entry["used"] = max(0, (used if isinstance(used, int) else 0) - get_copilot_request_entry_cost(month_request, cost))
         removed_from_month = True
 
-    if not removed_from_month:
+    if not removed_from_month and history_entry is not None:
         month_entry["requests"].pop(request_key, None)
         month_entry["used"] = max(0, month_entry["used"] - get_copilot_request_entry_cost(history_entry, cost))
 
