@@ -2710,6 +2710,34 @@ class BuildReviewPayloadTests(unittest.TestCase):
         self.assertNotIn("기존 Copilot 리뷰 코멘트를 찾지 못했습니다.", body)
         self.assertNotIn("자동 요청하지 않습니다.", body)
 
+    def test_copilot_section_shows_recent_comments_first(self) -> None:
+        context = [
+            {
+                "source": "review_comment",
+                "author": "copilot-pull-request-reviewer[bot]",
+                "path": "Sources/App.swift",
+                "line": index,
+                "body": f"copilot-comment-{index}",
+            }
+            for index in range(1, 8)
+        ]
+
+        payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+            existing_review_context=context,
+        )
+
+        body = payload["body"]
+        self.assertNotIn("copilot-comment-1", body)
+        self.assertNotIn("copilot-comment-2", body)
+        self.assertLess(body.index("copilot-comment-7"), body.index("copilot-comment-6"))
+        self.assertLess(body.index("copilot-comment-6"), body.index("copilot-comment-5"))
+
     def test_body_appends_model_name_footer_when_provided(self) -> None:
         payload = review_service.build_review_payload(
             summary="요약",

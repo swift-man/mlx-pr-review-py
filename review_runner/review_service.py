@@ -1598,9 +1598,10 @@ def build_copilot_review_section(existing_review_context: list[dict[str, Any]] |
     body_lines = ["", "## Copilot 리뷰"]
     body_lines.append(f"- 상태: 기존 Copilot 리뷰 코멘트 {len(copilot_items)}건을 확인했습니다.")
     body_lines.append("- 참고: Copilot이 직접 남긴 라인 코멘트는 중복 게시하지 않고 아래에 요약만 표시합니다.")
+    recent_copilot_items = copilot_items[-MAX_COPILOT_REVIEW_SECTION_ITEMS:]
     body_lines.extend(
         format_copilot_review_context_item(item)
-        for item in copilot_items[:MAX_COPILOT_REVIEW_SECTION_ITEMS]
+        for item in reversed(recent_copilot_items)
     )
     if len(copilot_items) > MAX_COPILOT_REVIEW_SECTION_ITEMS:
         body_lines.append(f"- 그 외 {len(copilot_items) - MAX_COPILOT_REVIEW_SECTION_ITEMS}건은 PR 대화에서 확인하세요.")
