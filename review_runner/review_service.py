@@ -577,6 +577,13 @@ SEVERITY_MINOR = "Minor"
 SEVERITY_SUGGESTION = "Suggestion"
 ALL_SEVERITIES = (SEVERITY_BLOCKING, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
 MIN_MODEL_COMMENT_CONFIDENCE = 0.8
+MAX_EXISTING_REVIEW_CONTEXT_ITEMS = 30
+MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS = 900
+REVIEW_CONTEXT_ISSUE_COMMENT_SKIP_MARKERS = (
+    "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->",
+    "<!-- walkthrough_start -->",
+    "<!-- internal state start -->",
+)
 FINDING_BODY_RE = re.compile(
     r"^\s*problem\s*:\s*(?P<problem>.+?)\s+"
     r"why\s+it\s+matters\s*:\s*(?P<why>.+?)\s+"
@@ -716,6 +723,36 @@ class PullRequestFile:
 
 
 @dataclass(frozen=True)
+class PullRequestDiscussionItem:
+    source: str
+    author: str
+    body: str
+    comment_id: int | None = None
+    path: str | None = None
+    line: int | None = None
+    reply_to_comment_id: int | None = None
+    created_at: str = ""
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "source": self.source,
+            "author": self.author,
+            "body": self.body,
+        }
+        if self.comment_id is not None:
+            payload["comment_id"] = self.comment_id
+        if self.path:
+            payload["path"] = self.path
+        if self.line is not None:
+            payload["line"] = self.line
+        if self.reply_to_comment_id is not None:
+            payload["reply_to_comment_id"] = self.reply_to_comment_id
+        if self.created_at:
+            payload["created_at"] = self.created_at
+        return payload
+
+
+@dataclass(frozen=True)
 class ReviewBotConfig:
     include: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
@@ -827,6 +864,40 @@ class GitHubApi:
             page += 1
         return files
 
+    def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+        comments: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = self.request_json(
+                "GET",
+                f"/repos/{self.repository}/issues/{pull_number}/comments",
+                params={"per_page": 100, "page": page},
+            )
+            if not batch:
+                break
+            comments.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return comments
+
+    def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+        comments: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = self.request_json(
+                "GET",
+                f"/repos/{self.repository}/pulls/{pull_number}/comments",
+                params={"per_page": 100, "page": page},
+            )
+            if not batch:
+                break
+            comments.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return comments
+
     def get_pull_head_sha(self, pull_number: int) -> str:
         pull = self.request_json("GET", f"/repos/{self.repository}/pulls/{pull_number}")
         head = pull.get("head") if isinstance(pull, dict) else None
@@ -869,6 +940,115 @@ class GitHubApi:
             f"/repos/{self.repository}/pulls/{pull_number}/reviews",
             body=body,
         )
+
+
+def coerce_optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def truncate_existing_review_context_body(value: Any) -> str:
+    normalized = normalize_text(value)
+    if len(normalized) <= MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS:
+        return normalized
+    return normalized[: MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS - 3].rstrip() + "..."
+
+
+def github_comment_author(raw_comment: dict[str, Any]) -> str:
+    user = raw_comment.get("user")
+    if isinstance(user, dict):
+        login = normalize_text(user.get("login"))
+        if login:
+            return login
+    return "unknown"
+
+
+def should_skip_issue_comment_context(body: Any) -> bool:
+    if not normalize_text(body):
+        return True
+    raw_body = body if isinstance(body, str) else ""
+    return any(marker in raw_body for marker in REVIEW_CONTEXT_ISSUE_COMMENT_SKIP_MARKERS)
+
+
+def build_issue_comment_context(raw_comment: dict[str, Any]) -> PullRequestDiscussionItem | None:
+    body = raw_comment.get("body")
+    if should_skip_issue_comment_context(body):
+        return None
+    return PullRequestDiscussionItem(
+        source="issue_comment",
+        author=github_comment_author(raw_comment),
+        body=truncate_existing_review_context_body(body),
+        comment_id=coerce_optional_int(raw_comment.get("id")),
+        created_at=normalize_text(raw_comment.get("created_at")),
+    )
+
+
+def build_review_comment_context(raw_comment: dict[str, Any]) -> PullRequestDiscussionItem | None:
+    body = truncate_existing_review_context_body(raw_comment.get("body"))
+    if not body:
+        return None
+    return PullRequestDiscussionItem(
+        source="review_comment",
+        author=github_comment_author(raw_comment),
+        body=body,
+        comment_id=coerce_optional_int(raw_comment.get("id")),
+        path=normalize_text(raw_comment.get("path")) or None,
+        line=coerce_optional_int(raw_comment.get("line")),
+        reply_to_comment_id=coerce_optional_int(raw_comment.get("in_reply_to_id")),
+        created_at=normalize_text(raw_comment.get("created_at")),
+    )
+
+
+def load_existing_review_context(
+    github: GitHubApi,
+    pull_number: int,
+    *,
+    log_prefix: str = "",
+) -> list[dict[str, Any]]:
+    """PR에 이미 달린 댓글과 리뷰 대댓글을 모델 참고용으로 정규화한다."""
+    discussion_items: list[PullRequestDiscussionItem] = []
+
+    try:
+        raw_review_comments = github.list_review_comments(pull_number)
+    except RuntimeError as exc:
+        log_progress(log_prefix, f"Skipping existing review comments context: {exc}")
+        raw_review_comments = []
+
+    for raw_comment in raw_review_comments:
+        if not isinstance(raw_comment, dict):
+            continue
+        item = build_review_comment_context(raw_comment)
+        if item is not None:
+            discussion_items.append(item)
+
+    try:
+        raw_issue_comments = github.list_issue_comments(pull_number)
+    except RuntimeError as exc:
+        log_progress(log_prefix, f"Skipping existing issue comments context: {exc}")
+        raw_issue_comments = []
+
+    for raw_comment in raw_issue_comments:
+        if not isinstance(raw_comment, dict):
+            continue
+        item = build_issue_comment_context(raw_comment)
+        if item is not None:
+            discussion_items.append(item)
+
+    discussion_items.sort(
+        key=lambda item: (
+            item.created_at,
+            item.source,
+            item.path or "",
+            item.line or 0,
+            item.comment_id or 0,
+        )
+    )
+    discussion_items = discussion_items[-MAX_EXISTING_REVIEW_CONTEXT_ITEMS:]
+    log_progress(log_prefix, f"Loaded {len(discussion_items)} existing PR discussion item(s)")
+    return [item.to_prompt_dict() for item in discussion_items]
 
 
 def parse_right_side_lines(patch: str) -> set[int]:
@@ -1638,7 +1818,13 @@ def sanitize_summary(summary: Any, has_findings: bool) -> str:
     return normalized
 
 
-def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile]) -> str:
+def make_prompt(
+    repository: str,
+    pull_number: int,
+    files: list[PullRequestFile],
+    *,
+    existing_review_context: list[dict[str, Any]] | None = None,
+) -> str:
     """모델이 바로 읽을 수 있는 JSON 프롬프트를 조립한다."""
     prompt_payload = {
         "repository": repository,
@@ -1668,6 +1854,12 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
                 "Blocking/Major는 재현 가능한 입력, 상태, 실행 순서와 High confidence가 있을 때만 사용하세요.",
                 "테스트 지적은 현재 테스트를 확인한 뒤 어떤 실패 모드를 막는지 설명할 수 있을 때만 작성하세요.",
                 f"confidence가 {MIN_MODEL_COMMENT_CONFIDENCE:.2f} 미만이면 코멘트를 작성하지 마세요.",
+            ],
+            "existing_review_context_rules": [
+                "existing_review_context가 있으면 Copilot, 다른 봇, 사용자 댓글과 대댓글의 최근 논의를 참고하세요.",
+                "이미 제기된 지적은 최신 PR HEAD의 diff와 파일 컨텍스트로 다시 증명될 때만 반복하세요.",
+                "이미 반박되었거나 해결된 false positive를 다시 코멘트하지 마세요.",
+                "다른 리뷰어의 코멘트를 그대로 복사하지 말고, 코드 증거와 재현 가능한 조건이 있을 때만 comments에 작성하세요.",
             ],
             "summary_rules": [
                 "summary는 전체 변경을 한두 문장으로 요약하세요.",
@@ -1707,6 +1899,8 @@ def make_prompt(repository: str, pull_number: int, files: list[PullRequestFile])
             for f in files
         ],
     }
+    if existing_review_context:
+        prompt_payload["existing_review_context"] = existing_review_context
     return json.dumps(prompt_payload, ensure_ascii=False, indent=2)
 
 
@@ -2418,9 +2612,15 @@ def generate_review_artifacts(
     pull_number: int,
     pr_files: list[PullRequestFile],
     *,
+    existing_review_context: list[dict[str, Any]] | None = None,
     log_prefix: str = "",
 ) -> ReviewGenerationArtifacts:
-    prompt = make_prompt(repository, pull_number, pr_files)
+    prompt = make_prompt(
+        repository,
+        pull_number,
+        pr_files,
+        existing_review_context=existing_review_context,
+    )
     if os.environ.get("WRITE_PROMPT_DEBUG") == "1":
         write_prompt_debug_file(prompt)
 
@@ -2511,7 +2711,14 @@ def review_pull_request(
             "skipped_by_reviewbot": file_load_result.skipped_by_reviewbot,
         }
 
-    artifacts = generate_review_artifacts(repository, pull_number, pr_files, log_prefix=log_prefix)
+    existing_review_context = load_existing_review_context(github, pull_number, log_prefix=log_prefix)
+    artifacts = generate_review_artifacts(
+        repository,
+        pull_number,
+        pr_files,
+        existing_review_context=existing_review_context,
+        log_prefix=log_prefix,
+    )
     result = build_review_result(
         repository,
         pull_number,
@@ -2519,6 +2726,7 @@ def review_pull_request(
         artifacts.payload,
         auth_source,
     )
+    result["existing_review_context_count"] = len(existing_review_context)
 
     if dry_run:
         log_progress(log_prefix, f"Dry run completed in {time.monotonic() - started_at:.1f}s")

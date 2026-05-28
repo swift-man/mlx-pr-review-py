@@ -742,6 +742,94 @@ review:
         self.assertFalse(result.default_filter_applied)
 
 
+class ExistingReviewContextTests(unittest.TestCase):
+    def test_load_existing_review_context_includes_review_comments_replies_and_user_notes(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return [
+                    {
+                        "id": 10,
+                        "body": "Problem: nil guard가 빠졌습니다. Why it matters: 특정 입력에서 crash가 납니다.",
+                        "path": "Sources/App.swift",
+                        "line": 42,
+                        "user": {"login": "copilot-pull-request-reviewer[bot]"},
+                        "created_at": "2026-05-28T01:00:00Z",
+                    },
+                    {
+                        "id": 11,
+                        "body": "현재 PR HEAD에는 guard가 추가되어 이 경로는 재현되지 않습니다.",
+                        "path": "Sources/App.swift",
+                        "line": 42,
+                        "in_reply_to_id": 10,
+                        "user": {"login": "swift-man"},
+                        "created_at": "2026-05-28T01:01:00Z",
+                    },
+                ]
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return [
+                    {
+                        "id": 20,
+                        "body": "<!-- walkthrough_start --> 자동 요약은 프롬프트에 넣지 않습니다.",
+                        "user": {"login": "coderabbitai[bot]"},
+                        "created_at": "2026-05-28T01:02:00Z",
+                    },
+                    {
+                        "id": 21,
+                        "body": "리뷰 코멘트는 최신 HEAD 기준으로만 다시 확인해 주세요.",
+                        "user": {"login": "swift-man"},
+                        "created_at": "2026-05-28T01:03:00Z",
+                    },
+                ]
+
+        context = review_service.load_existing_review_context(FakeGitHub(), 4)
+
+        self.assertEqual([item["comment_id"] for item in context], [10, 11, 21])
+        self.assertEqual(context[0]["source"], "review_comment")
+        self.assertEqual(context[0]["author"], "copilot-pull-request-reviewer[bot]")
+        self.assertEqual(context[0]["path"], "Sources/App.swift")
+        self.assertEqual(context[0]["line"], 42)
+        self.assertEqual(context[1]["reply_to_comment_id"], 10)
+        self.assertEqual(context[2]["source"], "issue_comment")
+
+    def test_make_prompt_includes_existing_review_context_rules_and_payload(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="Sources/App.swift",
+            status="modified",
+            patch="@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+            additions=1,
+            deletions=1,
+            right_side_lines={1},
+        )
+        context = [
+            {
+                "source": "review_comment",
+                "author": "copilot-pull-request-reviewer[bot]",
+                "path": "Sources/App.swift",
+                "line": 1,
+                "body": "이미 제기된 코멘트입니다.",
+            }
+        ]
+
+        prompt = json.loads(
+            review_service.make_prompt(
+                "swift-man/app",
+                4,
+                [pr_file],
+                existing_review_context=context,
+            )
+        )
+
+        self.assertEqual(prompt["existing_review_context"], context)
+        rules = prompt["instructions"]["existing_review_context_rules"]
+        self.assertTrue(any("false positive" in rule for rule in rules))
+        self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
+
+
 class NormalizeSeverityTests(unittest.TestCase):
     def test_recognizes_all_four_severities_case_insensitively(self) -> None:
         cases = {
