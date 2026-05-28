@@ -8,6 +8,14 @@ if [[ "$TARGET_ROOT" != "/" ]]; then
   TARGET_ROOT="${TARGET_ROOT%/}"
 fi
 ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$TARGET_ROOT/scripts/local_review_env.sh}"
+
+if [[ -f "$ENV_FILE" ]]; then
+  set +u
+  source "$ENV_FILE"
+  set -u
+  ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$ENV_FILE}"
+fi
+
 LAUNCH_AGENT_LABEL="${LOCAL_REVIEW_LAUNCH_AGENT_LABEL:-com.swiftman.pr-review}"
 LAUNCH_AGENT_SERVICE="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
 
@@ -82,7 +90,7 @@ ensure_env_file_exists() {
     return
   fi
 
-  cat <<EOF
+  cat <<EOF >&2
 No env file found at:
   $ENV_FILE
 

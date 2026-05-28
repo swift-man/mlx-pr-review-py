@@ -17,6 +17,7 @@ LAUNCH_AGENT_SERVICE="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
 PORT="${PORT:-8000}"
 HEALTH_HOST="${LOCAL_REVIEW_HEALTH_HOST:-127.0.0.1}"
 HEALTH_URL="${LOCAL_REVIEW_HEALTH_URL:-http://$HEALTH_HOST:$PORT/healthz}"
+HEALTH_TIMEOUT="${LOCAL_REVIEW_HEALTH_TIMEOUT:-2}"
 STDOUT_LOG="${LOCAL_REVIEW_WEBHOOK_LOG:-/tmp/mlx-pr-review-webhook.log}"
 STDERR_LOG="${LOCAL_REVIEW_WEBHOOK_ERR_LOG:-/tmp/mlx-pr-review-webhook.err.log}"
 TAIL_LINES="${LOCAL_REVIEW_TAIL_LINES:-80}"
@@ -35,7 +36,7 @@ echo "  $HEALTH_URL"
 
 health_ok=0
 for _ in {1..20}; do
-  if response="$(curl -fsS "$HEALTH_URL" 2>/dev/null)"; then
+  if response="$(curl -fsS --max-time "$HEALTH_TIMEOUT" "$HEALTH_URL" 2>/dev/null)"; then
     echo "$response"
     health_ok=1
     break
