@@ -29,6 +29,12 @@ export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
 # webhook 백그라운드 작업이 MLX generate 를 오래 점유하면 리뷰가 게시되지 않은 것처럼
 # 보일 수 있으므로 운영 예시는 응답 상한을 보수적으로 둔다.
 export MLX_MAX_TOKENS=900
+# PR 리뷰 입력은 diff만 보지 않고 최신 PR HEAD의 변경 파일 current code context도 함께 봅니다.
+# auto: 작은 변경 파일은 full file, 큰 파일은 모든 hunk 주변 excerpt로 폴백합니다.
+# full은 토큰/timeout 비용이 커질 수 있으므로 큰 저장소에서는 auto를 우선 권장합니다.
+# export MLX_REVIEW_CONTEXT_MODE=auto
+# export MLX_REVIEW_CONTEXT_MAX_CHARS=20000
+# export MLX_REVIEW_CONTEXT_LINE_RADIUS=80
 # Metal/MLX abort가 반복되면 주석을 해제해 CPU fallback으로 확인하세요.
 # export MLX_DEVICE=cpu
 

@@ -626,13 +626,23 @@ review:
 
             def get_file_text(self, path: str, *, ref: str) -> str:
                 self.loaded_paths.append((path, ref))
+                if path != review_service.REVIEWBOT_CONFIG_PATH:
+                    return "line 1\nline 2\n"
                 return raw_config
 
         fake_github = FakeGitHub()
 
         result = review_service.load_patchable_pr_files_result(fake_github, 7)
 
-        self.assertEqual(fake_github.loaded_paths, [(review_service.REVIEWBOT_CONFIG_PATH, "abc123")])
+        self.assertEqual(
+            fake_github.loaded_paths,
+            [
+                (review_service.REVIEWBOT_CONFIG_PATH, "abc123"),
+                ("Sources/App.swift", "abc123"),
+                (review_service.REVIEWBOT_CONFIG_PATH, "abc123"),
+                ("Package.swift", "abc123"),
+            ],
+        )
         self.assertEqual(
             [pr_file.filename for pr_file in result.files],
             ["Sources/App.swift", ".reviewbot.yml", "Package.swift"],
@@ -687,7 +697,14 @@ review:
         fake_github = FakeGitHub()
         result = review_service.load_patchable_pr_files_result(fake_github, 7)
 
-        self.assertEqual(fake_github.loaded_paths, [(review_service.REVIEWBOT_CONFIG_PATH, "abc123")])
+        self.assertEqual(
+            fake_github.loaded_paths,
+            [
+                (review_service.REVIEWBOT_CONFIG_PATH, "abc123"),
+                ("README.md", "abc123"),
+                ("Sources/App.swift", "abc123"),
+            ],
+        )
         self.assertEqual([pr_file.filename for pr_file in result.files], ["README.md", "Sources/App.swift"])
         self.assertEqual(result.patchable_count, 3)
         self.assertEqual(result.skipped_by_reviewbot, 1)
@@ -875,6 +892,86 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertTrue(any("false positive" in rule for rule in rules))
         self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
         self.assertTrue(any("Copilot" in rule and "중복" in rule for rule in rules))
+
+    def test_current_file_context_excerpt_expands_hunk_context(self) -> None:
+        file_text = "\n".join(f"line {line_number}" for line_number in range(1, 21))
+        patch = "@@ -10,1 +10,2 @@\n old\n+new\n"
+
+        excerpt = review_service.build_current_file_context_excerpt(
+            file_text,
+            patch,
+            line_radius=2,
+            max_chars=10_000,
+        )
+
+        self.assertIn("Lines 8-13:", excerpt)
+        self.assertIn("8: line 8", excerpt)
+        self.assertIn("13: line 13", excerpt)
+        self.assertNotIn("7: line 7", excerpt)
+
+    def test_current_file_context_uses_full_file_when_it_fits(self) -> None:
+        context, mode = review_service.build_current_file_context(
+            "def a():\n    return 1\n",
+            "@@ -1,1 +1,2 @@\n def a():\n+    return 1\n",
+            mode="auto",
+            line_radius=1,
+            max_chars=10_000,
+        )
+
+        self.assertEqual(mode, "full_file")
+        self.assertIn("1: def a():", context)
+        self.assertIn("2:     return 1", context)
+
+    def test_current_file_context_auto_falls_back_to_excerpt_for_large_files(self) -> None:
+        file_text = "\n".join(f"line {line_number}" for line_number in range(1, 200))
+        context, mode = review_service.build_current_file_context(
+            file_text,
+            "@@ -100,1 +100,2 @@\n line 100\n+line new\n",
+            mode="auto",
+            line_radius=1,
+            max_chars=120,
+        )
+
+        self.assertEqual(mode, "excerpt")
+        self.assertIn("Lines 99-102:", context)
+        self.assertNotIn("Lines 1-", context)
+
+    def test_make_prompt_includes_current_file_context_and_cooldown_focus_hints(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch=(
+                "@@ -20,0 +20,6 @@\n"
+                "+server_error_count = 0\n"
+                "+try:\n"
+                "+    await client.fetch_quote(item)\n"
+                "+except httpx.HTTPStatusError as exc:\n"
+                "+    server_error_count += 1\n"
+                "+    self._pause_kis_rest_fallback()\n"
+            ),
+            additions=6,
+            deletions=0,
+            right_side_lines=set(range(20, 26)),
+            current_file_context=(
+                "Lines 1-40:\n"
+                "1: async def retry_all(items):\n"
+                "2:     await asyncio.gather(*(client.fetch_quote(item) for item in items))\n"
+                "3:     # unchanged caller context\n"
+            ),
+            current_file_context_mode="full_file",
+        )
+
+        prompt = json.loads(review_service.make_prompt("swift-man/app", 4, [pr_file]))
+
+        prompt_file = prompt["files"][0]
+        self.assertIn("asyncio.gather", prompt_file["current_file_context"])
+        self.assertEqual(prompt_file["current_file_context_mode"], "full_file")
+        self.assertIn("file_context_rules", prompt["instructions"])
+        hints = prompt["instructions"]["review_focus_hints"]
+        self.assertTrue(any("cooldown" in hint for hint in hints))
+        self.assertTrue(any("asyncio.gather" in hint for hint in hints))
+        self.assertTrue(any("지역 변수" in hint for hint in hints))
+        self.assertTrue(any("RequestError" in hint for hint in hints))
 
 
 class CopilotReviewRequestTests(unittest.TestCase):
@@ -1487,8 +1584,12 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 return "abc123"
 
             def get_file_text(self, path: str, *, ref: str) -> str:
-                case.assertEqual((path, ref), (review_service.REVIEWBOT_CONFIG_PATH, "abc123"))
-                raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+                case.assertEqual(ref, "abc123")
+                if path == review_service.REVIEWBOT_CONFIG_PATH:
+                    raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+                if path == "Sources/App.swift":
+                    return "let value = new\n"
+                raise AssertionError(f"unexpected file path: {path}")
 
             def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
                 self._assert_pull_number(pull_number)
