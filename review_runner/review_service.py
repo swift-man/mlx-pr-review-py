@@ -50,12 +50,14 @@ COPILOT_REVIEW_MONTHLY_BUDGET_ENV = "COPILOT_REVIEW_MONTHLY_BUDGET"
 COPILOT_REVIEW_REQUEST_COST_ENV = "COPILOT_REVIEW_REQUEST_COST"
 COPILOT_REVIEW_BUDGET_FILE_ENV = "COPILOT_REVIEW_BUDGET_FILE"
 COPILOT_REVIEW_PENDING_TTL_SECONDS_ENV = "COPILOT_REVIEW_PENDING_TTL_SECONDS"
+COPILOT_REVIEW_API_TIMEOUT_SECONDS_ENV = "COPILOT_REVIEW_API_TIMEOUT_SECONDS"
 DEFAULT_COPILOT_REVIEWER = "copilot"
 DEFAULT_COPILOT_REVIEW_MONTHLY_BUDGET = 50
 # GitHub announced a Copilot code review multiplier of 13 from 2026-06-01.
 # Keep the default conservative; operators can lower this to 1 if their plan still bills that way.
 DEFAULT_COPILOT_REVIEW_REQUEST_COST = 13
 DEFAULT_COPILOT_REVIEW_PENDING_TTL_SECONDS = 10 * 60
+DEFAULT_COPILOT_REVIEW_API_TIMEOUT_SECONDS = 10
 _COPILOT_REVIEW_BUDGET_LOCK = threading.Lock()
 FORCED_ALWAYS_REVIEW_PATTERNS = (REVIEWBOT_CONFIG_PATH, "AGENTS.md")
 DEFAULT_REVIEWBOT_EXCLUDE_PATTERNS = (
@@ -421,6 +423,7 @@ def request_json_url(
     headers: dict[str, str],
     body: dict[str, Any] | None = None,
     ssl_context: ssl.SSLContext | None = None,
+    timeout: float | None = None,
 ) -> Any:
     """공통 GitHub API JSON 호출 래퍼다."""
     payload = None
@@ -434,7 +437,7 @@ def request_json_url(
         headers=headers,
     )
     try:
-        with urllib.request.urlopen(request, context=ssl_context or build_ssl_context()) as response:
+        with urllib.request.urlopen(request, context=ssl_context or build_ssl_context(), timeout=timeout) as response:
             raw = response.read().decode("utf-8")
             if not raw:
                 return None
@@ -858,6 +861,7 @@ class GitHubApi:
         path: str,
         body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         url = f"{self.api_url}{path}"
         if params:
@@ -868,6 +872,7 @@ class GitHubApi:
             headers=build_github_headers(self.token),
             body=body,
             ssl_context=self.ssl_context,
+            timeout=timeout,
         )
 
     def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
@@ -921,10 +926,11 @@ class GitHubApi:
             page += 1
         return comments
 
-    def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+    def list_requested_reviewers(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
         response = self.request_json(
             "GET",
             f"/repos/{self.repository}/pulls/{pull_number}/requested_reviewers",
+            timeout=timeout,
         )
         if not isinstance(response, dict):
             return []
@@ -933,11 +939,12 @@ class GitHubApi:
             return [user for user in users if isinstance(user, dict)]
         return []
 
-    def request_reviewers(self, pull_number: int, reviewers: list[str]) -> Any:
+    def request_reviewers(self, pull_number: int, reviewers: list[str], *, timeout: float | None = None) -> Any:
         return self.request_json(
             "POST",
             f"/repos/{self.repository}/pulls/{pull_number}/requested_reviewers",
             body={"reviewers": reviewers},
+            timeout=timeout,
         )
 
     def get_pull_head_sha(self, pull_number: int) -> str:
@@ -1361,6 +1368,10 @@ def maybe_request_copilot_review(
         COPILOT_REVIEW_PENDING_TTL_SECONDS_ENV,
         DEFAULT_COPILOT_REVIEW_PENDING_TTL_SECONDS,
     )
+    api_timeout_seconds = parse_positive_int_env(
+        COPILOT_REVIEW_API_TIMEOUT_SECONDS_ENV,
+        DEFAULT_COPILOT_REVIEW_API_TIMEOUT_SECONDS,
+    )
     budget_file = default_copilot_review_budget_file()
     month = current_copilot_review_budget_month()
     request_key = f"{github.repository}#{pull_number}"
@@ -1441,7 +1452,7 @@ def maybe_request_copilot_review(
         )
 
     try:
-        requested_reviewers = github.list_requested_reviewers(pull_number)
+        requested_reviewers = github.list_requested_reviewers(pull_number, timeout=api_timeout_seconds)
     except GitHubApiError as exc:
         used = rollback_copilot_review_budget_request(
             budget_file=budget_file,
@@ -1501,7 +1512,7 @@ def maybe_request_copilot_review(
         )
 
     try:
-        github.request_reviewers(pull_number, [reviewer])
+        github.request_reviewers(pull_number, [reviewer], timeout=api_timeout_seconds)
     except GitHubApiError as exc:
         used = rollback_copilot_review_budget_request(
             budget_file=budget_file,

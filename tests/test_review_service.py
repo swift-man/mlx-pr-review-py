@@ -886,13 +886,23 @@ class CopilotReviewRequestTests(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.requested_reviewers: list[str] = []
+                self.list_timeout = None
+                self.request_timeout = None
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 case.assertEqual(pull_number, 4)
+                self.list_timeout = timeout
                 return []
 
-            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
                 case.assertEqual(pull_number, 4)
+                self.request_timeout = timeout
                 self.requested_reviewers.extend(reviewers)
                 return {"requested_reviewers": [{"login": reviewers[0]}]}
 
@@ -905,6 +915,7 @@ class CopilotReviewRequestTests(unittest.TestCase):
                     review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: budget_file,
                     review_service.COPILOT_REVIEW_MONTHLY_BUDGET_ENV: "50",
                     review_service.COPILOT_REVIEW_REQUEST_COST_ENV: "13",
+                    review_service.COPILOT_REVIEW_API_TIMEOUT_SECONDS_ENV: "7",
                 },
                 clear=False,
             ):
@@ -913,6 +924,8 @@ class CopilotReviewRequestTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "requested")
             self.assertEqual(github.requested_reviewers, ["copilot"])
+            self.assertEqual(github.list_timeout, 7)
+            self.assertEqual(github.request_timeout, 7)
             self.assertEqual(result["used"], 13)
             with open(budget_file, "r", encoding="utf-8") as fh:
                 budget_state = json.load(fh)
@@ -926,10 +939,16 @@ class CopilotReviewRequestTests(unittest.TestCase):
         class FakeGitHub:
             repository = "swift-man/app"
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 raise AssertionError("budget check should happen before GitHub reviewer lookup")
 
-            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
                 raise AssertionError("budget-exhausted requests must not call GitHub")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -952,10 +971,16 @@ class CopilotReviewRequestTests(unittest.TestCase):
         class FakeGitHub:
             repository = "swift-man/app"
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 raise AssertionError("global PR request history should skip GitHub reviewer lookup")
 
-            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
                 raise AssertionError("global PR request history should skip GitHub reviewer requests")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1006,11 +1031,17 @@ class CopilotReviewRequestTests(unittest.TestCase):
         class RejectingGitHub:
             repository = "swift-man/app"
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 case.assertEqual(pull_number, 4)
                 return []
 
-            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
                 case.assertEqual((pull_number, reviewers), (4, ["copilot"]))
                 raise review_service.GitHubApiError(
                     method="POST",
@@ -1041,11 +1072,55 @@ class CopilotReviewRequestTests(unittest.TestCase):
         self.assertNotIn("swift-man/app#4", budget_state["requests"])
         self.assertNotIn("swift-man/app#4", month_entry["requests"])
 
+    def test_rolls_back_budget_when_copilot_request_times_out(self) -> None:
+        case = self
+
+        class TimeoutGitHub:
+            repository = "swift-man/app"
+
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                case.assertEqual(timeout, 3)
+                return []
+
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
+                case.assertEqual((pull_number, reviewers, timeout), (4, ["copilot"], 3))
+                raise TimeoutError("timed out")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            budget_file = os.path.join(tmpdir, "copilot-budget.json")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    review_service.COPILOT_REVIEW_REQUEST_ENV: "1",
+                    review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: budget_file,
+                    review_service.COPILOT_REVIEW_API_TIMEOUT_SECONDS_ENV: "3",
+                },
+                clear=False,
+            ):
+                result = review_service.maybe_request_copilot_review(TimeoutGitHub(), 4)
+
+            with open(budget_file, "r", encoding="utf-8") as fh:
+                budget_state = json.load(fh)
+
+        month_entry = budget_state[review_service.current_copilot_review_budget_month()]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "request_failed")
+        self.assertEqual(month_entry["used"], 0)
+        self.assertNotIn("swift-man/app#4", budget_state["requests"])
+        self.assertNotIn("swift-man/app#4", month_entry["requests"])
+
     def test_skips_recent_pending_copilot_request_without_github_lookup(self) -> None:
         class FakeGitHub:
             repository = "swift-man/app"
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 raise AssertionError("recent pending requests should not call GitHub")
 
         month = review_service.current_copilot_review_budget_month()
@@ -1090,11 +1165,17 @@ class CopilotReviewRequestTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.requested_reviewers: list[str] = []
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 case.assertEqual(pull_number, 4)
                 return []
 
-            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
                 case.assertEqual((pull_number, reviewers), (4, ["copilot"]))
                 self.requested_reviewers.extend(reviewers)
                 return {"requested_reviewers": [{"login": reviewers[0]}]}
@@ -1143,11 +1224,17 @@ class CopilotReviewRequestTests(unittest.TestCase):
         class FakeGitHub:
             repository = "swift-man/app"
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 case.assertEqual(pull_number, 4)
                 return []
 
-            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+            def request_reviewers(
+                self,
+                pull_number: int,
+                reviewers: list[str],
+                *,
+                timeout=None,
+            ) -> dict[str, Any]:
                 case.assertEqual((pull_number, reviewers), (4, ["copilot"]))
                 return {"requested_reviewers": [{"login": reviewers[0]}]}
 
@@ -1194,7 +1281,7 @@ class CopilotReviewRequestTests(unittest.TestCase):
         class FakeGitHub:
             repository = "swift-man/app"
 
-            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+            def list_requested_reviewers(self, pull_number: int, *, timeout=None) -> list[dict[str, Any]]:
                 raise AssertionError("existing Copilot comments should skip reviewer requests")
 
         with tempfile.TemporaryDirectory() as tmpdir:
