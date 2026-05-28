@@ -443,6 +443,18 @@ def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> 
     return completed
 
 
+class GitHubApiTests(unittest.TestCase):
+    def test_get_pull_head_sha_caches_result_per_pull(self) -> None:
+        with mock.patch.object(review_service, "build_ssl_context", return_value=mock.Mock()):
+            github = review_service.GitHubApi(token="token", repository="swift-man/app")
+
+        with mock.patch.object(github, "request_json", return_value={"head": {"sha": "abc123"}}) as request_json:
+            self.assertEqual(github.get_pull_head_sha(4), "abc123")
+            self.assertEqual(github.get_pull_head_sha(4), "abc123")
+
+        request_json.assert_called_once_with("GET", "/repos/swift-man/app/pulls/4")
+
+
 class ReviewBotConfigTests(unittest.TestCase):
     def _pr_file(self, filename: str) -> "review_service.PullRequestFile":
         return review_service.PullRequestFile(
@@ -624,15 +636,25 @@ review:
                 case.assertEqual(pull_number, 7)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 self.loaded_paths.append((path, ref))
+                if path != review_service.REVIEWBOT_CONFIG_PATH:
+                    return "line 1\nline 2\n"
                 return raw_config
 
         fake_github = FakeGitHub()
 
         result = review_service.load_patchable_pr_files_result(fake_github, 7)
 
-        self.assertEqual(fake_github.loaded_paths, [(review_service.REVIEWBOT_CONFIG_PATH, "abc123")])
+        self.assertEqual(
+            fake_github.loaded_paths,
+            [
+                (review_service.REVIEWBOT_CONFIG_PATH, "abc123"),
+                ("Sources/App.swift", "abc123"),
+                (review_service.REVIEWBOT_CONFIG_PATH, "abc123"),
+                ("Package.swift", "abc123"),
+            ],
+        )
         self.assertEqual(
             [pr_file.filename for pr_file in result.files],
             ["Sources/App.swift", ".reviewbot.yml", "Package.swift"],
@@ -680,14 +702,21 @@ review:
                 case.assertEqual(pull_number, 7)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 self.loaded_paths.append((path, ref))
                 raise RuntimeError("GitHub API GET https://api.github.com/repos/swift-man/app/contents/.reviewbot.yml failed: 404 Not Found")
 
         fake_github = FakeGitHub()
         result = review_service.load_patchable_pr_files_result(fake_github, 7)
 
-        self.assertEqual(fake_github.loaded_paths, [(review_service.REVIEWBOT_CONFIG_PATH, "abc123")])
+        self.assertEqual(
+            fake_github.loaded_paths,
+            [
+                (review_service.REVIEWBOT_CONFIG_PATH, "abc123"),
+                ("README.md", "abc123"),
+                ("Sources/App.swift", "abc123"),
+            ],
+        )
         self.assertEqual([pr_file.filename for pr_file in result.files], ["README.md", "Sources/App.swift"])
         self.assertEqual(result.patchable_count, 3)
         self.assertEqual(result.skipped_by_reviewbot, 1)
@@ -729,7 +758,7 @@ review:
                 case.assertEqual(pull_number, 7)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
                 case.assertEqual((path, ref), (review_service.REVIEWBOT_CONFIG_PATH, "abc123"))
                 return raw_config
 
@@ -875,6 +904,351 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertTrue(any("false positive" in rule for rule in rules))
         self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
         self.assertTrue(any("Copilot" in rule and "중복" in rule for rule in rules))
+
+    def test_current_file_context_excerpt_expands_hunk_context(self) -> None:
+        file_text = "\n".join(f"line {line_number}" for line_number in range(1, 21))
+        patch = "@@ -10,1 +10,2 @@\n old\n+new\n"
+
+        excerpt = review_service.build_current_file_context_excerpt(
+            file_text,
+            patch,
+            line_radius=2,
+            max_chars=10_000,
+        )
+
+        self.assertIn("Lines 8-13:", excerpt)
+        self.assertIn("8: line 8", excerpt)
+        self.assertIn("13: line 13", excerpt)
+        self.assertNotIn("7: line 7", excerpt)
+
+    def test_current_file_context_uses_full_file_when_it_fits(self) -> None:
+        context, mode = review_service.build_current_file_context(
+            "def a():\n    return 1\n",
+            "@@ -1,1 +1,2 @@\n def a():\n+    return 1\n",
+            mode="auto",
+            line_radius=1,
+            max_chars=10_000,
+        )
+
+        self.assertEqual(mode, "full_file")
+        self.assertIn("1: def a():", context)
+        self.assertIn("2:     return 1", context)
+
+    def test_current_file_context_full_mode_marks_truncated_file(self) -> None:
+        file_text = "\n".join(f"line {line_number}" for line_number in range(1, 200))
+
+        context, mode = review_service.build_current_file_context(
+            file_text,
+            "@@ -100,1 +100,2 @@\n line 100\n+line new\n",
+            mode="full",
+            line_radius=1,
+            max_chars=120,
+        )
+
+        self.assertEqual(mode, "full_file_truncated")
+        self.assertIn("full file context truncated", context)
+
+    def test_current_file_context_literal_truncation_marker_does_not_force_excerpt(self) -> None:
+        context, mode = review_service.build_current_file_context(
+            "def marker():\n    return 'full file context truncated'\n",
+            "@@ -2,1 +2,1 @@\n-    return ''\n+    return 'full file context truncated'\n",
+            mode="full_repo",
+            line_radius=0,
+            max_chars=10_000,
+        )
+
+        self.assertEqual(mode, "full_file")
+        self.assertIn("1: def marker():", context)
+
+    def test_current_file_context_auto_falls_back_to_excerpt_for_large_files(self) -> None:
+        file_text = "\n".join(f"line {line_number}" for line_number in range(1, 200))
+        context, mode = review_service.build_current_file_context(
+            file_text,
+            "@@ -100,1 +100,2 @@\n line 100\n+line new\n",
+            mode="auto",
+            line_radius=1,
+            max_chars=120,
+        )
+
+        self.assertEqual(mode, "excerpt")
+        self.assertIn("Lines 99-102:", context)
+        self.assertNotIn("Lines 1-", context)
+
+    def test_configured_context_mode_auto_disables_repository_context(self) -> None:
+        with mock.patch.dict(os.environ, {review_service.CURRENT_FILE_CONTEXT_MODE_ENV: "auto"}, clear=False):
+            mode = review_service.configured_current_file_context_mode()
+
+        self.assertEqual(mode, "auto")
+        self.assertFalse(review_service.repository_context_enabled(mode))
+
+    def test_repository_context_priority_does_not_promote_all_root_files_for_root_change(self) -> None:
+        priority, path = review_service.repository_context_priority("LICENSE", {"README.md"})
+
+        self.assertEqual((priority, path), (4, "LICENSE"))
+
+    def test_make_prompt_includes_current_file_context_and_cooldown_focus_hints(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch=(
+                "@@ -20,0 +20,6 @@\n"
+                "+server_error_count = 0\n"
+                "+try:\n"
+                "+    await client.fetch_quote(item)\n"
+                "+except httpx.HTTPStatusError as exc:\n"
+                "+    server_error_count += 1\n"
+                "+    self._pause_kis_rest_fallback()\n"
+            ),
+            additions=6,
+            deletions=0,
+            right_side_lines=set(range(20, 26)),
+            current_file_context=(
+                "Lines 1-40:\n"
+                "1: async def retry_all(items):\n"
+                "2:     await asyncio.gather(*(client.fetch_quote(item) for item in items))\n"
+                "3:     # unchanged caller context\n"
+            ),
+            current_file_context_mode="full_file",
+        )
+
+        prompt = json.loads(review_service.make_prompt("swift-man/app", 4, [pr_file]))
+
+        prompt_file = prompt["files"][0]
+        self.assertIn("asyncio.gather", prompt_file["current_file_context"])
+        self.assertEqual(prompt_file["current_file_context_mode"], "full_file")
+        self.assertIn("file_context_rules", prompt["instructions"])
+        hints = prompt["instructions"]["review_focus_hints"]
+        self.assertTrue(any("cooldown" in hint for hint in hints))
+        self.assertTrue(any("asyncio.gather" in hint for hint in hints))
+        self.assertTrue(any("지역 변수" in hint for hint in hints))
+        self.assertTrue(any("RequestError" in hint for hint in hints))
+
+    def test_review_focus_hints_detect_plain_error_count_reset(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch=(
+                "@@ -20,0 +20,4 @@\n"
+                "+error_count = 0\n"
+                "+if status == 429:\n"
+                "+    error_count += 1\n"
+                "+    self._pause_until = now\n"
+            ),
+            additions=4,
+            deletions=0,
+            right_side_lines=set(range(20, 24)),
+        )
+
+        hints = review_service.build_review_focus_hints([pr_file])
+
+        self.assertTrue(any("지역 변수" in hint for hint in hints))
+
+    def test_make_prompt_includes_repository_context(self) -> None:
+        pr_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        repo_context = [
+            review_service.RepositoryContextEntry(
+                path="price_proxy/models.py",
+                content="1: class WatchItem:\n2:     pass",
+                mode="full_file",
+            )
+        ]
+
+        prompt = json.loads(
+            review_service.make_prompt(
+                "swift-man/app",
+                4,
+                [pr_file],
+                repository_context=repo_context,
+            )
+        )
+
+        self.assertEqual(prompt["repository_context"][0]["path"], "price_proxy/models.py")
+        self.assertIn("repository_context", " ".join(prompt["instructions"]["file_context_rules"]))
+
+    def test_collect_repository_context_uses_full_repo_mode_budget_and_filters(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(
+            include=("**/*.py",),
+            exclude=("vendor/**",),
+            always_review=(),
+            loaded=True,
+        )
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
+                case.assertEqual(ref, "abc123")
+                case.assertEqual(timeout, 7)
+                return [
+                    {"type": "blob", "path": "price_proxy/service.py", "size": 100},
+                    {"type": "blob", "path": "price_proxy/models.py", "size": 100},
+                    {"type": "blob", "path": "vendor/generated.py", "size": 100},
+                    {"type": "blob", "path": "README.md", "size": 100},
+                ]
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual(ref, "abc123")
+                case.assertEqual(timeout, 7)
+                return f"# {path}\nvalue = 1\n"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.CURRENT_FILE_CONTEXT_MODE_ENV: "full_repo",
+                review_service.REPOSITORY_CONTEXT_MAX_FILES_ENV: "5",
+                review_service.REPOSITORY_CONTEXT_MAX_CHARS_ENV: "2000",
+                review_service.REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV: "1000",
+                review_service.REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV: "7",
+            },
+            clear=False,
+        ):
+            entries = review_service.collect_repository_context(
+                FakeGitHub(),
+                4,
+                [changed_file],
+                config,
+                settings=review_service.configured_review_context_settings(),
+            )
+
+        self.assertEqual([entry.path for entry in entries], ["price_proxy/models.py"])
+        self.assertIn("1: # price_proxy/models.py", entries[0].content)
+
+    def test_collect_repository_context_literal_truncation_marker_stays_full_file(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(include=("**/*.py",), loaded=True)
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=1,
+            max_chars=1000,
+            repository_max_files=5,
+            repository_max_chars=2000,
+            repository_file_max_chars=1000,
+            api_timeout_seconds=7,
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                return [{"type": "blob", "path": "price_proxy/models.py", "size": 100}]
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual((path, ref, timeout), ("price_proxy/models.py", "abc123", 7))
+                return "# full file context truncated\nvalue = 1\n"
+
+        entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config, settings=settings)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].mode, "full_file")
+
+    def test_collect_repository_context_skips_oversized_candidate_and_keeps_later_fit(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(include=("**/*.py",), loaded=True)
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=1,
+            max_chars=1000,
+            repository_max_files=5,
+            repository_max_chars=120,
+            repository_file_max_chars=1000,
+            api_timeout_seconds=7,
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                return [
+                    {"type": "blob", "path": "price_proxy/a_large.py", "size": 100},
+                    {"type": "blob", "path": "price_proxy/z_small.py", "size": 100},
+                ]
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                if path == "price_proxy/a_large.py":
+                    return "\n".join(f"value_{index} = {index}" for index in range(100))
+                return "value = 1\n"
+
+        entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config, settings=settings)
+
+        self.assertEqual([entry.path for entry in entries], ["price_proxy/z_small.py"])
+
+    def test_collect_repository_context_skips_fetch_when_remaining_budget_cannot_fit_path(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(include=("**/*.py",), loaded=True)
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=1,
+            max_chars=100,
+            repository_max_files=5,
+            repository_max_chars=40,
+            repository_file_max_chars=1000,
+            api_timeout_seconds=7,
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                return [{"type": "blob", "path": "price_proxy/models.py", "size": 100}]
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                raise AssertionError("file fetch should be skipped when even the minimum entry cost exceeds budget")
+
+        entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config, settings=settings)
+
+        self.assertEqual(entries, [])
 
 
 class CopilotReviewRequestTests(unittest.TestCase):
@@ -1486,9 +1860,13 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
-            def get_file_text(self, path: str, *, ref: str) -> str:
-                case.assertEqual((path, ref), (review_service.REVIEWBOT_CONFIG_PATH, "abc123"))
-                raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual(ref, "abc123")
+                if path == review_service.REVIEWBOT_CONFIG_PATH:
+                    raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+                if path == "Sources/App.swift":
+                    return "let value = new\n"
+                raise AssertionError(f"unexpected file path: {path}")
 
             def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
                 self._assert_pull_number(pull_number)
