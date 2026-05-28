@@ -6,6 +6,10 @@ CERT_PATH="$(
 )"
 
 export LOCAL_REVIEW_HOME=/Users/runner/pr-review
+# install_local_review.sh 가 기록한 원본 repo 경로를 kickstart 시 자동 사용합니다.
+# 원본 경로를 직접 지정하거나 자동 복사를 끄고 싶으면 아래 값을 조정하세요.
+# export LOCAL_REVIEW_SOURCE_ROOT=/Users/runner/mlx-pr-review-py
+# export LOCAL_REVIEW_SYNC_SOURCE=0
 export HOST=127.0.0.1
 export PORT=8000
 

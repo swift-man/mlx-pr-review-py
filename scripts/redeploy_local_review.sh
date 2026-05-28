@@ -182,10 +182,16 @@ EOF
 }
 
 print_launchagent_followup() {
+  local stdout_log="${LOCAL_REVIEW_WEBHOOK_LOG:-/tmp/mlx-pr-review-webhook.log}"
+  local stderr_log="${LOCAL_REVIEW_WEBHOOK_ERR_LOG:-/tmp/mlx-pr-review-webhook.err.log}"
+
   cat <<EOF
 LaunchAgent restart completed and health check passed.
 
-Watch logs with:
+Watch logs without another restart:
+  tail -f $stdout_log $stderr_log
+
+Sync latest source, restart, and watch logs with:
   zsh $TARGET_ROOT/scripts/kickstart_local_review.sh
 EOF
 }
@@ -198,6 +204,7 @@ if launchagent_is_loaded; then
 
   LOCAL_REVIEW_HOME="$TARGET_ROOT" \
     LOCAL_REVIEW_ENV_FILE="$ENV_FILE" \
+    LOCAL_REVIEW_SYNC_SOURCE=0 \
     LOCAL_REVIEW_TAIL_LOGS=0 \
     zsh "$TARGET_ROOT/scripts/kickstart_local_review.sh"
   print_launchagent_followup

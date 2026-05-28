@@ -246,32 +246,33 @@ pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 
 ## 6. 서버 재시작
 
-코드 변경이 있거나 환경 변수를 바꿨다면 아래 순서대로 재시작하면 됩니다.
-
-한 번에 다시 배포하고 실행하려면 아래 래퍼 스크립트를 써도 됩니다.
-
-```bash
-./scripts/redeploy_local_review.sh /Users/runner/pr-review
-```
-
-이 스크립트는 LaunchAgent `com.swiftman.pr-review`가 이미 등록되어 있으면 최신 소스를
-`/Users/runner/pr-review`로 다시 복사한 뒤 tail 없이 `kickstart_local_review.sh`를 호출해
-LaunchAgent 재시동과 `/healthz` 확인까지 수행합니다. 이 경로에서는 서버를 포그라운드로
-다시 실행하지 않으므로 `address already in use` 충돌을 피할 수 있습니다.
-단, 로드된 LaunchAgent가 실제로 전달한 배포 대상 경로를 가리키는지 먼저 확인합니다.
-경로가 다르면 다른 설치본을 재시동할 수 있으므로 실패 메시지를 내고 중단합니다.
-
-LaunchAgent가 등록되어 있지 않은 개발 환경에서는 기존 uvicorn 프로세스를 종료한 뒤
-`/Users/runner/pr-review/scripts/local_review_env.sh`를 읽어 서버를 포그라운드로 다시 띄웁니다.
-
-LaunchAgent 기준으로 재시동만 필요하면 아래 명령을 사용합니다.
+LaunchAgent 기준 운영 환경에서는 코드 변경 반영과 재시동을 아래 한 명령으로 처리합니다.
 
 ```bash
 zsh /Users/runner/pr-review/scripts/kickstart_local_review.sh
 ```
 
-이 스크립트는 `launchctl kickstart -k`, `/healthz` 확인, 로그 tail을 순서대로 실행합니다.
-자동화에서 로그 tail 없이 종료해야 하면 `LOCAL_REVIEW_TAIL_LOGS=0`을 함께 넘깁니다.
+`install_local_review.sh`가 배포 복사본에 원본 repo 경로를 기록해 두므로, 이 스크립트는
+재시동 전에 최신 소스를 `/Users/runner/pr-review`로 먼저 복사합니다. 그 다음
+`launchctl kickstart -k`, `/healthz` 확인, 로그 tail을 순서대로 실행합니다. 자동화에서
+로그 tail 없이 종료해야 하면 `LOCAL_REVIEW_TAIL_LOGS=0`을 함께 넘깁니다. 이미 복사된
+서버만 재시동하고 싶으면 `LOCAL_REVIEW_SYNC_SOURCE=0`을 함께 넘깁니다.
+
+재시동 없이 로그만 보려면 아래 명령을 사용합니다.
+
+```bash
+tail -f /tmp/mlx-pr-review-webhook.log /tmp/mlx-pr-review-webhook.err.log
+```
+
+처음 설치하거나 원본 repo/배포 대상 경로를 바꿨다면 원본 repo에서 아래 명령으로 배포
+복사본과 source metadata를 다시 잡아줍니다.
+
+```bash
+./scripts/redeploy_local_review.sh /Users/runner/pr-review
+```
+
+LaunchAgent가 등록되어 있지 않은 개발 환경에서는 기존 uvicorn 프로세스를 종료한 뒤
+`/Users/runner/pr-review/scripts/local_review_env.sh`를 읽어 서버를 포그라운드로 다시 띄웁니다.
 
 ### 포그라운드 수동 재시작 (LaunchAgent 미사용 시)
 

@@ -2,11 +2,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REQUESTED_LOCAL_REVIEW_HOME="${LOCAL_REVIEW_HOME:-}"
 ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$SCRIPT_DIR/local_review_env.sh}"
 
 if [[ -f "$ENV_FILE" ]]; then
   # 운영용 값은 로컬 전용 env 스크립트에서 읽고, 저장소에는 커밋하지 않는다.
   source "$ENV_FILE"
+fi
+
+if [[ -n "$REQUESTED_LOCAL_REVIEW_HOME" ]]; then
+  LOCAL_REVIEW_HOME="$REQUESTED_LOCAL_REVIEW_HOME"
 fi
 
 if [[ $# -gt 0 ]]; then
