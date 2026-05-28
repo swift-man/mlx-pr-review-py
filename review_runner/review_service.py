@@ -773,6 +773,17 @@ class RepositoryContextEntry:
 
 
 @dataclass(frozen=True)
+class ReviewContextSettings:
+    mode: str
+    line_radius: int
+    max_chars: int
+    repository_max_files: int
+    repository_max_chars: int
+    repository_file_max_chars: int
+    api_timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class PullRequestDiscussionItem:
     source: str
     author: str
@@ -879,6 +890,7 @@ class GitHubApi:
         self.repository = repository
         self.api_url = api_url.rstrip("/")
         self.ssl_context = build_ssl_context()
+        self._pull_head_sha_cache: dict[int, str] = {}
 
     def request_json(
         self,
@@ -973,12 +985,16 @@ class GitHubApi:
         )
 
     def get_pull_head_sha(self, pull_number: int) -> str:
+        cached_sha = self._pull_head_sha_cache.get(pull_number)
+        if cached_sha:
+            return cached_sha
         pull = self.request_json("GET", f"/repos/{self.repository}/pulls/{pull_number}")
         head = pull.get("head") if isinstance(pull, dict) else None
         sha = head.get("sha") if isinstance(head, dict) else None
         normalized_sha = str(sha or "").strip()
         if not normalized_sha:
             raise RuntimeError(f"GitHub pull request response did not include head.sha for #{pull_number}")
+        self._pull_head_sha_cache[pull_number] = normalized_sha
         return normalized_sha
 
     def list_repo_tree(self, ref: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
@@ -1906,6 +1922,18 @@ def configured_review_context_api_timeout_seconds() -> int:
     )
 
 
+def configured_review_context_settings() -> ReviewContextSettings:
+    return ReviewContextSettings(
+        mode=configured_current_file_context_mode(),
+        line_radius=configured_current_file_context_line_radius(),
+        max_chars=configured_current_file_context_max_chars(),
+        repository_max_files=configured_repository_context_max_files(),
+        repository_max_chars=configured_repository_context_max_chars(),
+        repository_file_max_chars=configured_repository_context_file_max_chars(),
+        api_timeout_seconds=configured_review_context_api_timeout_seconds(),
+    )
+
+
 def truncate_context(text: str, max_chars: int, *, suffix: str) -> str:
     if max_chars <= 0:
         return ""
@@ -2012,17 +2040,18 @@ def enrich_pr_files_with_current_context(
     pull_number: int,
     files: list[PullRequestFile],
     *,
+    settings: ReviewContextSettings,
     log_prefix: str = "",
 ) -> None:
     """PR HEAD의 현재 파일 excerpt를 붙여 diff 밖 호출 경로도 모델이 검증할 수 있게 한다."""
     if not files:
         return
 
-    line_radius = configured_current_file_context_line_radius()
-    max_chars = configured_current_file_context_max_chars()
-    mode = configured_current_file_context_mode()
-    api_timeout_seconds = configured_review_context_api_timeout_seconds()
-    if mode == "off" or max_chars <= 0:
+    if settings.mode == "off":
+        log_progress(log_prefix, "Skipping current file context: mode=off")
+        return
+    if settings.max_chars <= 0:
+        log_progress(log_prefix, "Skipping current file context: max_chars<=0")
         return
 
     try:
@@ -2032,30 +2061,44 @@ def enrich_pr_files_with_current_context(
         return
 
     loaded_count = 0
+    outcome_counts: dict[str, int] = {}
+
+    def record_outcome(outcome: str) -> None:
+        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+
     for pr_file in files:
         if pr_file.status.lower() in {"removed", "deleted"}:
+            record_outcome("skipped_removed")
             continue
         try:
-            file_text = github.get_file_text(pr_file.filename, ref=head_sha, timeout=api_timeout_seconds)
+            file_text = github.get_file_text(pr_file.filename, ref=head_sha, timeout=settings.api_timeout_seconds)
         except (RuntimeError, OSError) as exc:
             log_progress(log_prefix, f"Skipping current file context for {pr_file.filename}: {exc}")
+            record_outcome("skipped_fetch_error")
             continue
 
         context, context_mode = build_current_file_context(
             file_text,
             pr_file.patch,
-            mode=mode,
-            line_radius=line_radius,
-            max_chars=max_chars,
+            mode=settings.mode,
+            line_radius=settings.line_radius,
+            max_chars=settings.max_chars,
         )
         if not context:
+            record_outcome("skipped_empty")
             continue
         pr_file.current_file_context = context
         pr_file.current_file_context_mode = context_mode
+        record_outcome(context_mode)
         loaded_count += 1
 
-    if loaded_count:
-        log_progress(log_prefix, f"Loaded current file context for {loaded_count} patchable file(s) mode={mode}")
+    if outcome_counts:
+        outcome_summary = ", ".join(f"{name}={count}" for name, count in sorted(outcome_counts.items()))
+        log_progress(
+            log_prefix,
+            f"Loaded current file context for {loaded_count} patchable file(s) mode={settings.mode} "
+            f"outcomes={outcome_summary}",
+        )
 
 
 def repository_context_enabled(mode: str) -> bool:
@@ -2099,24 +2142,23 @@ def collect_repository_context(
     changed_files: list[PullRequestFile],
     config: ReviewBotConfig,
     *,
+    settings: ReviewContextSettings,
     log_prefix: str = "",
 ) -> list[RepositoryContextEntry]:
     """품질 우선 리뷰를 위해 PR HEAD의 repo 파일 일부를 읽기 전용 컨텍스트로 수집한다."""
-    mode = configured_current_file_context_mode()
-    if not repository_context_enabled(mode):
+    if not repository_context_enabled(settings.mode):
         return []
 
-    max_files = configured_repository_context_max_files()
-    max_chars = configured_repository_context_max_chars()
-    file_max_chars = configured_repository_context_file_max_chars()
-    api_timeout_seconds = configured_review_context_api_timeout_seconds()
+    max_files = settings.repository_max_files
+    max_chars = settings.repository_max_chars
+    file_max_chars = settings.repository_file_max_chars
     if max_files <= 0 or max_chars <= 0 or file_max_chars <= 0:
         return []
 
     changed_paths = {pr_file.filename for pr_file in changed_files}
     try:
         head_sha = github.get_pull_head_sha(pull_number)
-        tree = github.list_repo_tree(head_sha, timeout=api_timeout_seconds)
+        tree = github.list_repo_tree(head_sha, timeout=settings.api_timeout_seconds)
     except (RuntimeError, OSError, AttributeError) as exc:
         log_progress(log_prefix, f"Skipping repository context: {exc}")
         return []
@@ -2140,8 +2182,11 @@ def collect_repository_context(
     for _priority, path, _size in sorted(candidates):
         if len(entries) >= max_files or total_chars >= max_chars:
             break
+        minimum_entry_cost = len(path) + 32
+        if total_chars + minimum_entry_cost >= max_chars:
+            break
         try:
-            file_text = github.get_file_text(path, ref=head_sha, timeout=api_timeout_seconds)
+            file_text = github.get_file_text(path, ref=head_sha, timeout=settings.api_timeout_seconds)
         except (RuntimeError, OSError) as exc:
             log_progress(log_prefix, f"Skipping repository context for {path}: {exc}")
             continue
@@ -3736,12 +3781,20 @@ def load_patchable_pr_files_result(
         )
     else:
         log_progress(log_prefix, f"Loaded {len(filtered_files)} patchable file(s)")
-    enrich_pr_files_with_current_context(github, pull_number, filtered_files, log_prefix=log_prefix)
+    context_settings = configured_review_context_settings()
+    enrich_pr_files_with_current_context(
+        github,
+        pull_number,
+        filtered_files,
+        settings=context_settings,
+        log_prefix=log_prefix,
+    )
     repository_context = collect_repository_context(
         github,
         pull_number,
         filtered_files,
         config,
+        settings=context_settings,
         log_prefix=log_prefix,
     )
     return PullRequestFileLoadResult(

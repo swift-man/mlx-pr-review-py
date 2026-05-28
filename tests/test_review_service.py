@@ -443,6 +443,18 @@ def subprocess_result(*, stdout: str, stderr: str = "", returncode: int = 0) -> 
     return completed
 
 
+class GitHubApiTests(unittest.TestCase):
+    def test_get_pull_head_sha_caches_result_per_pull(self) -> None:
+        with mock.patch.object(review_service, "build_ssl_context", return_value=mock.Mock()):
+            github = review_service.GitHubApi(token="token", repository="swift-man/app")
+
+        with mock.patch.object(github, "request_json", return_value={"head": {"sha": "abc123"}}) as request_json:
+            self.assertEqual(github.get_pull_head_sha(4), "abc123")
+            self.assertEqual(github.get_pull_head_sha(4), "abc123")
+
+        request_json.assert_called_once_with("GET", "/repos/swift-man/app/pulls/4")
+
+
 class ReviewBotConfigTests(unittest.TestCase):
     def _pr_file(self, filename: str) -> "review_service.PullRequestFile":
         return review_service.PullRequestFile(
@@ -1096,10 +1108,53 @@ class ExistingReviewContextTests(unittest.TestCase):
             },
             clear=False,
         ):
-            entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config)
+            entries = review_service.collect_repository_context(
+                FakeGitHub(),
+                4,
+                [changed_file],
+                config,
+                settings=review_service.configured_review_context_settings(),
+            )
 
         self.assertEqual([entry.path for entry in entries], ["price_proxy/models.py"])
         self.assertIn("1: # price_proxy/models.py", entries[0].content)
+
+    def test_collect_repository_context_skips_fetch_when_remaining_budget_cannot_fit_path(self) -> None:
+        case = self
+        config = review_service.ReviewBotConfig(include=("**/*.py",), loaded=True)
+        changed_file = review_service.PullRequestFile(
+            filename="price_proxy/service.py",
+            status="modified",
+            patch="@@ -1,0 +1,1 @@\n+value = 1\n",
+            additions=1,
+            deletions=0,
+            right_side_lines={1},
+        )
+        settings = review_service.ReviewContextSettings(
+            mode="full_repo",
+            line_radius=1,
+            max_chars=100,
+            repository_max_files=5,
+            repository_max_chars=40,
+            repository_file_max_chars=1000,
+            api_timeout_seconds=7,
+        )
+
+        class FakeGitHub:
+            def get_pull_head_sha(self, pull_number: int) -> str:
+                case.assertEqual(pull_number, 4)
+                return "abc123"
+
+            def list_repo_tree(self, ref: str, *, timeout=None) -> list[dict[str, object]]:
+                case.assertEqual((ref, timeout), ("abc123", 7))
+                return [{"type": "blob", "path": "price_proxy/models.py", "size": 100}]
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                raise AssertionError("file fetch should be skipped when even the minimum entry cost exceeds budget")
+
+        entries = review_service.collect_repository_context(FakeGitHub(), 4, [changed_file], config, settings=settings)
+
+        self.assertEqual(entries, [])
 
 
 class CopilotReviewRequestTests(unittest.TestCase):
