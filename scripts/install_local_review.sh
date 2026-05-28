@@ -13,6 +13,7 @@ mkdir -p "$TARGET_ROOT/review_runner"
 mkdir -p "$TARGET_ROOT/scripts"
 mkdir -p "$TARGET_ROOT/deploy"
 mkdir -p "$TARGET_ROOT/deploy/launchagents"
+printf '%s\n' "$SOURCE_ROOT" > "$TARGET_ROOT/.local_review_source_root"
 find "$TARGET_ROOT/review_runner" -maxdepth 1 -type f -name '*.py' -delete
 cp "$SOURCE_ROOT/review_runner/"*.py "$TARGET_ROOT/review_runner/"
 cp "$SOURCE_ROOT/review_runner/requirements.txt" "$TARGET_ROOT/review_runner/"
