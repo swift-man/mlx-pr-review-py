@@ -18,6 +18,13 @@ ROOT_DIR="${LOCAL_REVIEW_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 
+# Copilot PR review 요청은 서버 시작 스크립트 기본값으로 관리한다.
+# local_review_env.sh 에서 같은 이름의 값을 지정하면 이 기본값을 덮어쓸 수 있다.
+COPILOT_REVIEW_REQUEST="${COPILOT_REVIEW_REQUEST:-1}"
+COPILOT_REVIEW_MONTHLY_BUDGET="${COPILOT_REVIEW_MONTHLY_BUDGET:-50}"
+COPILOT_REVIEW_REQUEST_COST="${COPILOT_REVIEW_REQUEST_COST:-13}"
+COPILOT_REVIEWER="${COPILOT_REVIEWER:-copilot}"
+
 # 웹훅 위조 방지를 위해 secret은 항상 필수다.
 : "${GITHUB_WEBHOOK_SECRET:?Set GITHUB_WEBHOOK_SECRET before starting the webhook server}"
 
@@ -31,6 +38,11 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
 fi
 
 cd "$ROOT_DIR"
-export PYTHONPATH="$ROOT_DIR"
 # uvicorn은 foreground로 실행해 상위 프로세스에서 로그를 그대로 볼 수 있게 둔다.
-exec "$ROOT_DIR/venv/bin/uvicorn" review_runner.webhook_app:app --host "$HOST" --port "$PORT"
+exec env \
+  PYTHONPATH="$ROOT_DIR" \
+  COPILOT_REVIEW_REQUEST="$COPILOT_REVIEW_REQUEST" \
+  COPILOT_REVIEW_MONTHLY_BUDGET="$COPILOT_REVIEW_MONTHLY_BUDGET" \
+  COPILOT_REVIEW_REQUEST_COST="$COPILOT_REVIEW_REQUEST_COST" \
+  COPILOT_REVIEWER="$COPILOT_REVIEWER" \
+  "$ROOT_DIR/venv/bin/uvicorn" review_runner.webhook_app:app --host "$HOST" --port "$PORT"

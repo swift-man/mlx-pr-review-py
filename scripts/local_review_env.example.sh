@@ -28,12 +28,13 @@ export MLX_MAX_TOKENS=900
 # Metal/MLX abort가 반복되면 주석을 해제해 CPU fallback으로 확인하세요.
 # export MLX_DEVICE=cpu
 
-# GitHub Copilot PR 리뷰를 함께 요청하려면 아래 값을 주석 해제하세요.
+# GitHub Copilot PR 리뷰 요청은 run_webhook_server.sh 기본값으로 켜져 있습니다.
 # 봇은 로컬 budget 파일에 월별 사용량을 기록하고, 같은 PR에는 중복 요청하지 않습니다.
 # Free 플랜은 GitHub.com PR code review가 기본 제공되지 않을 수 있으므로 실패하면 MLX 리뷰만 계속합니다.
-# export COPILOT_REVIEW_REQUEST=1
-# export COPILOT_REVIEW_MONTHLY_BUDGET=50
-# export COPILOT_REVIEW_REQUEST_COST=13
+# 필요하면 export 없이 값만 지정해 시작 스크립트 기본값을 덮어씁니다.
+# COPILOT_REVIEW_REQUEST=0
+# COPILOT_REVIEW_MONTHLY_BUDGET=50
+# COPILOT_REVIEW_REQUEST_COST=13
 
 # ───────────────────────────────────────────────────────────────────────────
 # 원격 MLX backend (mlx-final-py 의 /v1/generate 와 모델 인스턴스 공유)
