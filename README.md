@@ -229,8 +229,21 @@ pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true
 ./scripts/redeploy_local_review.sh /Users/runner/pr-review
 ```
 
-이 스크립트는 기존 uvicorn 프로세스를 종료한 뒤, 최신 소스를 `/Users/runner/pr-review`로 다시 복사하고,
+이 스크립트는 LaunchAgent `com.swiftman.pr-review`가 이미 등록되어 있으면 최신 소스를
+`/Users/runner/pr-review`로 다시 복사한 뒤 `launchctl kickstart -k`로 기존 서버를 종료하고
+새 프로세스를 띄웁니다. 이 경로에서는 서버를 포그라운드로 다시 실행하지 않으므로
+`address already in use` 충돌을 피할 수 있습니다.
+
+LaunchAgent가 등록되어 있지 않은 개발 환경에서는 기존 uvicorn 프로세스를 종료한 뒤
 `/Users/runner/pr-review/scripts/local_review_env.sh`를 읽어 서버를 포그라운드로 다시 띄웁니다.
+
+LaunchAgent 기준으로 재시동만 필요하면 아래 명령을 사용합니다.
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.swiftman.pr-review
+curl http://127.0.0.1:8000/healthz
+tail -f /tmp/mlx-pr-review-webhook.log /tmp/mlx-pr-review-webhook.err.log
+```
 
 ```bash
 pkill -f '/Users/runner/pr-review/venv/bin/uvicorn' || true

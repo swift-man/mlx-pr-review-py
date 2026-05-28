@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_ROOT="${1:-/Users/runner/pr-review}"
 ENV_FILE="${LOCAL_REVIEW_ENV_FILE:-$TARGET_ROOT/scripts/local_review_env.sh}"
+LAUNCH_AGENT_LABEL="${LOCAL_REVIEW_LAUNCH_AGENT_LABEL:-com.swiftman.pr-review}"
+LAUNCH_AGENT_SERVICE="gui/$(id -u)/$LAUNCH_AGENT_LABEL"
 
 resolve_python_bin() {
   if [[ -n "${PYTHON_BIN:-}" ]]; then
@@ -37,13 +39,15 @@ resolve_python_bin() {
 
 PYTHON_BIN_RESOLVED="$(resolve_python_bin)"
 
-echo "Stopping existing webhook server from $TARGET_ROOT"
-pkill -f "$TARGET_ROOT/venv/bin/uvicorn" || true
+launchagent_is_loaded() {
+  command -v launchctl >/dev/null 2>&1 && launchctl print "$LAUNCH_AGENT_SERVICE" >/dev/null 2>&1
+}
 
-echo "Installing latest source from $SOURCE_ROOT into $TARGET_ROOT"
-PYTHON_BIN="$PYTHON_BIN_RESOLVED" "$SOURCE_ROOT/scripts/install_local_review.sh" "$TARGET_ROOT"
+ensure_env_file_exists() {
+  if [[ -f "$ENV_FILE" ]]; then
+    return
+  fi
 
-if [[ ! -f "$ENV_FILE" ]]; then
   cat <<EOF
 No env file found at:
   $ENV_FILE
@@ -54,7 +58,39 @@ Create it first with:
 Then fill in the real GitHub/App credentials and rerun this script.
 EOF
   exit 1
+}
+
+print_launchagent_followup() {
+  cat <<EOF
+LaunchAgent restart requested:
+  launchctl kickstart -k $LAUNCH_AGENT_SERVICE
+
+Check server health:
+  curl http://127.0.0.1:8000/healthz
+
+Watch logs:
+  tail -f /tmp/mlx-pr-review-webhook.log /tmp/mlx-pr-review-webhook.err.log
+EOF
+}
+
+if launchagent_is_loaded; then
+  echo "LaunchAgent $LAUNCH_AGENT_SERVICE is loaded; installing latest source before restart"
+  PYTHON_BIN="$PYTHON_BIN_RESOLVED" "$SOURCE_ROOT/scripts/install_local_review.sh" "$TARGET_ROOT"
+  ensure_env_file_exists
+
+  echo "Restarting webhook server through LaunchAgent $LAUNCH_AGENT_SERVICE"
+  launchctl kickstart -k "$LAUNCH_AGENT_SERVICE"
+  print_launchagent_followup
+  exit 0
 fi
+
+echo "No loaded LaunchAgent found for $LAUNCH_AGENT_SERVICE"
+echo "Stopping existing foreground webhook server from $TARGET_ROOT"
+pkill -f "$TARGET_ROOT/venv/bin/uvicorn" || true
+
+echo "Installing latest source from $SOURCE_ROOT into $TARGET_ROOT"
+PYTHON_BIN="$PYTHON_BIN_RESOLVED" "$SOURCE_ROOT/scripts/install_local_review.sh" "$TARGET_ROOT"
+ensure_env_file_exists
 
 echo "Starting webhook server using env file $ENV_FILE"
 export LOCAL_REVIEW_HOME="$TARGET_ROOT"
