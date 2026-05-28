@@ -1137,6 +1137,59 @@ class CopilotReviewRequestTests(unittest.TestCase):
         self.assertEqual(budget_state[month]["used"], 13)
         self.assertEqual(budget_state["requests"]["swift-man/app#4"]["status"], "requested")
 
+    def test_stale_pending_cleanup_removes_original_month_usage(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            repository = "swift-man/app"
+
+            def list_requested_reviewers(self, pull_number: int) -> list[dict[str, Any]]:
+                case.assertEqual(pull_number, 4)
+                return []
+
+            def request_reviewers(self, pull_number: int, reviewers: list[str]) -> dict[str, Any]:
+                case.assertEqual((pull_number, reviewers), (4, ["copilot"]))
+                return {"requested_reviewers": [{"login": reviewers[0]}]}
+
+        current_month = review_service.current_copilot_review_budget_month()
+        old_month = "2000-01"
+        pending_entry = {
+            "cost": 13,
+            "month": old_month,
+            "requested_at": "2000-01-01T00:00:00Z",
+            "reviewer": "copilot",
+            "status": "pending",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            budget_file = os.path.join(tmpdir, "copilot-budget.json")
+            with open(budget_file, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "requests": {"swift-man/app#4": pending_entry},
+                        old_month: {"used": 13, "requests": {"swift-man/app#4": pending_entry}},
+                    },
+                    fh,
+                )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    review_service.COPILOT_REVIEW_REQUEST_ENV: "1",
+                    review_service.COPILOT_REVIEW_BUDGET_FILE_ENV: budget_file,
+                    review_service.COPILOT_REVIEW_PENDING_TTL_SECONDS_ENV: "600",
+                },
+                clear=False,
+            ):
+                result = review_service.maybe_request_copilot_review(FakeGitHub(), 4)
+                with open(budget_file, "r", encoding="utf-8") as fh:
+                    budget_state = json.load(fh)
+
+        self.assertEqual(result["status"], "requested")
+        self.assertEqual(budget_state[old_month]["used"], 0)
+        self.assertNotIn("swift-man/app#4", budget_state[old_month]["requests"])
+        self.assertEqual(budget_state[current_month]["used"], 13)
+        self.assertEqual(budget_state["requests"]["swift-man/app#4"]["month"], current_month)
+
     def test_skips_copilot_review_when_copilot_context_already_exists(self) -> None:
         class FakeGitHub:
             repository = "swift-man/app"

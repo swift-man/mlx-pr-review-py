@@ -1232,9 +1232,23 @@ def remove_copilot_review_budget_request(
     request_key: str,
     cost: int,
 ) -> None:
-    get_copilot_request_history(state).pop(request_key, None)
-    month_entry["requests"].pop(request_key, None)
-    month_entry["used"] = max(0, month_entry["used"] - cost)
+    history_entry = get_copilot_request_history(state).pop(request_key, None)
+    removed_from_month = False
+
+    for raw_entry in state.values():
+        if not isinstance(raw_entry, dict):
+            continue
+        requests = raw_entry.get("requests")
+        if not isinstance(requests, dict) or request_key not in requests:
+            continue
+        month_request = requests.pop(request_key)
+        used = raw_entry.get("used")
+        raw_entry["used"] = max(0, (used if isinstance(used, int) else 0) - get_copilot_request_entry_cost(month_request, cost))
+        removed_from_month = True
+
+    if not removed_from_month:
+        month_entry["requests"].pop(request_key, None)
+        month_entry["used"] = max(0, month_entry["used"] - get_copilot_request_entry_cost(history_entry, cost))
 
 
 def rollback_copilot_review_budget_request(
