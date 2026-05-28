@@ -9,21 +9,40 @@ fi
 TARGET_ROOT="$1"
 SOURCE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+copy_file() {
+  local source_file="$1"
+  local target_file="$2"
+  local temp_file="$target_file.tmp.$$"
+
+  cp "$source_file" "$temp_file"
+  mv "$temp_file" "$target_file"
+}
+
+copy_into_dir() {
+  local target_dir="$1"
+  shift
+
+  local source_file
+  for source_file in "$@"; do
+    copy_file "$source_file" "$target_dir/$(basename "$source_file")"
+  done
+}
+
 mkdir -p "$TARGET_ROOT/review_runner"
 mkdir -p "$TARGET_ROOT/scripts"
 mkdir -p "$TARGET_ROOT/deploy"
 mkdir -p "$TARGET_ROOT/deploy/launchagents"
 printf '%s\n' "$SOURCE_ROOT" > "$TARGET_ROOT/.local_review_source_root"
 find "$TARGET_ROOT/review_runner" -maxdepth 1 -type f -name '*.py' -delete
-cp "$SOURCE_ROOT/review_runner/"*.py "$TARGET_ROOT/review_runner/"
-cp "$SOURCE_ROOT/review_runner/requirements.txt" "$TARGET_ROOT/review_runner/"
-cp "$SOURCE_ROOT/scripts/kickstart_local_review.sh" "$TARGET_ROOT/scripts/"
-cp "$SOURCE_ROOT/scripts/run_webhook_server.sh" "$TARGET_ROOT/scripts/"
-cp "$SOURCE_ROOT/scripts/send_test_webhook.sh" "$TARGET_ROOT/scripts/"
-cp "$SOURCE_ROOT/scripts/warm_mlx_model.sh" "$TARGET_ROOT/scripts/"
-cp "$SOURCE_ROOT/scripts/local_review_env.example.sh" "$TARGET_ROOT/scripts/"
-cp "$SOURCE_ROOT/deploy/nginx-pr-review.conf" "$TARGET_ROOT/deploy/"
-cp "$SOURCE_ROOT/deploy/launchagents/"*.plist "$TARGET_ROOT/deploy/launchagents/"
+copy_into_dir "$TARGET_ROOT/review_runner" "$SOURCE_ROOT/review_runner/"*.py
+copy_file "$SOURCE_ROOT/review_runner/requirements.txt" "$TARGET_ROOT/review_runner/requirements.txt"
+copy_file "$SOURCE_ROOT/scripts/kickstart_local_review.sh" "$TARGET_ROOT/scripts/kickstart_local_review.sh"
+copy_file "$SOURCE_ROOT/scripts/run_webhook_server.sh" "$TARGET_ROOT/scripts/run_webhook_server.sh"
+copy_file "$SOURCE_ROOT/scripts/send_test_webhook.sh" "$TARGET_ROOT/scripts/send_test_webhook.sh"
+copy_file "$SOURCE_ROOT/scripts/warm_mlx_model.sh" "$TARGET_ROOT/scripts/warm_mlx_model.sh"
+copy_file "$SOURCE_ROOT/scripts/local_review_env.example.sh" "$TARGET_ROOT/scripts/local_review_env.example.sh"
+copy_file "$SOURCE_ROOT/deploy/nginx-pr-review.conf" "$TARGET_ROOT/deploy/nginx-pr-review.conf"
+copy_into_dir "$TARGET_ROOT/deploy/launchagents" "$SOURCE_ROOT/deploy/launchagents/"*.plist
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
