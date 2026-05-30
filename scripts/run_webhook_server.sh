@@ -33,9 +33,10 @@ COPILOT_REVIEWER="${COPILOT_REVIEWER:-copilot}"
 # 리뷰 입력 컨텍스트 기본값도 시작 스크립트에서 관리한다.
 # 코드 기본값 full_repo 는 변경 외 repo 파일까지 프롬프트에 붙여 입력이 수십만 자로
 # 커지고, remote /v1/generate prefill 이 길어져 한 PR 리뷰가 15~20분까지 걸린다.
-# 변경 파일의 최신 PR HEAD full code 만 컨텍스트로 주는 full 로 기본을 낮춘다.
+# auto 는 변경 파일만 컨텍스트로 주되, MAX_CHARS 를 넘는 큰 파일은 변경 hunk 주변
+# excerpt 로 보존해 full(초과 시 앞부분만 남기고 잘림)보다 안전하게 입력을 줄인다.
 # local_review_env.sh 에서 같은 이름을 지정하면 이 기본값을 덮어쓸 수 있다.
-MLX_REVIEW_CONTEXT_MODE="${MLX_REVIEW_CONTEXT_MODE:-full}"
+MLX_REVIEW_CONTEXT_MODE="${MLX_REVIEW_CONTEXT_MODE:-auto}"
 MLX_REVIEW_CONTEXT_MAX_CHARS="${MLX_REVIEW_CONTEXT_MAX_CHARS:-18000}"
 
 # 웹훅 위조 방지를 위해 secret은 항상 필수다.

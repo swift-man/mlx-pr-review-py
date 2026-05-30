@@ -29,8 +29,9 @@ export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
 # Apple Silicon 64GB급 로컬 운영은 품질 우선으로 출력 상한을 넉넉하게 둔다.
 export MLX_MAX_TOKENS=1600
 # PR 리뷰 입력은 diff만 보지 않고 최신 PR HEAD의 변경 파일과 repo context도 함께 봅니다.
-# 기본 full_repo: 변경 파일 full/excerpt + 예산 안의 변경 외 repo 파일을 추가합니다.
-# timeout/body limit 이 부담되면 auto(변경 파일만) 또는 off 로 낮출 수 있습니다.
+# webhook 서버(run_webhook_server.sh)는 prefill 폭증을 막기 위해 기본을 auto/18000 으로
+# 낮춰 둡니다. auto: 변경 파일만, MAX_CHARS 초과 시 변경 hunk 주변 excerpt 로 보존.
+# 품질 우선으로 변경 외 repo 파일까지 보려면 아래를 full_repo 로 올릴 수 있습니다.
 # export MLX_REVIEW_CONTEXT_MODE=full_repo
 # export MLX_REVIEW_CONTEXT_MAX_CHARS=30000
 # export MLX_REVIEW_CONTEXT_LINE_RADIUS=120
