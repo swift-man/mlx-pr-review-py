@@ -1937,6 +1937,65 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(artifacts.validated_review.event, "APPROVE")
         self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
 
+    def test_generate_review_artifacts_413_uses_server_limit_when_config_is_too_high(self) -> None:
+        files = [
+            self._large_pr_file("a.py", context_size=120_000),
+            self._large_pr_file("b.py", context_size=120_000),
+        ]
+        seen_batches: list[list[str]] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            payload = json.loads(prompt)
+            seen_batches.append([file_payload["path"] for file_payload in payload["files"]])
+            if len(seen_batches) == 1:
+                raise RuntimeError(
+                    'MLX generate endpoint returned HTTP 413: {"ok": false, '
+                    '"error": "message content too large (243884 > 150000 chars; '
+                    'MLX_GENERATE_MAX_PROMPT_CHARS)"}'
+                )
+            return {
+                "summary": "batch ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: "999999"}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, files)
+
+        self.assertEqual(seen_batches, [["a.py", "b.py"], ["a.py"], ["b.py"]])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
+
+    def test_split_pr_files_truncates_single_file_context_to_fit_prompt_budget(self) -> None:
+        pr_file = self._large_pr_file("huge.py", context_size=20_000)
+        empty_context_file = review_service.replace(
+            pr_file,
+            current_file_context="",
+            current_file_context_mode="",
+        )
+        budget = len(review_service.make_prompt("swift-man/app", 4, [empty_context_file])) + 2_000
+
+        batches = review_service.split_pr_files_for_prompt_budget(
+            "swift-man/app",
+            4,
+            [pr_file],
+            existing_review_context=None,
+            prompt_max_chars=budget,
+        )
+
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(batches[0]), 1)
+        fitted_file = batches[0][0]
+        fitted_prompt = review_service.make_prompt("swift-man/app", 4, [fitted_file])
+        self.assertLessEqual(len(fitted_prompt), budget)
+        self.assertIn("prompt_truncated", fitted_file.current_file_context_mode)
+        self.assertIn("current file context truncated to fit prompt budget", fitted_file.current_file_context)
+
     def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
         case = self
 

@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import certifi
@@ -3870,12 +3870,13 @@ def generate_review_artifacts(
     except RuntimeError as exc:
         if not should_retry_as_batched_review(exc, pr_files):
             raise
+        retry_prompt_max_chars = review_prompt_retry_budget(prompt_max_chars, len(prompt), exc)
         return generate_batched_review_artifacts(
             repository,
             pull_number,
             pr_files,
             existing_review_context=existing_review_context,
-            prompt_max_chars=prompt_max_chars or DEFAULT_REVIEW_PROMPT_MAX_CHARS,
+            prompt_max_chars=retry_prompt_max_chars,
             initial_prompt_chars=len(prompt),
             log_prefix=log_prefix,
         )
@@ -3913,8 +3914,93 @@ def is_mlx_prompt_too_large_error(error: RuntimeError) -> bool:
     )
 
 
+def parse_prompt_limit_from_mlx_error(error: RuntimeError) -> int | None:
+    """MLX 413 메시지의 ``current > limit`` 숫자에서 서버 상한을 읽는다."""
+    message = normalize_text(str(error))
+    match = re.search(r"\b\d+\s*>\s*(\d+)\s*chars?\b", message)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def review_prompt_retry_budget(configured_budget: int, initial_prompt_chars: int, error: RuntimeError) -> int:
+    """413 이후에는 실패한 prompt보다 확실히 작은 예산으로 batch를 강제한다."""
+    base_budget = configured_budget if configured_budget > 0 else DEFAULT_REVIEW_PROMPT_MAX_CHARS
+    retry_budget = min(base_budget, DEFAULT_REVIEW_PROMPT_MAX_CHARS)
+
+    server_limit = parse_prompt_limit_from_mlx_error(error)
+    if server_limit is not None:
+        retry_budget = min(retry_budget, max(server_limit - 5_000, 1))
+    else:
+        retry_budget = min(retry_budget, max(initial_prompt_chars // 2, 1))
+
+    return max(retry_budget, 1)
+
+
 def should_retry_as_batched_review(error: RuntimeError, pr_files: list[PullRequestFile]) -> bool:
     return len(pr_files) > 1 and is_mlx_prompt_too_large_error(error)
+
+
+def prompt_truncated_context_mode(context_mode: str) -> str:
+    normalized = normalize_text(context_mode) or "current_file_context"
+    if normalized.endswith("_prompt_truncated"):
+        return normalized
+    return f"{normalized}_prompt_truncated"
+
+
+def fit_pr_file_to_prompt_budget(
+    repository: str,
+    pull_number: int,
+    pr_file: PullRequestFile,
+    *,
+    existing_review_context: list[dict[str, Any]] | None,
+    prompt_max_chars: int,
+) -> PullRequestFile:
+    """단일 파일 prompt도 예산을 넘으면 current_file_context만 명시적으로 줄인다."""
+    if prompt_max_chars <= 0:
+        return pr_file
+
+    fitted_file = pr_file
+    for _attempt in range(4):
+        prompt = make_prompt(
+            repository,
+            pull_number,
+            [fitted_file],
+            repository_context=None,
+            existing_review_context=existing_review_context,
+        )
+        if len(prompt) <= prompt_max_chars:
+            return fitted_file
+
+        current_context = fitted_file.current_file_context
+        if not current_context:
+            return fitted_file
+
+        overage = len(prompt) - prompt_max_chars
+        target_context_chars = len(current_context) - overage - 1_000
+        if target_context_chars <= 0:
+            next_context = ""
+            next_mode = "current_file_context_omitted_to_fit_prompt"
+        else:
+            next_context = truncate_context(
+                current_context,
+                target_context_chars,
+                suffix="current file context truncated to fit prompt budget",
+            )
+            next_mode = prompt_truncated_context_mode(fitted_file.current_file_context_mode)
+
+        if next_context == current_context:
+            return fitted_file
+        fitted_file = replace(
+            fitted_file,
+            current_file_context=next_context,
+            current_file_context_mode=next_mode,
+        )
+
+    return fitted_file
 
 
 def split_pr_files_for_prompt_budget(
@@ -3926,14 +4012,21 @@ def split_pr_files_for_prompt_budget(
     prompt_max_chars: int,
 ) -> list[list[PullRequestFile]]:
     """각 batch prompt가 예산에 들어오도록 PR 파일 순서를 유지해 나눈다."""
-    if prompt_max_chars <= 0 or len(pr_files) <= 1:
+    if prompt_max_chars <= 0:
         return [list(pr_files)]
 
     batches: list[list[PullRequestFile]] = []
     current_batch: list[PullRequestFile] = []
 
     for pr_file in pr_files:
-        candidate = [*current_batch, pr_file]
+        budgeted_file = fit_pr_file_to_prompt_budget(
+            repository,
+            pull_number,
+            pr_file,
+            existing_review_context=existing_review_context,
+            prompt_max_chars=prompt_max_chars,
+        )
+        candidate = [*current_batch, budgeted_file]
         candidate_prompt = make_prompt(
             repository,
             pull_number,
@@ -3943,7 +4036,7 @@ def split_pr_files_for_prompt_budget(
         )
         if current_batch and len(candidate_prompt) > prompt_max_chars:
             batches.append(current_batch)
-            current_batch = [pr_file]
+            current_batch = [budgeted_file]
             continue
         current_batch = candidate
 
@@ -3995,11 +4088,16 @@ def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) ->
         has_any_finding=has_findings,
     )
     summary_prefix = f"대형 PR이라 {len(batch_artifacts)}개 묶음으로 나눠 리뷰했습니다."
+    if has_findings:
+        summaries = [summary for summary in summaries if not looks_like_no_findings_summary(summary)]
+
     if summaries:
         summary = f"{summary_prefix} {' '.join(summaries)}"
     else:
         summary = summary_prefix
     summary = sanitize_summary(summary, has_findings=has_findings)
+    if not summary.startswith(summary_prefix):
+        summary = f"{summary_prefix} {summary}"
     return ValidatedReview(
         comments=comments,
         summary=summary,
