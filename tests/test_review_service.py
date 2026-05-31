@@ -1972,6 +1972,24 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(artifacts.validated_review.event, "APPROVE")
         self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
 
+    def test_prompt_limit_parser_accepts_byte_limit_errors(self) -> None:
+        error = RuntimeError(
+            "MLX generate request body is too large (543710 > 250000 bytes)."
+        )
+
+        self.assertEqual(review_service.parse_prompt_limit_from_mlx_error(error), 250000)
+
+    def test_retry_budget_respects_explicit_budget_when_no_server_limit_is_available(self) -> None:
+        error = RuntimeError("MLX generate endpoint returned HTTP 413: too large")
+
+        budget = review_service.review_prompt_retry_budget(
+            configured_budget=400_000,
+            initial_prompt_chars=300_000,
+            error=error,
+        )
+
+        self.assertEqual(budget, 150_000)
+
     def test_generate_review_artifacts_batches_single_file_prompt_before_mlx(self) -> None:
         pr_file = self._large_pr_file("huge.py", context_size=20_000)
         empty_context_file = review_service.replace(
@@ -2060,6 +2078,40 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual([comment.path for comment in combined.comments], ["b.py", "a.py"])
         self.assertEqual(combined.event, "REQUEST_CHANGES")
         self.assertEqual(len(combined.must_fix), 1)
+
+    def test_combine_batched_reviews_keeps_rule_based_comments_outside_model_limit(self) -> None:
+        def artifact(comment: review_service.ReviewComment) -> review_service.ReviewGenerationArtifacts:
+            return review_service.ReviewGenerationArtifacts(
+                prompt="",
+                mlx_result={},
+                validated_review=review_service.ValidatedReview(
+                    comments=[comment],
+                    summary=f"{comment.path} summary",
+                    event="REQUEST_CHANGES" if comment.severity in review_service.BLOCKING_SEVERITIES else "COMMENT",
+                    positives=[],
+                    must_fix=[],
+                    suggestions=[],
+                ),
+                payload={},
+            )
+
+        comments = [
+            review_service.ReviewComment("a.py", 1, "major model", severity=review_service.SEVERITY_MAJOR),
+            review_service.ReviewComment("b.py", 2, "minor model", severity=review_service.SEVERITY_MINOR),
+            review_service.ReviewComment(
+                "secret.py",
+                3,
+                "rule based secret",
+                severity=review_service.SEVERITY_CRITICAL,
+                source="rule",
+            ),
+        ]
+
+        with mock.patch.dict(os.environ, {review_service.MAX_MODEL_FINDINGS_ENV: "1"}, clear=False):
+            combined = review_service.combine_batched_reviews([artifact(comment) for comment in comments])
+
+        self.assertEqual([comment.path for comment in combined.comments], ["a.py", "secret.py"])
+        self.assertEqual(combined.event, "REQUEST_CHANGES")
 
     def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
         case = self

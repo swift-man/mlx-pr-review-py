@@ -753,6 +753,7 @@ class ReviewComment:
     severity: str = SEVERITY_MINOR
     confidence: float = 1.0
     side: str = "RIGHT"
+    source: str = "model"
 
 
 @dataclass
@@ -2597,6 +2598,7 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                                 suggested_fix="누락된 서명은 401로 거부하도록 유지하세요.",
                             ),
                             severity=SEVERITY_CRITICAL,
+                            source="rule",
                         )
                     )
                 elif re.search(r"if\s+not\s+.*signature.*:\s*return\b", stripped, re.IGNORECASE) or re.search(
@@ -2614,6 +2616,7 @@ def detect_signature_bypass(pr_file: PullRequestFile) -> list[ReviewComment]:
                                 suggested_fix="서명 누락이나 불일치는 예외를 발생시켜 요청을 거부하세요.",
                             ),
                             severity=SEVERITY_CRITICAL,
+                            source="rule",
                         )
                     )
             previous_visible_line = stripped
@@ -2652,6 +2655,7 @@ def detect_secret_logging(pr_file: PullRequestFile) -> list[ReviewComment]:
                 suggested_fix="민감한 값은 출력하지 말고, 필요하면 마스킹된 메타데이터만 기록하세요.",
             ),
             severity=SEVERITY_CRITICAL,
+            source="rule",
         )
     ]
 
@@ -2677,6 +2681,7 @@ def detect_contract_typos(pr_file: PullRequestFile) -> list[ReviewComment]:
                         suggested_fix=f"공개 응답 필드와 GitHub 헤더 이름은 `{expected}`로 정확히 유지하세요.",
                     ),
                     severity=SEVERITY_MAJOR,
+                    source="rule",
                 )
             )
             break
@@ -3921,7 +3926,7 @@ def is_mlx_prompt_too_large_error(error: RuntimeError) -> bool:
 def parse_prompt_limit_from_mlx_error(error: RuntimeError) -> int | None:
     """MLX 413 메시지의 ``current > limit`` 숫자에서 서버 상한을 읽는다."""
     message = normalize_text(str(error))
-    match = re.search(r"\b\d+\s*>\s*(\d+)\s*chars?\b", message)
+    match = re.search(r"\b\d+\s*>\s*(\d+)\s*(?:chars?|bytes)\b", message)
     if not match:
         return None
     try:
@@ -3933,7 +3938,7 @@ def parse_prompt_limit_from_mlx_error(error: RuntimeError) -> int | None:
 def review_prompt_retry_budget(configured_budget: int, initial_prompt_chars: int, error: RuntimeError) -> int:
     """413 이후에는 실패한 prompt보다 확실히 작은 예산으로 batch를 강제한다."""
     base_budget = configured_budget if configured_budget > 0 else DEFAULT_REVIEW_PROMPT_MAX_CHARS
-    retry_budget = min(base_budget, DEFAULT_REVIEW_PROMPT_MAX_CHARS)
+    retry_budget = base_budget
 
     server_limit = parse_prompt_limit_from_mlx_error(error)
     if server_limit is not None:
@@ -4079,16 +4084,18 @@ def dedupe_review_comments(comments: list[ReviewComment]) -> list[ReviewComment]
 
 def cap_review_comments(comments: list[ReviewComment], max_comments: int) -> list[ReviewComment]:
     """batch별 finding 상한을 합친 뒤에도 전체 리뷰 상한을 다시 적용한다."""
+    rule_based_comments = [comment for comment in comments if comment.source == "rule"]
+    model_comments = [comment for comment in comments if comment.source != "rule"]
     if max_comments <= 0:
-        return []
-    if len(comments) <= max_comments:
+        return rule_based_comments
+    if len(model_comments) <= max_comments:
         return comments
 
-    blocking_comments = [comment for comment in comments if comment.severity in BLOCKING_SEVERITIES]
-    non_blocking_comments = [comment for comment in comments if comment.severity not in BLOCKING_SEVERITIES]
+    blocking_comments = [comment for comment in model_comments if comment.severity in BLOCKING_SEVERITIES]
+    non_blocking_comments = [comment for comment in model_comments if comment.severity not in BLOCKING_SEVERITIES]
     capped_blocking = blocking_comments[:max_comments]
     remaining_slots = max_comments - len(capped_blocking)
-    return [*capped_blocking, *non_blocking_comments[:remaining_slots]]
+    return [*capped_blocking, *non_blocking_comments[:remaining_slots], *rule_based_comments]
 
 
 def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) -> ValidatedReview:
