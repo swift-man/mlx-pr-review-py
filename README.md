@@ -91,7 +91,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `GITHUB_API_URL=https://api.github.com` (옵션)
 - `MLX_MAX_TOKENS=1600` (옵션, 모델 출력 토큰 상한. Apple Silicon 64GB급 로컬 운영은 품질 우선으로 넉넉하게 둠)
 - `MLX_MAX_FINDINGS=10` (옵션)
-- `MLX_REVIEW_CONTEXT_MODE` (옵션. 코드 기본값은 `full_repo`이지만, webhook 서버는 `scripts/run_webhook_server.sh`가 prefill 폭증을 막기 위해 기본을 `auto`로 낮춤. 변경 파일 context에 더해 예산 안의 repo 파일까지 `repository_context`로 보려면 `full_repo`. 그 외 `full`, `excerpt`, `off` 가능)
+- `MLX_REVIEW_CONTEXT_MODE=auto` (옵션, 기본값. 변경 파일만 컨텍스트로 주고, 큰 파일은 변경 hunk 주변 excerpt로 보존. 변경 외 repo 파일까지 `repository_context`로 보려면 `full_repo`. 그 외 `full`, `excerpt`, `off` 가능. webhook 서버는 `scripts/run_webhook_server.sh`에서 동일하게 `auto`로 시작)
 - `MLX_REVIEW_CONTEXT_MAX_CHARS` (옵션, 파일별 current code context 최대 길이. 코드 기본값 30000, webhook 서버 기본값은 `run_webhook_server.sh`에서 18000)
 - `MLX_REVIEW_CONTEXT_LINE_RADIUS=120` (옵션, 큰 파일 excerpt에서 hunk 앞뒤로 포함할 기본 줄 수)
 - `MLX_REVIEW_REPO_CONTEXT_MAX_FILES=120` (옵션, `full_repo` 모드에서 추가로 읽을 변경 외 repo 파일 수 상한)
@@ -548,7 +548,7 @@ false positive 방지를 위해 게시하지 않습니다. `Blocking`/`Major`는
 프롬프트의 `files[]`에는 GitHub diff patch와 함께 `current_file_context`가 들어갑니다. 작은 변경 파일은
 최신 PR HEAD의 전체 파일을 line-numbered 형태로 넣고, 큰 파일은 모든 hunk 주변을 보존하도록 반경을 줄인
 excerpt를 넣습니다. 명시적 `full` 모드에서 최대 길이 때문에 잘린 파일은 `full_file_truncated`로 표시합니다.
-기본 `full_repo` 모드에서는 변경 파일 외 repo 파일도 `.reviewbot.yml`/built-in 필터와
+`full_repo` 모드에서는 변경 파일 외 repo 파일도 `.reviewbot.yml`/built-in 필터와
 Apple Silicon 64GB급 운영 예산 안에서 `repository_context`로 추가합니다. 모델은 이 context로 diff 밖 호출자와 helper 흐름을 검증하지만,
 GitHub Review API 제약 때문에 실제 코멘트 line은 여전히 `valid_comment_lines` 안에서만 선택해야 합니다.
 [`review_runner/sample_mlx_client.py`](/Users/m4_25/develop/codereview/review_runner/sample_mlx_client.py)는

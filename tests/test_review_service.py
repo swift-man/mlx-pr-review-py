@@ -994,6 +994,14 @@ class ExistingReviewContextTests(unittest.TestCase):
         self.assertEqual(mode, "auto")
         self.assertFalse(review_service.repository_context_enabled(mode))
 
+    def test_configured_context_mode_defaults_to_auto_when_unset(self) -> None:
+        env = {key: value for key, value in os.environ.items() if key != review_service.CURRENT_FILE_CONTEXT_MODE_ENV}
+        with mock.patch.dict(os.environ, env, clear=True):
+            mode = review_service.configured_current_file_context_mode()
+
+        self.assertEqual(mode, "auto")
+        self.assertFalse(review_service.repository_context_enabled(mode))
+
     def test_repository_context_priority_does_not_promote_all_root_files_for_root_change(self) -> None:
         priority, path = review_service.repository_context_priority("LICENSE", {"README.md"})
 
