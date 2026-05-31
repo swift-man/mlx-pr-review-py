@@ -44,6 +44,7 @@ DEFAULT_FINDINGS_SUMMARY = "자동 리뷰에서 확인이 필요한 변경 사�
 REVIEWBOT_CONFIG_PATH = ".reviewbot.yml"
 DEFAULT_MAX_MODEL_FINDINGS = 10
 MAX_MODEL_FINDINGS_ENV = "MLX_MAX_FINDINGS"
+MAX_BATCH_PROMPT_RETRY_DEPTH = 4
 CURRENT_FILE_CONTEXT_LINE_RADIUS_ENV = "MLX_REVIEW_CONTEXT_LINE_RADIUS"
 CURRENT_FILE_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_CONTEXT_MAX_CHARS"
 DEFAULT_CURRENT_FILE_CONTEXT_LINE_RADIUS = 120
@@ -874,6 +875,13 @@ class ReviewGenerationArtifacts:
     mlx_result: dict[str, Any]
     validated_review: ValidatedReview
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PromptLimitEstimate:
+    current: int
+    limit: int
+    unit: str
 
 
 @dataclass
@@ -3928,15 +3936,37 @@ def is_mlx_prompt_too_large_error(error: RuntimeError) -> bool:
 
 
 def parse_prompt_limit_from_mlx_error(error: RuntimeError) -> int | None:
-    """MLX 413 메시지의 ``current > limit`` 숫자에서 서버 상한을 읽는다."""
+    """MLX 413 메시지의 ``current > limit`` 숫자에서 서버 상한만 읽는다."""
+    limit = parse_prompt_limit_estimate_from_mlx_error(error)
+    return limit.limit if limit else None
+
+
+def parse_prompt_limit_estimate_from_mlx_error(error: RuntimeError) -> PromptLimitEstimate | None:
+    """MLX 413 메시지의 현재 크기, 상한, 단위를 함께 읽는다."""
     message = normalize_text(str(error))
-    match = re.search(r"\b\d+\s*>\s*(\d+)\s*(?:chars?|bytes)\b", message)
+    match = re.search(r"\b(\d+)\s*>\s*(\d+)\s*(chars?|bytes)\b", message)
     if not match:
         return None
     try:
-        return int(match.group(1))
+        current = int(match.group(1))
+        limit = int(match.group(2))
     except ValueError:
         return None
+    raw_unit = match.group(3).lower()
+    unit = "bytes" if raw_unit.startswith("byte") else "chars"
+    return PromptLimitEstimate(current=current, limit=limit, unit=unit)
+
+
+def estimate_prompt_char_budget_from_byte_limit(
+    initial_prompt_chars: int,
+    current_bytes: int,
+    limit_bytes: int,
+) -> int:
+    """원격 request body bytes 상한을 prompt 문자 예산으로 보수적으로 환산한다."""
+    if current_bytes <= 0:
+        return max(limit_bytes // 4, 1)
+    scaled = int(initial_prompt_chars * (limit_bytes / current_bytes))
+    return max(scaled - 5_000, 1)
 
 
 def review_prompt_retry_budget(configured_budget: int, initial_prompt_chars: int, error: RuntimeError) -> int:
@@ -3944,12 +3974,20 @@ def review_prompt_retry_budget(configured_budget: int, initial_prompt_chars: int
     base_budget = configured_budget if configured_budget > 0 else DEFAULT_REVIEW_PROMPT_MAX_CHARS
     retry_budget = base_budget
 
-    server_limit = parse_prompt_limit_from_mlx_error(error)
-    if server_limit is not None:
-        retry_budget = min(retry_budget, max(server_limit - 5_000, 1))
+    server_limit = parse_prompt_limit_estimate_from_mlx_error(error)
+    if server_limit is not None and server_limit.unit == "bytes":
+        byte_budget = estimate_prompt_char_budget_from_byte_limit(
+            initial_prompt_chars,
+            server_limit.current,
+            server_limit.limit,
+        )
+        retry_budget = min(retry_budget, byte_budget)
+    elif server_limit is not None:
+        retry_budget = min(retry_budget, max(server_limit.limit - 5_000, 1))
     else:
         retry_budget = min(retry_budget, max(initial_prompt_chars // 2, 1))
 
+    retry_budget = min(retry_budget, max(initial_prompt_chars - 1, 1))
     return max(retry_budget, 1)
 
 
@@ -4128,7 +4166,10 @@ def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) ->
         should_request_changes=bool(must_fix or blocking_comments),
         has_any_finding=has_findings,
     )
-    summary_prefix = f"대형 PR이라 {len(batch_artifacts)}개 묶음으로 나눠 리뷰했습니다."
+    if len(batch_artifacts) > 1:
+        summary_prefix = f"대형 PR이라 {len(batch_artifacts)}개 묶음으로 나눠 리뷰했습니다."
+    else:
+        summary_prefix = "프롬프트 예산에 맞춰 변경 파일 context를 조정해 리뷰했습니다."
     if has_findings:
         summaries = [summary for summary in summaries if not looks_like_no_findings_summary(summary)]
 
@@ -4149,7 +4190,89 @@ def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) ->
     )
 
 
-def generate_batched_review_artifacts(
+def generate_single_batch_review_artifacts(
+    repository: str,
+    pull_number: int,
+    batch_files: list[PullRequestFile],
+    *,
+    existing_review_context: list[dict[str, Any]] | None,
+    prompt_max_chars: int,
+    fallback_trigger: str,
+    batch_index: int,
+    batch_total: int,
+    retry_depth: int,
+    log_prefix: str = "",
+) -> list[ReviewGenerationArtifacts]:
+    batch_prompt = make_prompt(
+        repository,
+        pull_number,
+        batch_files,
+        repository_context=None,
+        existing_review_context=existing_review_context,
+    )
+    mlx_started_at = time.monotonic()
+    log_progress(
+        log_prefix,
+        f"Running MLX review model for batch {batch_index}/{batch_total} "
+        f"files={len(batch_files)} prompt_chars={len(batch_prompt)}",
+    )
+    try:
+        mlx_result = run_mlx(batch_prompt, log_prefix=log_prefix)
+    except RuntimeError as exc:
+        if (
+            not should_retry_as_batched_review(exc, batch_files)
+            or retry_depth >= MAX_BATCH_PROMPT_RETRY_DEPTH
+        ):
+            raise
+        retry_prompt_max_chars = review_prompt_retry_budget(prompt_max_chars, len(batch_prompt), exc)
+        error_detail = truncate_context(
+            normalize_text(str(exc)),
+            300,
+            suffix="MLX batch prompt-too-large error truncated",
+        )
+        log_progress(
+            log_prefix,
+            "Retrying MLX review batch "
+            f"{batch_index}/{batch_total} as smaller batches after prompt-too-large error: {error_detail}",
+        )
+        return generate_batched_review_artifact_list(
+            repository,
+            pull_number,
+            batch_files,
+            existing_review_context=existing_review_context,
+            prompt_max_chars=retry_prompt_max_chars,
+            initial_prompt_chars=len(batch_prompt),
+            fallback_trigger=f"{fallback_trigger}_batch_413",
+            retry_depth=retry_depth + 1,
+            log_prefix=log_prefix,
+        )
+
+    log_progress(
+        log_prefix,
+        f"MLX review batch {batch_index}/{batch_total} completed in {time.monotonic() - mlx_started_at:.1f}s",
+    )
+    validated_review = validate_mlx_output(mlx_result, batch_files, log_prefix=log_prefix)
+    payload = build_review_payload(
+        validated_review.summary,
+        validated_review.event,
+        validated_review.comments,
+        validated_review.positives,
+        validated_review.must_fix,
+        validated_review.suggestions,
+        model_name=extract_model_name_from_result(mlx_result),
+        existing_review_context=existing_review_context,
+    )
+    return [
+        ReviewGenerationArtifacts(
+            prompt=batch_prompt,
+            mlx_result=mlx_result,
+            validated_review=validated_review,
+            payload=payload,
+        )
+    ]
+
+
+def generate_batched_review_artifact_list(
     repository: str,
     pull_number: int,
     pr_files: list[PullRequestFile],
@@ -4158,8 +4281,9 @@ def generate_batched_review_artifacts(
     prompt_max_chars: int,
     initial_prompt_chars: int,
     fallback_trigger: str,
+    retry_depth: int = 0,
     log_prefix: str = "",
-) -> ReviewGenerationArtifacts:
+) -> list[ReviewGenerationArtifacts]:
     """큰 PR을 여러 요청으로 나눠 generate 서버 입력 상한을 넘지 않게 한다."""
     batches = split_pr_files_for_prompt_budget(
         repository,
@@ -4177,48 +4301,70 @@ def generate_batched_review_artifacts(
 
     batch_artifacts: list[ReviewGenerationArtifacts] = []
     for index, batch_files in enumerate(batches, start=1):
-        batch_prompt = make_prompt(
-            repository,
-            pull_number,
-            batch_files,
-            repository_context=None,
-            existing_review_context=existing_review_context,
-        )
-        mlx_started_at = time.monotonic()
-        log_progress(
-            log_prefix,
-            f"Running MLX review model for batch {index}/{len(batches)} "
-            f"files={len(batch_files)} prompt_chars={len(batch_prompt)}",
-        )
-        mlx_result = run_mlx(batch_prompt, log_prefix=log_prefix)
-        log_progress(
-            log_prefix,
-            f"MLX review batch {index}/{len(batches)} completed in {time.monotonic() - mlx_started_at:.1f}s",
-        )
-        validated_review = validate_mlx_output(mlx_result, batch_files, log_prefix=log_prefix)
-        payload = build_review_payload(
-            validated_review.summary,
-            validated_review.event,
-            validated_review.comments,
-            validated_review.positives,
-            validated_review.must_fix,
-            validated_review.suggestions,
-            model_name=extract_model_name_from_result(mlx_result),
-            existing_review_context=existing_review_context,
-        )
-        batch_artifacts.append(
-            ReviewGenerationArtifacts(
-                prompt=batch_prompt,
-                mlx_result=mlx_result,
-                validated_review=validated_review,
-                payload=payload,
+        batch_artifacts.extend(
+            generate_single_batch_review_artifacts(
+                repository,
+                pull_number,
+                batch_files,
+                existing_review_context=existing_review_context,
+                prompt_max_chars=prompt_max_chars,
+                fallback_trigger=fallback_trigger,
+                batch_index=index,
+                batch_total=len(batches),
+                retry_depth=retry_depth,
+                log_prefix=log_prefix,
             )
         )
+    return batch_artifacts
+
+
+def generate_batched_review_artifacts(
+    repository: str,
+    pull_number: int,
+    pr_files: list[PullRequestFile],
+    *,
+    existing_review_context: list[dict[str, Any]] | None,
+    prompt_max_chars: int,
+    initial_prompt_chars: int,
+    fallback_trigger: str,
+    log_prefix: str = "",
+) -> ReviewGenerationArtifacts:
+    batch_artifacts = generate_batched_review_artifact_list(
+        repository,
+        pull_number,
+        pr_files,
+        existing_review_context=existing_review_context,
+        prompt_max_chars=prompt_max_chars,
+        initial_prompt_chars=initial_prompt_chars,
+        fallback_trigger=fallback_trigger,
+        log_prefix=log_prefix,
+    )
+    if not batch_artifacts:
+        raise RuntimeError("Batched review produced no review artifacts")
 
     combined_review = combine_batched_reviews(batch_artifacts)
-    combined_result = dict(batch_artifacts[-1].mlx_result)
-    combined_meta = dict(combined_result.get("_meta") or {})
+    combined_result = {
+        "summary": combined_review.summary,
+        "event": combined_review.event,
+        "positives": combined_review.positives,
+        "must_fix": combined_review.must_fix,
+        "suggestions": combined_review.suggestions,
+        "comments": [comment.body for comment in combined_review.comments],
+    }
+    batch_metas = [
+        meta
+        for artifact in batch_artifacts
+        if isinstance((meta := artifact.mlx_result.get("_meta")), dict)
+    ]
+    combined_meta: dict[str, Any] = {}
+    for meta in batch_metas:
+        for key in ("model_name", "backend", "generate_url"):
+            value = meta.get(key)
+            if key not in combined_meta and isinstance(value, str) and value:
+                combined_meta[key] = value
     combined_meta["review_batches"] = len(batch_artifacts)
+    if batch_metas:
+        combined_meta["review_batch_metas"] = batch_metas
     combined_result["_meta"] = combined_meta
     combined_payload = build_review_payload(
         combined_review.summary,

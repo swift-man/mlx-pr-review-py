@@ -1978,6 +1978,26 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         )
 
         self.assertEqual(review_service.parse_prompt_limit_from_mlx_error(error), 250000)
+        estimate = review_service.parse_prompt_limit_estimate_from_mlx_error(error)
+        self.assertIsNotNone(estimate)
+        if estimate is None:
+            self.fail("expected byte limit estimate")
+        self.assertEqual(estimate.current, 543710)
+        self.assertEqual(estimate.limit, 250000)
+        self.assertEqual(estimate.unit, "bytes")
+
+    def test_retry_budget_converts_byte_limit_to_prompt_chars(self) -> None:
+        error = RuntimeError(
+            "MLX generate request body is too large (600000 > 300000 bytes)."
+        )
+
+        budget = review_service.review_prompt_retry_budget(
+            configured_budget=500_000,
+            initial_prompt_chars=240_000,
+            error=error,
+        )
+
+        self.assertEqual(budget, 115_000)
 
     def test_retry_budget_respects_explicit_budget_when_no_server_limit_is_available(self) -> None:
         error = RuntimeError("MLX generate endpoint returned HTTP 413: too large")
@@ -2022,6 +2042,47 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(len(seen_prompt_sizes), 1)
         self.assertLessEqual(seen_prompt_sizes[0], budget)
         self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 1)
+
+    def test_generate_review_artifacts_retries_pre_split_batch_413(self) -> None:
+        pr_file = self._large_pr_file("huge.py", context_size=60_000)
+        empty_context_file = review_service.replace(
+            pr_file,
+            current_file_context="",
+            current_file_context_mode="",
+        )
+        budget = len(review_service.make_prompt("swift-man/app", 4, [empty_context_file])) + 30_000
+        seen_prompt_sizes: list[int] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            seen_prompt_sizes.append(len(prompt))
+            if len(seen_prompt_sizes) == 1:
+                current_bytes = len(prompt.encode("utf-8")) * 4
+                limit_bytes = current_bytes * 3 // 4
+                raise RuntimeError(
+                    "MLX generate request body is too large "
+                    f"({current_bytes} > {limit_bytes} bytes)."
+                )
+            payload = json.loads(prompt)
+            self.assertEqual([file_payload["path"] for file_payload in payload["files"]], ["huge.py"])
+            return {
+                "summary": "single batch retry ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: str(budget)}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, [pr_file])
+
+        self.assertEqual(len(seen_prompt_sizes), 2)
+        self.assertLess(seen_prompt_sizes[1], seen_prompt_sizes[0])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 1)
+        self.assertNotIn("1개 묶음", artifacts.validated_review.summary)
 
     def test_split_pr_files_truncates_single_file_context_to_fit_prompt_budget(self) -> None:
         pr_file = self._large_pr_file("huge.py", context_size=20_000)
