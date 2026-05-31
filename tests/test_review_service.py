@@ -1859,6 +1859,365 @@ class CopilotReviewRequestTests(unittest.TestCase):
 
 
 class ReviewPullRequestFlowTests(unittest.TestCase):
+    def _large_pr_file(self, filename: str, *, context_size: int = 5000) -> review_service.PullRequestFile:
+        return review_service.PullRequestFile(
+            filename=filename,
+            status="modified",
+            patch=f"@@ -1,1 +1,1 @@\n-old\n+new {filename}\n",
+            additions=1,
+            deletions=1,
+            right_side_lines={1},
+            current_file_context="1: " + ("x" * context_size),
+            current_file_context_mode="full_file",
+        )
+
+    def test_generate_review_artifacts_batches_large_prompt_before_mlx(self) -> None:
+        files = [
+            self._large_pr_file("a.py"),
+            self._large_pr_file("b.py"),
+        ]
+        extra_prompt_buffer = 100
+        single_prompt_budget = len(review_service.make_prompt("swift-man/app", 4, [files[0]])) + extra_prompt_buffer
+        seen_batches: list[list[str]] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            payload = json.loads(prompt)
+            seen_batches.append([file_payload["path"] for file_payload in payload["files"]])
+            return {
+                "summary": f"{seen_batches[-1][0]} 검토 완료",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(
+            os.environ,
+            {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: str(single_prompt_budget)},
+            clear=False,
+        ):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, files)
+
+        self.assertEqual(seen_batches, [["a.py"], ["b.py"]])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertIn("2개 묶음", artifacts.validated_review.summary)
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
+
+    def test_generate_review_artifacts_retries_413_as_batches(self) -> None:
+        files = [
+            self._large_pr_file("a.py", context_size=120_000),
+            self._large_pr_file("b.py", context_size=120_000),
+        ]
+        seen_batches: list[list[str]] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            payload = json.loads(prompt)
+            seen_batches.append([file_payload["path"] for file_payload in payload["files"]])
+            if len(seen_batches) == 1:
+                raise RuntimeError(
+                    'MLX generate endpoint returned HTTP 413: {"ok": false, "error": "message content too large"}'
+                )
+            return {
+                "summary": "batch ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: "0"}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, files)
+
+        self.assertEqual(seen_batches, [["a.py", "b.py"], ["a.py"], ["b.py"]])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
+
+    def test_generate_review_artifacts_413_uses_server_limit_when_config_is_too_high(self) -> None:
+        files = [
+            self._large_pr_file("a.py", context_size=120_000),
+            self._large_pr_file("b.py", context_size=120_000),
+        ]
+        seen_batches: list[list[str]] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            payload = json.loads(prompt)
+            seen_batches.append([file_payload["path"] for file_payload in payload["files"]])
+            if len(seen_batches) == 1:
+                raise RuntimeError(
+                    'MLX generate endpoint returned HTTP 413: {"ok": false, '
+                    '"error": "message content too large (243884 > 150000 chars; '
+                    'MLX_GENERATE_MAX_PROMPT_CHARS)"}'
+                )
+            return {
+                "summary": "batch ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: "999999"}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, files)
+
+        self.assertEqual(seen_batches, [["a.py", "b.py"], ["a.py"], ["b.py"]])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
+
+    def test_prompt_limit_parser_accepts_byte_limit_errors(self) -> None:
+        error = RuntimeError(
+            "MLX generate request body is too large (543710 > 250000 bytes)."
+        )
+
+        self.assertEqual(review_service.parse_prompt_limit_from_mlx_error(error), 250000)
+        estimate = review_service.parse_prompt_limit_estimate_from_mlx_error(error)
+        self.assertIsNotNone(estimate)
+        if estimate is None:
+            self.fail("expected byte limit estimate")
+        self.assertEqual(estimate.current, 543710)
+        self.assertEqual(estimate.limit, 250000)
+        self.assertEqual(estimate.unit, "bytes")
+
+    def test_retry_budget_converts_byte_limit_to_prompt_chars(self) -> None:
+        error = RuntimeError(
+            "MLX generate request body is too large (600000 > 300000 bytes)."
+        )
+
+        budget = review_service.review_prompt_retry_budget(
+            configured_budget=500_000,
+            initial_prompt_chars=240_000,
+            error=error,
+        )
+
+        self.assertEqual(budget, 115_000)
+
+    def test_batch_retry_trigger_replaces_previous_retry_suffix(self) -> None:
+        self.assertEqual(
+            review_service.batch_retry_fallback_trigger("prompt_budget", 1),
+            "prompt_budget_batch_retry_1",
+        )
+        self.assertEqual(
+            review_service.batch_retry_fallback_trigger("prompt_budget_batch_retry_1", 2),
+            "prompt_budget_batch_retry_2",
+        )
+        self.assertEqual(
+            review_service.batch_retry_fallback_trigger("prompt_budget_batch_413", 2),
+            "prompt_budget_batch_retry_2",
+        )
+
+    def test_retry_budget_respects_explicit_budget_when_no_server_limit_is_available(self) -> None:
+        error = RuntimeError("MLX generate endpoint returned HTTP 413: too large")
+
+        budget = review_service.review_prompt_retry_budget(
+            configured_budget=400_000,
+            initial_prompt_chars=300_000,
+            error=error,
+        )
+
+        self.assertEqual(budget, 150_000)
+
+    def test_generate_review_artifacts_batches_single_file_prompt_before_mlx(self) -> None:
+        pr_file = self._large_pr_file("huge.py", context_size=20_000)
+        empty_context_file = review_service.replace(
+            pr_file,
+            current_file_context="",
+            current_file_context_mode="",
+        )
+        budget = len(review_service.make_prompt("swift-man/app", 4, [empty_context_file])) + 2_000
+        seen_prompt_sizes: list[int] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            seen_prompt_sizes.append(len(prompt))
+            payload = json.loads(prompt)
+            self.assertEqual([file_payload["path"] for file_payload in payload["files"]], ["huge.py"])
+            self.assertEqual(payload["files"][0]["current_file_context_mode"], "full_file_prompt_truncated")
+            return {
+                "summary": "single batch ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: str(budget)}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, [pr_file])
+
+        self.assertEqual(len(seen_prompt_sizes), 1)
+        self.assertLessEqual(seen_prompt_sizes[0], budget)
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 1)
+
+    def test_generate_review_artifacts_retries_pre_split_batch_413(self) -> None:
+        pr_file = self._large_pr_file("huge.py", context_size=60_000)
+        empty_context_file = review_service.replace(
+            pr_file,
+            current_file_context="",
+            current_file_context_mode="",
+        )
+        budget = len(review_service.make_prompt("swift-man/app", 4, [empty_context_file])) + 30_000
+        seen_prompt_sizes: list[int] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            seen_prompt_sizes.append(len(prompt))
+            if len(seen_prompt_sizes) == 1:
+                current_bytes = len(prompt.encode("utf-8")) * 4
+                limit_bytes = current_bytes * 3 // 4
+                raise RuntimeError(
+                    "MLX generate request body is too large "
+                    f"({current_bytes} > {limit_bytes} bytes)."
+                )
+            payload = json.loads(prompt)
+            self.assertEqual([file_payload["path"] for file_payload in payload["files"]], ["huge.py"])
+            return {
+                "summary": "single batch retry ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: str(budget)}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, [pr_file])
+
+        self.assertEqual(len(seen_prompt_sizes), 2)
+        self.assertLess(seen_prompt_sizes[1], seen_prompt_sizes[0])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 1)
+        self.assertNotIn("1개 묶음", artifacts.validated_review.summary)
+
+    def test_split_pr_files_truncates_single_file_context_to_fit_prompt_budget(self) -> None:
+        pr_file = self._large_pr_file("huge.py", context_size=20_000)
+        empty_context_file = review_service.replace(
+            pr_file,
+            current_file_context="",
+            current_file_context_mode="",
+        )
+        budget = len(review_service.make_prompt("swift-man/app", 4, [empty_context_file])) + 2_000
+
+        batches = review_service.split_pr_files_for_prompt_budget(
+            "swift-man/app",
+            4,
+            [pr_file],
+            existing_review_context=None,
+            prompt_max_chars=budget,
+        )
+
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(batches[0]), 1)
+        fitted_file = batches[0][0]
+        fitted_prompt = review_service.make_prompt("swift-man/app", 4, [fitted_file])
+        self.assertLessEqual(len(fitted_prompt), budget)
+        self.assertIn("prompt_truncated", fitted_file.current_file_context_mode)
+        self.assertIn("current file context truncated to fit prompt budget", fitted_file.current_file_context)
+
+    def test_combine_batched_reviews_reapplies_global_comment_limit(self) -> None:
+        def artifact(comment: review_service.ReviewComment) -> review_service.ReviewGenerationArtifacts:
+            validated = review_service.ValidatedReview(
+                comments=[comment],
+                summary=f"{comment.path} summary",
+                event="REQUEST_CHANGES" if comment.severity in review_service.BLOCKING_SEVERITIES else "COMMENT",
+                positives=[],
+                must_fix=[comment.body] if comment.severity in review_service.BLOCKING_SEVERITIES else [],
+                suggestions=[comment.body] if comment.severity not in review_service.BLOCKING_SEVERITIES else [],
+            )
+            return review_service.ReviewGenerationArtifacts(
+                prompt="",
+                mlx_result={},
+                validated_review=validated,
+                payload={},
+            )
+
+        comments = [
+            review_service.ReviewComment("a.py", 1, "minor one", severity=review_service.SEVERITY_MINOR),
+            review_service.ReviewComment("b.py", 2, "major one", severity=review_service.SEVERITY_MAJOR),
+            review_service.ReviewComment("c.py", 3, "minor two", severity=review_service.SEVERITY_MINOR),
+        ]
+
+        with mock.patch.dict(os.environ, {review_service.MAX_MODEL_FINDINGS_ENV: "2"}, clear=False):
+            combined = review_service.combine_batched_reviews([artifact(comment) for comment in comments])
+
+        self.assertEqual(len(combined.comments), 2)
+        self.assertEqual([comment.path for comment in combined.comments], ["b.py", "a.py"])
+        self.assertEqual(combined.event, "REQUEST_CHANGES")
+        self.assertEqual(len(combined.must_fix), 1)
+
+    def test_combine_batched_reviews_keeps_rule_based_comments_outside_model_limit(self) -> None:
+        def artifact(comment: review_service.ReviewComment) -> review_service.ReviewGenerationArtifacts:
+            return review_service.ReviewGenerationArtifacts(
+                prompt="",
+                mlx_result={},
+                validated_review=review_service.ValidatedReview(
+                    comments=[comment],
+                    summary=f"{comment.path} summary",
+                    event="REQUEST_CHANGES" if comment.severity in review_service.BLOCKING_SEVERITIES else "COMMENT",
+                    positives=[],
+                    must_fix=[],
+                    suggestions=[],
+                ),
+                payload={},
+            )
+
+        comments = [
+            review_service.ReviewComment("a.py", 1, "major model", severity=review_service.SEVERITY_MAJOR),
+            review_service.ReviewComment("b.py", 2, "minor model", severity=review_service.SEVERITY_MINOR),
+            review_service.ReviewComment(
+                "secret.py",
+                3,
+                "rule based secret",
+                severity=review_service.SEVERITY_CRITICAL,
+                source="rule",
+            ),
+        ]
+
+        with mock.patch.dict(os.environ, {review_service.MAX_MODEL_FINDINGS_ENV: "1"}, clear=False):
+            combined = review_service.combine_batched_reviews([artifact(comment) for comment in comments])
+
+        self.assertEqual([comment.path for comment in combined.comments], ["a.py", "secret.py"])
+        self.assertEqual(combined.event, "REQUEST_CHANGES")
+
+    def test_combine_batched_reviews_keeps_five_top_level_summaries(self) -> None:
+        def artifact(comment: review_service.ReviewComment) -> review_service.ReviewGenerationArtifacts:
+            return review_service.ReviewGenerationArtifacts(
+                prompt="",
+                mlx_result={},
+                validated_review=review_service.ValidatedReview(
+                    comments=[comment],
+                    summary=f"{comment.path} summary",
+                    event="REQUEST_CHANGES",
+                    positives=[],
+                    must_fix=[],
+                    suggestions=[],
+                ),
+                payload={},
+            )
+
+        comments = [
+            review_service.ReviewComment(
+                f"file{index}.py",
+                index,
+                f"major finding {index}",
+                severity=review_service.SEVERITY_MAJOR,
+            )
+            for index in range(1, 7)
+        ]
+
+        combined = review_service.combine_batched_reviews([artifact(comment) for comment in comments])
+
+        self.assertEqual(combined.must_fix, [f"major finding {index}" for index in range(1, 6)])
+
     def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
         case = self
 
@@ -2638,6 +2997,31 @@ class DedupeAcrossSectionsTests(unittest.TestCase):
         )
 
         self.assertEqual(summaries, ["None 반환 시 AttributeError가 발생합니다."])
+
+    def test_summarize_structured_comment_preserves_long_problem_text(self) -> None:
+        problem = (
+            "settingsFeatureLoadsValuesOnAppear 테스트의 initialState에서 appVersion과 "
+            "buildNumber가 빈 문자열로 초기화되어 있지만 withDependencies에서 앱 정보 "
+            "클라이언트 반환값을 설정하지 않아 새 필드 검증이 누락됩니다."
+        )
+
+        summaries = review_service.summarize_comment_bodies(
+            [
+                review_service.ReviewComment(
+                    path="Tests/SettingsFeatureTests.swift",
+                    line=42,
+                    body=_finding_body(
+                        problem=problem,
+                        why="설정 화면에 표시되는 앱 버전 회귀를 테스트가 놓칠 수 있습니다.",
+                        fix="테스트에서 appInfoClient 반환값을 지정하고 상태 반영을 검증합니다.",
+                    ),
+                    severity=review_service.SEVERITY_MAJOR,
+                )
+            ]
+        )
+
+        self.assertEqual(summaries, [problem])
+        self.assertNotIn("...", summaries[0])
 
     def test_identical_finding_in_must_fix_and_comment_is_deduped_to_comment(self) -> None:
         # 같은 finding 이 must_fix 와 comments[] 에 동시에 있으면 라인 anchor 쪽을 보존.

@@ -93,6 +93,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_MAX_FINDINGS=10` (옵션)
 - `MLX_REVIEW_CONTEXT_MODE=full` (옵션, 기본값. 변경 파일을 최신 PR HEAD 기준 line-numbered full code로 읽고, diff는 코멘트 anchor로만 사용. 변경 외 repo 파일까지 `repository_context`로 보려면 `full_repo`. 입력을 줄여야 하면 `auto`, `excerpt`, `off` 가능. webhook 서버는 `scripts/run_webhook_server.sh`에서 동일하게 `full`로 시작)
 - `MLX_REVIEW_CONTEXT_MAX_CHARS` (옵션, 파일별 current code context 최대 길이. 코드와 webhook 서버 기본값은 220000)
+- `MLX_REVIEW_PROMPT_MAX_CHARS=220000` (옵션, 전체 리뷰 prompt가 이 값을 넘으면 변경 파일을 여러 묶음으로 나눠 generate 서버의 `MLX_GENERATE_MAX_PROMPT_CHARS` 상한을 넘지 않게 함)
 - `MLX_REVIEW_CONTEXT_LINE_RADIUS=120` (옵션, 큰 파일 excerpt에서 hunk 앞뒤로 포함할 기본 줄 수)
 - `MLX_REVIEW_REPO_CONTEXT_MAX_FILES=120` (옵션, `full_repo` 모드에서 추가로 읽을 변경 외 repo 파일 수 상한)
 - `MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=320000` (옵션, `repository_context` 전체 문자 상한)

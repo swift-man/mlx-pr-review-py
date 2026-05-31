@@ -35,6 +35,8 @@ export MLX_MAX_TOKENS=1600
 # 변경 외 repo 파일까지 보려면 full_repo 로 올릴 수 있습니다.
 # export MLX_REVIEW_CONTEXT_MODE=full_repo
 # export MLX_REVIEW_CONTEXT_MAX_CHARS=220000
+# 전체 prompt 가 generate 서버 상한을 넘으면 변경 파일을 여러 묶음으로 나눠 리뷰합니다.
+# export MLX_REVIEW_PROMPT_MAX_CHARS=220000
 # export MLX_REVIEW_CONTEXT_LINE_RADIUS=120
 # export MLX_REVIEW_REPO_CONTEXT_MAX_FILES=120
 # export MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=320000
