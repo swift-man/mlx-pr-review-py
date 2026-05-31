@@ -1859,6 +1859,84 @@ class CopilotReviewRequestTests(unittest.TestCase):
 
 
 class ReviewPullRequestFlowTests(unittest.TestCase):
+    def _large_pr_file(self, filename: str, *, context_size: int = 5000) -> review_service.PullRequestFile:
+        return review_service.PullRequestFile(
+            filename=filename,
+            status="modified",
+            patch=f"@@ -1,1 +1,1 @@\n-old\n+new {filename}\n",
+            additions=1,
+            deletions=1,
+            right_side_lines={1},
+            current_file_context="1: " + ("x" * context_size),
+            current_file_context_mode="full_file",
+        )
+
+    def test_generate_review_artifacts_batches_large_prompt_before_mlx(self) -> None:
+        files = [
+            self._large_pr_file("a.py"),
+            self._large_pr_file("b.py"),
+        ]
+        single_prompt_budget = len(review_service.make_prompt("swift-man/app", 4, [files[0]])) + 100
+        seen_batches: list[list[str]] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            payload = json.loads(prompt)
+            seen_batches.append([file_payload["path"] for file_payload in payload["files"]])
+            return {
+                "summary": f"{seen_batches[-1][0]} 검토 완료",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(
+            os.environ,
+            {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: str(single_prompt_budget)},
+            clear=False,
+        ):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, files)
+
+        self.assertEqual(seen_batches, [["a.py"], ["b.py"]])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertIn("2개 묶음", artifacts.validated_review.summary)
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
+
+    def test_generate_review_artifacts_retries_413_as_batches(self) -> None:
+        files = [
+            self._large_pr_file("a.py", context_size=120_000),
+            self._large_pr_file("b.py", context_size=120_000),
+        ]
+        seen_batches: list[list[str]] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            payload = json.loads(prompt)
+            seen_batches.append([file_payload["path"] for file_payload in payload["files"]])
+            if len(seen_batches) == 1:
+                raise RuntimeError(
+                    'MLX generate endpoint returned HTTP 413: {"ok": false, "error": "message content too large"}'
+                )
+            return {
+                "summary": "batch ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: "0"}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, files)
+
+        self.assertEqual(seen_batches, [["a.py", "b.py"], ["a.py"], ["b.py"]])
+        self.assertEqual(artifacts.validated_review.event, "APPROVE")
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
+
     def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
         case = self
 

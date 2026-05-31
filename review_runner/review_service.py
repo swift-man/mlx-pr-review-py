@@ -52,6 +52,8 @@ CURRENT_FILE_CONTEXT_MODE_ENV = "MLX_REVIEW_CONTEXT_MODE"
 # 기본값은 변경 파일의 최신 PR HEAD 전체를 주는 full. diff 는 GitHub
 # 코멘트 anchor 로만 쓰고, full_repo 는 변경 외 repo 파일까지 추가로 붙인다.
 DEFAULT_CURRENT_FILE_CONTEXT_MODE = "full"
+REVIEW_PROMPT_MAX_CHARS_ENV = "MLX_REVIEW_PROMPT_MAX_CHARS"
+DEFAULT_REVIEW_PROMPT_MAX_CHARS = 220_000
 REPOSITORY_CONTEXT_MAX_FILES_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_FILES"
 REPOSITORY_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_CHARS"
 REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS"
@@ -1919,6 +1921,13 @@ def configured_review_context_api_timeout_seconds() -> int:
     return parse_positive_int_env(
         REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV,
         DEFAULT_REVIEW_CONTEXT_API_TIMEOUT_SECONDS,
+    )
+
+
+def configured_review_prompt_max_chars() -> int:
+    return parse_non_negative_int_env(
+        REVIEW_PROMPT_MAX_CHARS_ENV,
+        DEFAULT_REVIEW_PROMPT_MAX_CHARS,
     )
 
 
@@ -3842,9 +3851,34 @@ def generate_review_artifacts(
     if os.environ.get("WRITE_PROMPT_DEBUG") == "1":
         write_prompt_debug_file(prompt)
 
+    prompt_max_chars = configured_review_prompt_max_chars()
+    if should_split_review_prompt(prompt, pr_files, prompt_max_chars):
+        return generate_batched_review_artifacts(
+            repository,
+            pull_number,
+            pr_files,
+            existing_review_context=existing_review_context,
+            prompt_max_chars=prompt_max_chars,
+            initial_prompt_chars=len(prompt),
+            log_prefix=log_prefix,
+        )
+
     mlx_started_at = time.monotonic()
     log_progress(log_prefix, "Running MLX review model")
-    mlx_result = run_mlx(prompt, log_prefix=log_prefix)
+    try:
+        mlx_result = run_mlx(prompt, log_prefix=log_prefix)
+    except RuntimeError as exc:
+        if not should_retry_as_batched_review(exc, pr_files):
+            raise
+        return generate_batched_review_artifacts(
+            repository,
+            pull_number,
+            pr_files,
+            existing_review_context=existing_review_context,
+            prompt_max_chars=prompt_max_chars or DEFAULT_REVIEW_PROMPT_MAX_CHARS,
+            initial_prompt_chars=len(prompt),
+            log_prefix=log_prefix,
+        )
     log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
     validated_review = validate_mlx_output(mlx_result, pr_files, log_prefix=log_prefix)
     payload = build_review_payload(
@@ -3862,6 +3896,204 @@ def generate_review_artifacts(
         mlx_result=mlx_result,
         validated_review=validated_review,
         payload=payload,
+    )
+
+
+def should_split_review_prompt(prompt: str, pr_files: list[PullRequestFile], prompt_max_chars: int) -> bool:
+    """원격 generate 상한에 걸릴 큰 PR은 파일 batch로 나눠 리뷰한다."""
+    return prompt_max_chars > 0 and len(pr_files) > 1 and len(prompt) > prompt_max_chars
+
+
+def is_mlx_prompt_too_large_error(error: RuntimeError) -> bool:
+    message = normalize_text(str(error)).lower()
+    return (
+        "http 413" in message
+        or "message content too large" in message
+        or "generate request body is too large" in message
+    )
+
+
+def should_retry_as_batched_review(error: RuntimeError, pr_files: list[PullRequestFile]) -> bool:
+    return len(pr_files) > 1 and is_mlx_prompt_too_large_error(error)
+
+
+def split_pr_files_for_prompt_budget(
+    repository: str,
+    pull_number: int,
+    pr_files: list[PullRequestFile],
+    *,
+    existing_review_context: list[dict[str, Any]] | None,
+    prompt_max_chars: int,
+) -> list[list[PullRequestFile]]:
+    """각 batch prompt가 예산에 들어오도록 PR 파일 순서를 유지해 나눈다."""
+    if prompt_max_chars <= 0 or len(pr_files) <= 1:
+        return [list(pr_files)]
+
+    batches: list[list[PullRequestFile]] = []
+    current_batch: list[PullRequestFile] = []
+
+    for pr_file in pr_files:
+        candidate = [*current_batch, pr_file]
+        candidate_prompt = make_prompt(
+            repository,
+            pull_number,
+            candidate,
+            repository_context=None,
+            existing_review_context=existing_review_context,
+        )
+        if current_batch and len(candidate_prompt) > prompt_max_chars:
+            batches.append(current_batch)
+            current_batch = [pr_file]
+            continue
+        current_batch = candidate
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
+def dedupe_review_comments(comments: list[ReviewComment]) -> list[ReviewComment]:
+    seen: set[tuple[str, int, str]] = set()
+    deduped: list[ReviewComment] = []
+    for comment in comments:
+        key = (comment.path, comment.line, normalize_text(comment.body))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(comment)
+    return deduped
+
+
+def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) -> ValidatedReview:
+    comments = dedupe_review_comments(
+        [comment for artifact in batch_artifacts for comment in artifact.validated_review.comments]
+    )
+    positives = merge_distinct_items(
+        [],
+        [item for artifact in batch_artifacts for item in artifact.validated_review.positives],
+        max_items=10,
+    )
+    must_fix = merge_distinct_items(
+        [],
+        [item for artifact in batch_artifacts for item in artifact.validated_review.must_fix],
+        max_items=10,
+    )
+    suggestions = merge_distinct_items(
+        [],
+        [item for artifact in batch_artifacts for item in artifact.validated_review.suggestions],
+        max_items=10,
+    )
+    summaries = merge_distinct_items(
+        [],
+        [artifact.validated_review.summary for artifact in batch_artifacts],
+        max_items=3,
+    )
+    has_findings = bool(comments or must_fix or suggestions)
+    blocking_comments = [comment for comment in comments if comment.severity in BLOCKING_SEVERITIES]
+    event = decide_review_event(
+        should_request_changes=bool(must_fix or blocking_comments),
+        has_any_finding=has_findings,
+    )
+    summary_prefix = f"대형 PR이라 {len(batch_artifacts)}개 묶음으로 나눠 리뷰했습니다."
+    if summaries:
+        summary = f"{summary_prefix} {' '.join(summaries)}"
+    else:
+        summary = summary_prefix
+    summary = sanitize_summary(summary, has_findings=has_findings)
+    return ValidatedReview(
+        comments=comments,
+        summary=summary,
+        event=event,
+        positives=positives,
+        must_fix=must_fix,
+        suggestions=suggestions,
+    )
+
+
+def generate_batched_review_artifacts(
+    repository: str,
+    pull_number: int,
+    pr_files: list[PullRequestFile],
+    *,
+    existing_review_context: list[dict[str, Any]] | None,
+    prompt_max_chars: int,
+    initial_prompt_chars: int,
+    log_prefix: str = "",
+) -> ReviewGenerationArtifacts:
+    """큰 PR을 여러 요청으로 나눠 generate 서버 입력 상한을 넘지 않게 한다."""
+    batches = split_pr_files_for_prompt_budget(
+        repository,
+        pull_number,
+        pr_files,
+        existing_review_context=existing_review_context,
+        prompt_max_chars=prompt_max_chars,
+    )
+    log_progress(
+        log_prefix,
+        f"Prompt size {initial_prompt_chars} exceeds budget {prompt_max_chars}; "
+        f"reviewing in {len(batches)} batch(es) without repository_context",
+    )
+
+    batch_artifacts: list[ReviewGenerationArtifacts] = []
+    for index, batch_files in enumerate(batches, start=1):
+        batch_prompt = make_prompt(
+            repository,
+            pull_number,
+            batch_files,
+            repository_context=None,
+            existing_review_context=existing_review_context,
+        )
+        mlx_started_at = time.monotonic()
+        log_progress(
+            log_prefix,
+            f"Running MLX review model for batch {index}/{len(batches)} "
+            f"files={len(batch_files)} prompt_chars={len(batch_prompt)}",
+        )
+        mlx_result = run_mlx(batch_prompt, log_prefix=log_prefix)
+        log_progress(
+            log_prefix,
+            f"MLX review batch {index}/{len(batches)} completed in {time.monotonic() - mlx_started_at:.1f}s",
+        )
+        validated_review = validate_mlx_output(mlx_result, batch_files, log_prefix=log_prefix)
+        payload = build_review_payload(
+            validated_review.summary,
+            validated_review.event,
+            validated_review.comments,
+            validated_review.positives,
+            validated_review.must_fix,
+            validated_review.suggestions,
+            model_name=extract_model_name_from_result(mlx_result),
+            existing_review_context=existing_review_context,
+        )
+        batch_artifacts.append(
+            ReviewGenerationArtifacts(
+                prompt=batch_prompt,
+                mlx_result=mlx_result,
+                validated_review=validated_review,
+                payload=payload,
+            )
+        )
+
+    combined_review = combine_batched_reviews(batch_artifacts)
+    combined_result = dict(batch_artifacts[-1].mlx_result)
+    combined_meta = dict(combined_result.get("_meta") or {})
+    combined_meta["review_batches"] = len(batch_artifacts)
+    combined_result["_meta"] = combined_meta
+    combined_payload = build_review_payload(
+        combined_review.summary,
+        combined_review.event,
+        combined_review.comments,
+        combined_review.positives,
+        combined_review.must_fix,
+        combined_review.suggestions,
+        model_name=extract_model_name_from_result(combined_result),
+        existing_review_context=existing_review_context,
+    )
+    return ReviewGenerationArtifacts(
+        prompt="\n\n".join(artifact.prompt for artifact in batch_artifacts),
+        mlx_result=combined_result,
+        validated_review=combined_review,
+        payload=combined_payload,
     )
 
 
