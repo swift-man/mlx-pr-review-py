@@ -31,15 +31,16 @@ COPILOT_REVIEW_REQUEST_COST="${COPILOT_REVIEW_REQUEST_COST:-13}"
 COPILOT_REVIEWER="${COPILOT_REVIEWER:-copilot}"
 
 # 리뷰 입력 컨텍스트 기본값도 시작 스크립트에서 관리한다.
-# 코드 기본값(review_service.DEFAULT_CURRENT_FILE_CONTEXT_MODE)도 auto 라 CLI 와
+# 코드 기본값(review_service.DEFAULT_CURRENT_FILE_CONTEXT_MODE)도 full 이라 CLI 와
 # webhook 이 같은 동작을 하며, 여기서는 운영 기본값을 한곳에서 명시해 둔다.
-# auto 는 변경 파일만 컨텍스트로 주되, MAX_CHARS 를 넘는 큰 파일은 변경 hunk 주변
-# excerpt 로 보존해 full(초과 시 앞부분만 남기고 잘림)보다 안전하게 입력을 줄인다.
-# 변경 외 repo 파일까지 붙이는 full_repo 는 입력이 수십만 자로 커져 remote
-# /v1/generate prefill 이 길어지므로, 품질 우선이 필요할 때만 명시해 올린다.
+# full 은 변경 파일을 최신 PR HEAD 기준 line-numbered 전체 코드로 읽고,
+# diff 는 GitHub 코멘트 anchor 로만 사용한다. MAX_CHARS 를 넘는 초대형 파일은
+# full_file_truncated 로 표시된다.
+# 변경 외 repo 파일까지 붙이는 full_repo 는 입력이 크게 늘 수 있으므로 명시할 때만 켠다.
+# 입력을 줄여야 하면 auto 또는 excerpt 로 낮출 수 있다.
 # local_review_env.sh 에서 같은 이름을 지정하면 이 기본값을 덮어쓸 수 있다.
-MLX_REVIEW_CONTEXT_MODE="${MLX_REVIEW_CONTEXT_MODE:-auto}"
-MLX_REVIEW_CONTEXT_MAX_CHARS="${MLX_REVIEW_CONTEXT_MAX_CHARS:-18000}"
+MLX_REVIEW_CONTEXT_MODE="${MLX_REVIEW_CONTEXT_MODE:-full}"
+MLX_REVIEW_CONTEXT_MAX_CHARS="${MLX_REVIEW_CONTEXT_MAX_CHARS:-220000}"
 
 # 웹훅 위조 방지를 위해 secret은 항상 필수다.
 : "${GITHUB_WEBHOOK_SECRET:?Set GITHUB_WEBHOOK_SECRET before starting the webhook server}"

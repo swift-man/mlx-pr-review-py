@@ -47,12 +47,11 @@ MAX_MODEL_FINDINGS_ENV = "MLX_MAX_FINDINGS"
 CURRENT_FILE_CONTEXT_LINE_RADIUS_ENV = "MLX_REVIEW_CONTEXT_LINE_RADIUS"
 CURRENT_FILE_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_CONTEXT_MAX_CHARS"
 DEFAULT_CURRENT_FILE_CONTEXT_LINE_RADIUS = 120
-DEFAULT_CURRENT_FILE_CONTEXT_MAX_CHARS = 30_000
+DEFAULT_CURRENT_FILE_CONTEXT_MAX_CHARS = 220_000
 CURRENT_FILE_CONTEXT_MODE_ENV = "MLX_REVIEW_CONTEXT_MODE"
-# 기본값은 변경 파일만 컨텍스트로 주는 auto. full_repo 는 변경 외 repo 파일까지
-# 통째로 붙여 prefill 입력이 수십만 자로 커지고 remote generate 가 길어지므로,
-# 품질 우선이 필요할 때만 MLX_REVIEW_CONTEXT_MODE=full_repo 로 명시해 올린다.
-DEFAULT_CURRENT_FILE_CONTEXT_MODE = "auto"
+# 기본값은 변경 파일의 최신 PR HEAD 전체를 주는 full. diff 는 GitHub
+# 코멘트 anchor 로만 쓰고, full_repo 는 변경 외 repo 파일까지 추가로 붙인다.
+DEFAULT_CURRENT_FILE_CONTEXT_MODE = "full"
 REPOSITORY_CONTEXT_MAX_FILES_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_FILES"
 REPOSITORY_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_CHARS"
 REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS"
@@ -2020,7 +2019,7 @@ def build_current_file_context(
     line_radius: int,
     max_chars: int,
 ) -> tuple[str, str]:
-    """full-file context를 우선하되 큰 파일은 excerpt로 안전하게 줄인다."""
+    """mode별로 최신 PR HEAD 파일 컨텍스트를 만든다."""
     if mode == "off" or max_chars <= 0:
         return "", "off"
 
@@ -3033,7 +3032,8 @@ def make_prompt(
                 f"confidence가 {MIN_MODEL_COMMENT_CONFIDENCE:.2f} 미만이면 코멘트를 작성하지 마세요.",
             ],
             "file_context_rules": [
-                "patch는 GitHub에 실제 코멘트를 달 수 있는 diff이고, current_file_context는 최신 PR HEAD의 변경 파일 전체, 명시적 full 모드의 잘린 전체 파일(full_file_truncated), 또는 큰 파일의 변경 hunk 주변 excerpt입니다.",
+                "patch는 GitHub에 실제 코멘트를 달기 위한 anchor용 diff입니다. current_file_context는 최신 PR HEAD의 변경 파일 전체를 line-numbered 형태로 제공하며, 예산 때문에 잘린 경우 full_file_truncated로 표시됩니다.",
+                "auto 또는 excerpt 모드를 명시한 경우에만 큰 파일의 변경 hunk 주변 excerpt가 current_file_context에 들어갈 수 있습니다.",
                 "repository_context는 최신 PR HEAD에서 예산 안에 들어온 변경 외 파일들의 읽기 전용 컨텍스트입니다. diff 밖 함수, 기존 호출자, 공용 helper와의 상호작용은 current_file_context와 repository_context로 확인하세요.",
                 "문제가 current_file_context의 unchanged line에서 드러나더라도, comments[].line은 반드시 valid_comment_lines 중 이 문제를 새로 만든 changed/context line으로 선택하세요. 적절한 valid line이 없으면 코멘트를 작성하지 마세요.",
             ],
