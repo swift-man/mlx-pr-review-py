@@ -2501,6 +2501,12 @@ def filter_reviewbot_files(
 
 
 def summarize_comment_bodies(comments: list[ReviewComment], max_items: int = 3) -> list[str]:
+    """라인 코멘트의 핵심 문제를 상단 요약에 그대로 노출한다.
+
+    상단 섹션은 실제 코멘트로 이동하기 전의 진입점이므로 코드 식별자나 조건이
+    말줄임으로 잘리면 finding 자체를 판단하기 어렵다. 항목 수만 제한하고 본문은
+    보존한다.
+    """
     summaries: list[str] = []
     seen: set[str] = set()
 
@@ -2509,8 +2515,6 @@ def summarize_comment_bodies(comments: list[ReviewComment], max_items: int = 3) 
         text = normalize_text(first_line)
         if not text:
             continue
-        if len(text) > 120:
-            text = f"{text[:117].rstrip()}..."
         if text in seen:
             continue
         seen.add(text)

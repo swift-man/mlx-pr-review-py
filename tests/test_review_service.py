@@ -2893,6 +2893,31 @@ class DedupeAcrossSectionsTests(unittest.TestCase):
 
         self.assertEqual(summaries, ["None 반환 시 AttributeError가 발생합니다."])
 
+    def test_summarize_structured_comment_preserves_long_problem_text(self) -> None:
+        problem = (
+            "settingsFeatureLoadsValuesOnAppear 테스트의 initialState에서 appVersion과 "
+            "buildNumber가 빈 문자열로 초기화되어 있지만 withDependencies에서 앱 정보 "
+            "클라이언트 반환값을 설정하지 않아 새 필드 검증이 누락됩니다."
+        )
+
+        summaries = review_service.summarize_comment_bodies(
+            [
+                review_service.ReviewComment(
+                    path="Tests/SettingsFeatureTests.swift",
+                    line=42,
+                    body=_finding_body(
+                        problem=problem,
+                        why="설정 화면에 표시되는 앱 버전 회귀를 테스트가 놓칠 수 있습니다.",
+                        fix="테스트에서 appInfoClient 반환값을 지정하고 상태 반영을 검증합니다.",
+                    ),
+                    severity=review_service.SEVERITY_MAJOR,
+                )
+            ]
+        )
+
+        self.assertEqual(summaries, [problem])
+        self.assertNotIn("...", summaries[0])
+
     def test_identical_finding_in_must_fix_and_comment_is_deduped_to_comment(self) -> None:
         # 같은 finding 이 must_fix 와 comments[] 에 동시에 있으면 라인 anchor 쪽을 보존.
         same_text = "signature 검증이 제거되어 인증 우회 위험이 있습니다."
