@@ -1999,6 +1999,20 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
 
         self.assertEqual(budget, 115_000)
 
+    def test_batch_retry_trigger_replaces_previous_retry_suffix(self) -> None:
+        self.assertEqual(
+            review_service.batch_retry_fallback_trigger("prompt_budget", 1),
+            "prompt_budget_batch_retry_1",
+        )
+        self.assertEqual(
+            review_service.batch_retry_fallback_trigger("prompt_budget_batch_retry_1", 2),
+            "prompt_budget_batch_retry_2",
+        )
+        self.assertEqual(
+            review_service.batch_retry_fallback_trigger("prompt_budget_batch_413", 2),
+            "prompt_budget_batch_retry_2",
+        )
+
     def test_retry_budget_respects_explicit_budget_when_no_server_limit_is_available(self) -> None:
         error = RuntimeError("MLX generate endpoint returned HTTP 413: too large")
 
@@ -2173,6 +2187,36 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
 
         self.assertEqual([comment.path for comment in combined.comments], ["a.py", "secret.py"])
         self.assertEqual(combined.event, "REQUEST_CHANGES")
+
+    def test_combine_batched_reviews_keeps_five_top_level_summaries(self) -> None:
+        def artifact(comment: review_service.ReviewComment) -> review_service.ReviewGenerationArtifacts:
+            return review_service.ReviewGenerationArtifacts(
+                prompt="",
+                mlx_result={},
+                validated_review=review_service.ValidatedReview(
+                    comments=[comment],
+                    summary=f"{comment.path} summary",
+                    event="REQUEST_CHANGES",
+                    positives=[],
+                    must_fix=[],
+                    suggestions=[],
+                ),
+                payload={},
+            )
+
+        comments = [
+            review_service.ReviewComment(
+                f"file{index}.py",
+                index,
+                f"major finding {index}",
+                severity=review_service.SEVERITY_MAJOR,
+            )
+            for index in range(1, 7)
+        ]
+
+        combined = review_service.combine_batched_reviews([artifact(comment) for comment in comments])
+
+        self.assertEqual(combined.must_fix, [f"major finding {index}" for index in range(1, 6)])
 
     def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
         case = self

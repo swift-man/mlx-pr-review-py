@@ -4154,8 +4154,8 @@ def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) ->
     )
     blocking_comments = [comment for comment in comments if comment.severity in BLOCKING_SEVERITIES]
     non_blocking_comments = [comment for comment in comments if comment.severity not in BLOCKING_SEVERITIES]
-    must_fix = summarize_comment_bodies(blocking_comments, max_items=3)
-    suggestions = summarize_comment_bodies(non_blocking_comments, max_items=3)
+    must_fix = summarize_comment_bodies(blocking_comments, max_items=5)
+    suggestions = summarize_comment_bodies(non_blocking_comments, max_items=5)
     summaries = merge_distinct_items(
         [],
         [artifact.validated_review.summary for artifact in batch_artifacts],
@@ -4188,6 +4188,12 @@ def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) ->
         must_fix=must_fix,
         suggestions=suggestions,
     )
+
+
+def batch_retry_fallback_trigger(fallback_trigger: str, retry_depth: int) -> str:
+    base_trigger = fallback_trigger.split("_batch_retry_", 1)[0]
+    base_trigger = base_trigger.split("_batch_413", 1)[0]
+    return f"{base_trigger}_batch_retry_{retry_depth}"
 
 
 def generate_single_batch_review_artifacts(
@@ -4242,7 +4248,7 @@ def generate_single_batch_review_artifacts(
             existing_review_context=existing_review_context,
             prompt_max_chars=retry_prompt_max_chars,
             initial_prompt_chars=len(batch_prompt),
-            fallback_trigger=f"{fallback_trigger}_batch_413",
+            fallback_trigger=batch_retry_fallback_trigger(fallback_trigger, retry_depth + 1),
             retry_depth=retry_depth + 1,
             log_prefix=log_prefix,
         )
