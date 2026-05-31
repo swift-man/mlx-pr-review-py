@@ -3860,6 +3860,7 @@ def generate_review_artifacts(
             existing_review_context=existing_review_context,
             prompt_max_chars=prompt_max_chars,
             initial_prompt_chars=len(prompt),
+            fallback_trigger="prompt_budget",
             log_prefix=log_prefix,
         )
 
@@ -3871,6 +3872,8 @@ def generate_review_artifacts(
         if not should_retry_as_batched_review(exc, pr_files):
             raise
         retry_prompt_max_chars = review_prompt_retry_budget(prompt_max_chars, len(prompt), exc)
+        error_detail = truncate_context(normalize_text(str(exc)), 300, suffix="MLX prompt-too-large error truncated")
+        log_progress(log_prefix, f"Retrying review as batches after MLX prompt-too-large error: {error_detail}")
         return generate_batched_review_artifacts(
             repository,
             pull_number,
@@ -3878,6 +3881,7 @@ def generate_review_artifacts(
             existing_review_context=existing_review_context,
             prompt_max_chars=retry_prompt_max_chars,
             initial_prompt_chars=len(prompt),
+            fallback_trigger="mlx_413",
             log_prefix=log_prefix,
         )
     log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
@@ -3902,7 +3906,7 @@ def generate_review_artifacts(
 
 def should_split_review_prompt(prompt: str, pr_files: list[PullRequestFile], prompt_max_chars: int) -> bool:
     """원격 generate 상한에 걸릴 큰 PR은 파일 batch로 나눠 리뷰한다."""
-    return prompt_max_chars > 0 and len(pr_files) > 1 and len(prompt) > prompt_max_chars
+    return prompt_max_chars > 0 and bool(pr_files) and len(prompt) > prompt_max_chars
 
 
 def is_mlx_prompt_too_large_error(error: RuntimeError) -> bool:
@@ -3941,7 +3945,7 @@ def review_prompt_retry_budget(configured_budget: int, initial_prompt_chars: int
 
 
 def should_retry_as_batched_review(error: RuntimeError, pr_files: list[PullRequestFile]) -> bool:
-    return len(pr_files) > 1 and is_mlx_prompt_too_large_error(error)
+    return bool(pr_files) and is_mlx_prompt_too_large_error(error)
 
 
 def prompt_truncated_context_mode(context_mode: str) -> str:
@@ -4026,14 +4030,30 @@ def split_pr_files_for_prompt_budget(
             existing_review_context=existing_review_context,
             prompt_max_chars=prompt_max_chars,
         )
-        candidate = [*current_batch, budgeted_file]
-        candidate_prompt = make_prompt(
+        single_file_prompt = make_prompt(
             repository,
             pull_number,
-            candidate,
+            [budgeted_file],
             repository_context=None,
             existing_review_context=existing_review_context,
         )
+        if len(single_file_prompt) > prompt_max_chars:
+            raise RuntimeError(
+                "Single-file review prompt still exceeds budget after context trimming: "
+                f"{budgeted_file.filename} ({len(single_file_prompt)} > {prompt_max_chars}). "
+                "Lower MLX_REVIEW_CONTEXT_MAX_CHARS, use auto/excerpt context mode, or exclude the file."
+            )
+        candidate = [*current_batch, budgeted_file]
+        if current_batch:
+            candidate_prompt = make_prompt(
+                repository,
+                pull_number,
+                candidate,
+                repository_context=None,
+                existing_review_context=existing_review_context,
+            )
+        else:
+            candidate_prompt = single_file_prompt
         if current_batch and len(candidate_prompt) > prompt_max_chars:
             batches.append(current_batch)
             current_batch = [budgeted_file]
@@ -4057,32 +4077,42 @@ def dedupe_review_comments(comments: list[ReviewComment]) -> list[ReviewComment]
     return deduped
 
 
+def cap_review_comments(comments: list[ReviewComment], max_comments: int) -> list[ReviewComment]:
+    """batch별 finding 상한을 합친 뒤에도 전체 리뷰 상한을 다시 적용한다."""
+    if max_comments <= 0:
+        return []
+    if len(comments) <= max_comments:
+        return comments
+
+    blocking_comments = [comment for comment in comments if comment.severity in BLOCKING_SEVERITIES]
+    non_blocking_comments = [comment for comment in comments if comment.severity not in BLOCKING_SEVERITIES]
+    capped_blocking = blocking_comments[:max_comments]
+    remaining_slots = max_comments - len(capped_blocking)
+    return [*capped_blocking, *non_blocking_comments[:remaining_slots]]
+
+
 def combine_batched_reviews(batch_artifacts: list[ReviewGenerationArtifacts]) -> ValidatedReview:
-    comments = dedupe_review_comments(
-        [comment for artifact in batch_artifacts for comment in artifact.validated_review.comments]
+    comments = cap_review_comments(
+        dedupe_review_comments(
+            [comment for artifact in batch_artifacts for comment in artifact.validated_review.comments]
+        ),
+        configured_max_model_findings(),
     )
     positives = merge_distinct_items(
         [],
         [item for artifact in batch_artifacts for item in artifact.validated_review.positives],
         max_items=10,
     )
-    must_fix = merge_distinct_items(
-        [],
-        [item for artifact in batch_artifacts for item in artifact.validated_review.must_fix],
-        max_items=10,
-    )
-    suggestions = merge_distinct_items(
-        [],
-        [item for artifact in batch_artifacts for item in artifact.validated_review.suggestions],
-        max_items=10,
-    )
+    blocking_comments = [comment for comment in comments if comment.severity in BLOCKING_SEVERITIES]
+    non_blocking_comments = [comment for comment in comments if comment.severity not in BLOCKING_SEVERITIES]
+    must_fix = summarize_comment_bodies(blocking_comments, max_items=3)
+    suggestions = summarize_comment_bodies(non_blocking_comments, max_items=3)
     summaries = merge_distinct_items(
         [],
         [artifact.validated_review.summary for artifact in batch_artifacts],
         max_items=3,
     )
     has_findings = bool(comments or must_fix or suggestions)
-    blocking_comments = [comment for comment in comments if comment.severity in BLOCKING_SEVERITIES]
     event = decide_review_event(
         should_request_changes=bool(must_fix or blocking_comments),
         has_any_finding=has_findings,
@@ -4116,6 +4146,7 @@ def generate_batched_review_artifacts(
     existing_review_context: list[dict[str, Any]] | None,
     prompt_max_chars: int,
     initial_prompt_chars: int,
+    fallback_trigger: str,
     log_prefix: str = "",
 ) -> ReviewGenerationArtifacts:
     """큰 PR을 여러 요청으로 나눠 generate 서버 입력 상한을 넘지 않게 한다."""
@@ -4128,7 +4159,8 @@ def generate_batched_review_artifacts(
     )
     log_progress(
         log_prefix,
-        f"Prompt size {initial_prompt_chars} exceeds budget {prompt_max_chars}; "
+        f"Batched review trigger={fallback_trigger}: prompt size {initial_prompt_chars} "
+        f"exceeds budget {prompt_max_chars}; "
         f"reviewing in {len(batches)} batch(es) without repository_context",
     )
 

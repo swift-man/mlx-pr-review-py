@@ -1876,7 +1876,8 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             self._large_pr_file("a.py"),
             self._large_pr_file("b.py"),
         ]
-        single_prompt_budget = len(review_service.make_prompt("swift-man/app", 4, [files[0]])) + 100
+        extra_prompt_buffer = 100
+        single_prompt_budget = len(review_service.make_prompt("swift-man/app", 4, [files[0]])) + extra_prompt_buffer
         seen_batches: list[list[str]] = []
 
         def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
@@ -1971,6 +1972,39 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(artifacts.validated_review.event, "APPROVE")
         self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 2)
 
+    def test_generate_review_artifacts_batches_single_file_prompt_before_mlx(self) -> None:
+        pr_file = self._large_pr_file("huge.py", context_size=20_000)
+        empty_context_file = review_service.replace(
+            pr_file,
+            current_file_context="",
+            current_file_context_mode="",
+        )
+        budget = len(review_service.make_prompt("swift-man/app", 4, [empty_context_file])) + 2_000
+        seen_prompt_sizes: list[int] = []
+
+        def fake_run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+            seen_prompt_sizes.append(len(prompt))
+            payload = json.loads(prompt)
+            self.assertEqual([file_payload["path"] for file_payload in payload["files"]], ["huge.py"])
+            self.assertEqual(payload["files"][0]["current_file_context_mode"], "full_file_prompt_truncated")
+            return {
+                "summary": "single batch ok",
+                "event": "APPROVE",
+                "positives": [],
+                "must_fix": [],
+                "suggestions": [],
+                "comments": [],
+                "_meta": {"model_name": "test-model"},
+            }
+
+        with mock.patch.dict(os.environ, {review_service.REVIEW_PROMPT_MAX_CHARS_ENV: str(budget)}, clear=False):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                artifacts = review_service.generate_review_artifacts("swift-man/app", 4, [pr_file])
+
+        self.assertEqual(len(seen_prompt_sizes), 1)
+        self.assertLessEqual(seen_prompt_sizes[0], budget)
+        self.assertEqual(artifacts.mlx_result["_meta"]["review_batches"], 1)
+
     def test_split_pr_files_truncates_single_file_context_to_fit_prompt_budget(self) -> None:
         pr_file = self._large_pr_file("huge.py", context_size=20_000)
         empty_context_file = review_service.replace(
@@ -1995,6 +2029,37 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertLessEqual(len(fitted_prompt), budget)
         self.assertIn("prompt_truncated", fitted_file.current_file_context_mode)
         self.assertIn("current file context truncated to fit prompt budget", fitted_file.current_file_context)
+
+    def test_combine_batched_reviews_reapplies_global_comment_limit(self) -> None:
+        def artifact(comment: review_service.ReviewComment) -> review_service.ReviewGenerationArtifacts:
+            validated = review_service.ValidatedReview(
+                comments=[comment],
+                summary=f"{comment.path} summary",
+                event="REQUEST_CHANGES" if comment.severity in review_service.BLOCKING_SEVERITIES else "COMMENT",
+                positives=[],
+                must_fix=[comment.body] if comment.severity in review_service.BLOCKING_SEVERITIES else [],
+                suggestions=[comment.body] if comment.severity not in review_service.BLOCKING_SEVERITIES else [],
+            )
+            return review_service.ReviewGenerationArtifacts(
+                prompt="",
+                mlx_result={},
+                validated_review=validated,
+                payload={},
+            )
+
+        comments = [
+            review_service.ReviewComment("a.py", 1, "minor one", severity=review_service.SEVERITY_MINOR),
+            review_service.ReviewComment("b.py", 2, "major one", severity=review_service.SEVERITY_MAJOR),
+            review_service.ReviewComment("c.py", 3, "minor two", severity=review_service.SEVERITY_MINOR),
+        ]
+
+        with mock.patch.dict(os.environ, {review_service.MAX_MODEL_FINDINGS_ENV: "2"}, clear=False):
+            combined = review_service.combine_batched_reviews([artifact(comment) for comment in comments])
+
+        self.assertEqual(len(combined.comments), 2)
+        self.assertEqual([comment.path for comment in combined.comments], ["b.py", "a.py"])
+        self.assertEqual(combined.event, "REQUEST_CHANGES")
+        self.assertEqual(len(combined.must_fix), 1)
 
     def test_review_pull_request_dry_run_does_not_post_review(self) -> None:
         case = self
