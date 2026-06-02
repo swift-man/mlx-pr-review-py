@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Callable
 
 import certifi
 import jwt
@@ -3729,6 +3729,32 @@ def should_retry_review_as_comment(error: RuntimeError, payload: dict[str, Any])
     return "request changes on your own pull request" in message
 
 
+def is_bad_credentials_error(error: RuntimeError) -> bool:
+    """GitHub App installation token 만료로 발생하는 401을 식별한다."""
+    if not isinstance(error, GitHubApiError) or error.status != 401:
+        return False
+    message = normalize_text(error.response_body).lower()
+    return "bad credentials" in message
+
+
+def refresh_github_app_token_for_review_post(
+    github: GitHubApi,
+    repository: str,
+    api_url: str,
+    auth_source: str | None,
+    *,
+    log_prefix: str = "",
+) -> bool:
+    """긴 MLX 리뷰 중 만료될 수 있는 GitHub App installation token을 POST 직전에 갱신한다."""
+    if auth_source != "github_app_installation":
+        return False
+
+    refreshed = resolve_github_token(repository=repository, api_url=api_url)
+    github.token = refreshed.token
+    log_progress(log_prefix, f"Refreshed GitHub token for review post via {refreshed.source}")
+    return True
+
+
 def build_review_result(
     repository: str,
     pull_number: int,
@@ -4396,14 +4422,27 @@ def post_review_with_fallback(
     *,
     payload: dict[str, Any],
     requested_event: str,
+    refresh_token: Callable[[], bool] | None = None,
     log_prefix: str = "",
 ) -> PostedReviewResult:
     posted_event = requested_event
     fallback_note = ""
     requested_event_after_retry: str | None = None
+
+    def post_with_auth_retry(review_payload: dict[str, Any]) -> Any:
+        try:
+            return github.post_review(pull_number, review_payload)
+        except RuntimeError as exc:
+            if refresh_token is None or not is_bad_credentials_error(exc):
+                raise
+            log_progress(log_prefix, "Refreshing GitHub token after 401 Bad credentials and retrying review post")
+            if not refresh_token():
+                raise
+            return github.post_review(pull_number, review_payload)
+
     try:
         log_progress(log_prefix, f"Posting GitHub review as {requested_event}")
-        response = github.post_review(pull_number, payload)
+        response = post_with_auth_retry(payload)
     except RuntimeError as exc:
         if not should_retry_review_as_comment(exc, payload):
             raise
@@ -4411,7 +4450,7 @@ def post_review_with_fallback(
         retry_payload = dict(payload)
         retry_payload["event"] = "COMMENT"
         log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
-        response = github.post_review(pull_number, retry_payload)
+        response = post_with_auth_retry(retry_payload)
         payload = retry_payload
         posted_event = "COMMENT"
         requested_event_after_retry = requested_event
@@ -4489,11 +4528,29 @@ def review_pull_request(
         log_progress(log_prefix, f"Dry run completed in {time.monotonic() - started_at:.1f}s")
         return result
 
+    def refresh_review_post_token() -> bool:
+        return refresh_github_app_token_for_review_post(
+            github,
+            repository,
+            api_url,
+            auth_source,
+            log_prefix=log_prefix,
+        )
+
+    try:
+        refresh_review_post_token()
+    except Exception as exc:
+        error_detail = truncate_context(normalize_text(str(exc)), 300)
+        log_progress(
+            log_prefix,
+            f"Could not refresh GitHub token before review post; posting with existing token and will retry on 401: {error_detail}",
+        )
     posted = post_review_with_fallback(
         github,
         pull_number,
         payload=artifacts.payload,
         requested_event=artifacts.validated_review.event,
+        refresh_token=refresh_review_post_token,
         log_prefix=log_prefix,
     )
     if posted.requested_event is not None:
