@@ -4435,9 +4435,27 @@ def post_review_with_fallback(
         except RuntimeError as exc:
             if refresh_token is None or not is_bad_credentials_error(exc):
                 raise
-            log_progress(log_prefix, "Refreshing GitHub token after 401 Bad credentials and retrying review post")
-            if not refresh_token():
+            try:
+                refreshed = refresh_token()
+            except (RuntimeError, OSError) as refresh_exc:
+                error_detail = truncate_context(
+                    normalize_text(str(refresh_exc)),
+                    300,
+                    suffix="github token refresh error truncated",
+                )
+                log_progress(
+                    log_prefix,
+                    "GitHub token refresh after 401 Bad credentials failed "
+                    f"({type(refresh_exc).__name__}): {error_detail}",
+                )
                 raise
+            if not refreshed:
+                log_progress(
+                    log_prefix,
+                    "Review post hit 401 Bad credentials, but GitHub token refresh was unavailable",
+                )
+                raise
+            log_progress(log_prefix, "Refreshed GitHub token after 401 Bad credentials; retrying review post")
             return github.post_review(pull_number, review_payload)
 
     try:
@@ -4539,11 +4557,16 @@ def review_pull_request(
 
     try:
         refresh_review_post_token()
-    except Exception as exc:
-        error_detail = truncate_context(normalize_text(str(exc)), 300)
+    except (RuntimeError, OSError) as exc:
+        error_detail = truncate_context(
+            normalize_text(str(exc)),
+            300,
+            suffix="github token refresh error truncated",
+        )
         log_progress(
             log_prefix,
-            f"Could not refresh GitHub token before review post; posting with existing token and will retry on 401: {error_detail}",
+            "Could not refresh GitHub token before review post; posting with existing token "
+            f"and will retry on 401 ({type(exc).__name__}): {error_detail}",
         )
     posted = post_review_with_fallback(
         github,
