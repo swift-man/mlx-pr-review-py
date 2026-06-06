@@ -42,8 +42,11 @@ export MLX_MAX_TOKENS=1600
 # export MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=320000
 # export MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS=18000
 # export MLX_REVIEW_CONTEXT_API_TIMEOUT_SECONDS=20
-# GitHub review post가 5xx/429/secondary rate limit 같은 일시 장애를 만나면 리뷰 생성
-# 결과를 버리지 않고 대기 후 재시도합니다. run_webhook_server.sh 기본값은 3회/15초입니다.
+# GitHub review post가 5xx/429/secondary rate limit 같은 명시적 일시 장애를 만나면
+# 리뷰 생성 결과를 버리지 않고 대기 후 재시도합니다. 네트워크 오류는 이미 서버가
+# 리뷰를 만들었을 수 있어 중복 방지를 위해 자동 재시도하지 않습니다.
+# run_webhook_server.sh 기본값은 timeout 20초, 3회/15초입니다.
+# export MLX_REVIEW_POST_API_TIMEOUT_SECONDS=20
 # export MLX_REVIEW_POST_RETRY_ATTEMPTS=3
 # export MLX_REVIEW_POST_RETRY_DELAY_SECONDS=15
 # Metal/MLX abort가 반복되면 주석을 해제해 CPU fallback으로 확인하세요.

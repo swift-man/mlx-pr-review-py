@@ -59,12 +59,14 @@ REPOSITORY_CONTEXT_MAX_FILES_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_FILES"
 REPOSITORY_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_CHARS"
 REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS"
 REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV = "MLX_REVIEW_CONTEXT_API_TIMEOUT_SECONDS"
+REVIEW_POST_API_TIMEOUT_SECONDS_ENV = "MLX_REVIEW_POST_API_TIMEOUT_SECONDS"
 REVIEW_POST_RETRY_ATTEMPTS_ENV = "MLX_REVIEW_POST_RETRY_ATTEMPTS"
 REVIEW_POST_RETRY_DELAY_SECONDS_ENV = "MLX_REVIEW_POST_RETRY_DELAY_SECONDS"
 DEFAULT_REPOSITORY_CONTEXT_MAX_FILES = 120
 DEFAULT_REPOSITORY_CONTEXT_MAX_CHARS = 320_000
 DEFAULT_REPOSITORY_CONTEXT_FILE_MAX_CHARS = 18_000
 DEFAULT_REVIEW_CONTEXT_API_TIMEOUT_SECONDS = 20
+DEFAULT_REVIEW_POST_API_TIMEOUT_SECONDS = 20
 DEFAULT_REVIEW_POST_RETRY_ATTEMPTS = 3
 DEFAULT_REVIEW_POST_RETRY_DELAY_SECONDS = 15
 COPILOT_REVIEW_REQUEST_ENV = "COPILOT_REVIEW_REQUEST"
@@ -1054,11 +1056,12 @@ class GitHubApi:
                 f"(type={entry_type!r}, encoding={encoding!r})"
             ) from exc
 
-    def post_review(self, pull_number: int, body: dict[str, Any]) -> Any:
+    def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> Any:
         return self.request_json(
             "POST",
             f"/repos/{self.repository}/pulls/{pull_number}/reviews",
             body=body,
+            timeout=timeout,
         )
 
 
@@ -1884,6 +1887,13 @@ def configured_review_post_retry_attempts() -> int:
     return parse_positive_int_env(
         REVIEW_POST_RETRY_ATTEMPTS_ENV,
         DEFAULT_REVIEW_POST_RETRY_ATTEMPTS,
+    )
+
+
+def configured_review_post_api_timeout_seconds() -> int:
+    return parse_positive_int_env(
+        REVIEW_POST_API_TIMEOUT_SECONDS_ENV,
+        DEFAULT_REVIEW_POST_API_TIMEOUT_SECONDS,
     )
 
 
@@ -3772,7 +3782,9 @@ def is_retryable_review_post_error(error: BaseException) -> bool:
         ):
             return True
         return False
-    return isinstance(error, (urllib.error.URLError, TimeoutError))
+    # POST 네트워크 오류는 서버가 요청을 처리했지만 응답만 끊긴 상태일 수 있어
+    # 자동 재시도하면 같은 리뷰와 라인 코멘트를 중복 등록할 수 있다.
+    return False
 
 
 def refresh_github_app_token_for_review_post(
@@ -4464,11 +4476,12 @@ def post_review_with_fallback(
     log_prefix: str = "",
 ) -> PostedReviewResult:
     retry_attempts = configured_review_post_retry_attempts()
+    post_timeout_seconds = configured_review_post_api_timeout_seconds()
     retry_delay_seconds = configured_review_post_retry_delay_seconds()
 
     def post_with_auth_retry(review_payload: dict[str, Any]) -> Any:
         try:
-            return github.post_review(pull_number, review_payload)
+            return github.post_review(pull_number, review_payload, timeout=post_timeout_seconds)
         except RuntimeError as exc:
             if refresh_token is None or not is_bad_credentials_error(exc):
                 raise
@@ -4493,7 +4506,7 @@ def post_review_with_fallback(
                 )
                 raise
             log_progress(log_prefix, "Refreshed GitHub token after 401 Bad credentials; retrying review post")
-            return github.post_review(pull_number, review_payload)
+            return github.post_review(pull_number, review_payload, timeout=post_timeout_seconds)
 
     def post_once() -> PostedReviewResult:
         posted_event = requested_event
