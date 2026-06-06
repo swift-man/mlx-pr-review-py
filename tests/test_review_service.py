@@ -454,6 +454,24 @@ class GitHubApiTests(unittest.TestCase):
 
         request_json.assert_called_once_with("GET", "/repos/swift-man/app/pulls/4")
 
+    def test_get_pull_head_sha_can_force_refresh_cached_result(self) -> None:
+        with mock.patch.object(review_service, "build_ssl_context", return_value=mock.Mock()):
+            github = review_service.GitHubApi(token="token", repository="swift-man/app")
+
+        with mock.patch.object(
+            github,
+            "request_json",
+            side_effect=[
+                {"head": {"sha": "abc123"}},
+                {"head": {"sha": "def456"}},
+            ],
+        ) as request_json:
+            self.assertEqual(github.get_pull_head_sha(4), "abc123")
+            self.assertEqual(github.get_pull_head_sha(4, force_refresh=True), "def456")
+            self.assertEqual(github.get_pull_head_sha(4), "def456")
+
+        self.assertEqual(request_json.call_count, 2)
+
 
 class ReviewBotConfigTests(unittest.TestCase):
     def _pr_file(self, filename: str) -> "review_service.PullRequestFile":
@@ -2222,9 +2240,11 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         class FakeGitHub:
             def __init__(self) -> None:
                 self.calls = 0
+                self.timeouts: list[float | None] = []
 
-            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
                 self.calls += 1
+                self.timeouts.append(timeout)
                 if self.calls == 1:
                     raise review_service.GitHubApiError(
                         method="POST",
@@ -2259,7 +2279,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
                 self.calls += 1
                 raise review_service.GitHubApiError(
                     method="POST",
@@ -2292,7 +2312,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
-            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
                 self.calls += 1
                 raise review_service.GitHubApiError(
                     method="POST",
@@ -2326,6 +2346,253 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             "\n".join(logs),
         )
 
+    def test_post_review_with_fallback_waits_and_retries_transient_post_error(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.timeouts: list[float | None] = []
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.calls += 1
+                self.timeouts.append(timeout)
+                if self.calls == 1:
+                    raise review_service.GitHubApiError(
+                        method="POST",
+                        url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                        status=502,
+                        response_body='{"message":"Bad Gateway"}',
+                    )
+                return {"id": 321, "pull_number": pull_number, "event": body["event"]}
+
+        github = FakeGitHub()
+        logs: list[str] = []
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_API_TIMEOUT_SECONDS_ENV: "7",
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "2",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with mock.patch(
+                "review_runner.review_service.log_progress",
+                side_effect=lambda _prefix, message: logs.append(message),
+            ):
+                posted = review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.calls, 2)
+        self.assertEqual(github.timeouts, [7, 7])
+        self.assertEqual(posted.response["id"], 321)
+        self.assertIn("retrying immediately", "\n".join(logs))
+
+    def test_post_review_with_fallback_skips_duplicate_retry_when_same_review_exists(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.post_calls = 0
+                self.list_calls = 0
+                self.list_timeouts: list[float | None] = []
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.post_calls += 1
+                raise review_service.GitHubApiError(
+                    method="POST",
+                    url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                    status=502,
+                    response_body='{"message":"Bad Gateway"}',
+                )
+
+            def list_reviews(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
+                self.list_calls += 1
+                self.list_timeouts.append(timeout)
+                return [
+                    {
+                        "id": 654,
+                        "body": payload["body"],
+                        "state": "APPROVED",
+                        "commit_id": "abc123",
+                    }
+                ]
+
+        github = FakeGitHub()
+        logs: list[str] = []
+        payload = review_service.attach_review_payload_identity(
+            {"body": "ok", "event": "APPROVE", "comments": []},
+            "abc123",
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_API_TIMEOUT_SECONDS_ENV: "7",
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "3",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with mock.patch(
+                "review_runner.review_service.log_progress",
+                side_effect=lambda _prefix, message: logs.append(message),
+            ):
+                posted = review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload=payload,
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.post_calls, 1)
+        self.assertEqual(github.list_calls, 1)
+        self.assertEqual(github.list_timeouts, [7])
+        self.assertEqual(posted.response["id"], 654)
+        self.assertIn("중복 POST", posted.fallback_note)
+        self.assertIn("skipping duplicate review post", "\n".join(logs))
+
+    def test_post_review_with_fallback_does_not_skip_duplicate_without_payload_identity(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.post_calls = 0
+                self.list_calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.post_calls += 1
+                if self.post_calls == 1:
+                    raise review_service.GitHubApiError(
+                        method="POST",
+                        url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                        status=502,
+                        response_body='{"message":"Bad Gateway"}',
+                    )
+                return {"id": 655, "pull_number": pull_number, "event": body["event"]}
+
+            def list_reviews(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
+                self.list_calls += 1
+                return [{"id": 654, "body": "ok", "state": "APPROVED", "commit_id": "abc123"}]
+
+        github = FakeGitHub()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "2",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            posted = review_service.post_review_with_fallback(
+                github,  # type: ignore[arg-type]
+                4,
+                payload={"body": "ok", "event": "APPROVE", "comments": []},
+                requested_event="APPROVE",
+            )
+
+        self.assertEqual(github.post_calls, 2)
+        self.assertEqual(github.list_calls, 0)
+        self.assertEqual(posted.response["id"], 655)
+
+    def test_post_review_with_fallback_does_not_wait_on_non_retryable_post_error(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.calls += 1
+                raise review_service.GitHubApiError(
+                    method="POST",
+                    url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                    status=422,
+                    response_body='{"message":"Validation Failed"}',
+                )
+
+        github = FakeGitHub()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "3",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(review_service.GitHubApiError):
+                review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.calls, 1)
+
+    def test_post_review_with_fallback_does_not_retry_ambiguous_network_error(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.calls += 1
+                raise review_service.urllib.error.URLError("connection reset after request body was sent")
+
+        github = FakeGitHub()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "3",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(review_service.urllib.error.URLError):
+                review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.calls, 1)
+
+    def test_post_review_with_fallback_exhausts_retries_on_persistent_error(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.calls += 1
+                raise review_service.GitHubApiError(
+                    method="POST",
+                    url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                    status=502,
+                    response_body='{"message":"Bad Gateway"}',
+                )
+
+        github = FakeGitHub()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "3",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(review_service.GitHubApiError):
+                review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.calls, 3)
+
     def test_review_pull_request_refreshes_github_app_token_before_posting(self) -> None:
         case = self
 
@@ -2350,7 +2617,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                     }
                 ]
 
-            def get_pull_head_sha(self, pull_number: int) -> str:
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
@@ -2370,9 +2637,14 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 self._assert_pull_number(pull_number)
                 return []
 
-            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
                 self._assert_pull_number(pull_number)
                 case.assertEqual(self.token, "fresh-token")
+                case.assertEqual(body["commit_id"], "abc123")
+                case.assertRegex(
+                    body["body"],
+                    r"<!-- mlx-review-payload-fingerprint:[a-f0-9]{24} -->$",
+                )
                 return {"id": 456}
 
             def _assert_pull_number(self, pull_number: int) -> None:
@@ -2438,7 +2710,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                     }
                 ]
 
-            def get_pull_head_sha(self, pull_number: int) -> str:
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
@@ -2458,7 +2730,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 self._assert_pull_number(pull_number)
                 return []
 
-            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
                 self._assert_pull_number(pull_number)
                 self.post_review_calls += 1
                 if self.post_review_calls == 1:
@@ -2539,7 +2811,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                     }
                 ]
 
-            def get_pull_head_sha(self, pull_number: int) -> str:
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
@@ -2559,7 +2831,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 self._assert_pull_number(pull_number)
                 return []
 
-            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
                 self.post_review_called = True
                 raise AssertionError("dry_run=True must not post a GitHub review")
 
@@ -2588,6 +2860,89 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["repository"], "swift-man/app")
         self.assertEqual(len(FakeGitHub.instances), 1)
+        self.assertFalse(FakeGitHub.instances[0].post_review_called)
+
+    def test_review_pull_request_skips_post_when_head_changes_during_review(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            instances: list["FakeGitHub"] = []
+
+            def __init__(self, token: str, repository: str, api_url: str) -> None:
+                self.token = token
+                self.repository = repository
+                self.api_url = api_url
+                self.post_review_called = False
+                FakeGitHub.instances.append(self)
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return [
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+                        "additions": 1,
+                        "deletions": 1,
+                    }
+                ]
+
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
+                self._assert_pull_number(pull_number)
+                return "def456" if force_refresh else "abc123"
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual(ref, "abc123")
+                if path == review_service.REVIEWBOT_CONFIG_PATH:
+                    raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+                if path == "Sources/App.swift":
+                    return "let value = new\n"
+                raise AssertionError(f"unexpected file path: {path}")
+
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.post_review_called = True
+                raise AssertionError("stale PR HEAD must skip review post")
+
+            def _assert_pull_number(self, pull_number: int) -> None:
+                if pull_number != 4:
+                    raise AssertionError(f"unexpected pull number: {pull_number}")
+
+        mlx_result = {
+            "summary": "요약",
+            "event": "COMMENT",
+            "positives": [],
+            "must_fix": [],
+            "suggestions": [],
+            "comments": [],
+        }
+
+        with mock.patch("review_runner.review_service.GitHubApi", FakeGitHub):
+            with mock.patch("review_runner.review_service.run_mlx", return_value=mlx_result):
+                with mock.patch(
+                    "review_runner.review_service.maybe_request_copilot_review",
+                    return_value=review_service.build_copilot_review_request_result(
+                        status="skipped",
+                        reviewer="copilot",
+                    ),
+                ):
+                    result = review_service.review_pull_request(
+                        "swift-man/app",
+                        4,
+                        token="token",
+                    )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reviewed_head_sha"], "abc123")
+        self.assertEqual(result["current_head_sha"], "def456")
+        self.assertIn("HEAD changed", result["message"])
         self.assertFalse(FakeGitHub.instances[0].post_review_called)
 
 
@@ -3987,6 +4342,47 @@ class ExtractModelNameFromResultTests(unittest.TestCase):
 
 
 class BuildReviewPayloadTests(unittest.TestCase):
+    def test_review_payload_identity_changes_when_line_comments_change(self) -> None:
+        first_payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[
+                review_service.ReviewComment(
+                    path="Sources/App.swift",
+                    line=10,
+                    body="Problem: A. Why it matters: B. Suggested fix: C. Confidence: High",
+                    confidence=0.95,
+                )
+            ],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+        )
+        second_payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[
+                review_service.ReviewComment(
+                    path="Sources/App.swift",
+                    line=11,
+                    body="Problem: A. Why it matters: B. Suggested fix: C. Confidence: High",
+                    confidence=0.95,
+                )
+            ],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+        )
+
+        first_identified = review_service.attach_review_payload_identity(first_payload, "abc123")
+        second_identified = review_service.attach_review_payload_identity(second_payload, "abc123")
+
+        self.assertEqual(first_identified["commit_id"], "abc123")
+        self.assertNotEqual(
+            review_service.extract_review_payload_fingerprint(first_identified["body"]),
+            review_service.extract_review_payload_fingerprint(second_identified["body"]),
+        )
+
     def test_body_separates_mlx_and_copilot_review_sections(self) -> None:
         payload = review_service.build_review_payload(
             summary="요약",

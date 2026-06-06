@@ -8,6 +8,7 @@ import binascii
 import calendar
 import contextlib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -59,10 +60,16 @@ REPOSITORY_CONTEXT_MAX_FILES_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_FILES"
 REPOSITORY_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_CHARS"
 REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS"
 REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV = "MLX_REVIEW_CONTEXT_API_TIMEOUT_SECONDS"
+REVIEW_POST_API_TIMEOUT_SECONDS_ENV = "MLX_REVIEW_POST_API_TIMEOUT_SECONDS"
+REVIEW_POST_RETRY_ATTEMPTS_ENV = "MLX_REVIEW_POST_RETRY_ATTEMPTS"
+REVIEW_POST_RETRY_DELAY_SECONDS_ENV = "MLX_REVIEW_POST_RETRY_DELAY_SECONDS"
 DEFAULT_REPOSITORY_CONTEXT_MAX_FILES = 120
 DEFAULT_REPOSITORY_CONTEXT_MAX_CHARS = 320_000
 DEFAULT_REPOSITORY_CONTEXT_FILE_MAX_CHARS = 18_000
 DEFAULT_REVIEW_CONTEXT_API_TIMEOUT_SECONDS = 20
+DEFAULT_REVIEW_POST_API_TIMEOUT_SECONDS = 20
+DEFAULT_REVIEW_POST_RETRY_ATTEMPTS = 3
+DEFAULT_REVIEW_POST_RETRY_DELAY_SECONDS = 15
 COPILOT_REVIEW_REQUEST_ENV = "COPILOT_REVIEW_REQUEST"
 COPILOT_REVIEWER_ENV = "COPILOT_REVIEWER"
 COPILOT_REVIEW_MONTHLY_BUDGET_ENV = "COPILOT_REVIEW_MONTHLY_BUDGET"
@@ -192,6 +199,9 @@ SECRET_LOG_RE = re.compile(r"\b(token|secret|password|passwd|api[_-]?key|authori
 LOG_CALL_RE = re.compile(r"\b(print|logging\.\w+|logger\.\w+)\s*\(")
 DIFF_STAT_RE = re.compile(r"\d+\s*개\s*(?:추가|삭제|변경)")
 HUNK_HEADER_RE = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+(?P<start>\d+)(?:,(?P<length>\d+))?\s+@@")
+REVIEW_PAYLOAD_FINGERPRINT_RE = re.compile(
+    r"\n*<!--\s*mlx-review-payload-fingerprint:(?P<fingerprint>[a-f0-9]{24,64})\s*-->\s*$"
+)
 PROMPT_ECHO_MARKERS = (
     "review_runner/",
     "valid_comment_lines",
@@ -974,6 +984,24 @@ class GitHubApi:
             page += 1
         return comments
 
+    def list_reviews(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
+        reviews: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = self.request_json(
+                "GET",
+                f"/repos/{self.repository}/pulls/{pull_number}/reviews",
+                params={"per_page": 100, "page": page},
+                timeout=timeout,
+            )
+            if not batch:
+                break
+            reviews.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return reviews
+
     def list_requested_reviewers(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
         response = self.request_json(
             "GET",
@@ -995,9 +1023,9 @@ class GitHubApi:
             timeout=timeout,
         )
 
-    def get_pull_head_sha(self, pull_number: int) -> str:
+    def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
         cached_sha = self._pull_head_sha_cache.get(pull_number)
-        if cached_sha:
+        if cached_sha and not force_refresh:
             return cached_sha
         pull = self.request_json("GET", f"/repos/{self.repository}/pulls/{pull_number}")
         head = pull.get("head") if isinstance(pull, dict) else None
@@ -1050,11 +1078,12 @@ class GitHubApi:
                 f"(type={entry_type!r}, encoding={encoding!r})"
             ) from exc
 
-    def post_review(self, pull_number: int, body: dict[str, Any]) -> Any:
+    def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> Any:
         return self.request_json(
             "POST",
             f"/repos/{self.repository}/pulls/{pull_number}/reviews",
             body=body,
+            timeout=timeout,
         )
 
 
@@ -1874,6 +1903,27 @@ def parse_non_negative_int_env(name: str, default: int) -> int:
     except ValueError:
         return default
     return max(parsed, 0)
+
+
+def configured_review_post_retry_attempts() -> int:
+    return parse_positive_int_env(
+        REVIEW_POST_RETRY_ATTEMPTS_ENV,
+        DEFAULT_REVIEW_POST_RETRY_ATTEMPTS,
+    )
+
+
+def configured_review_post_api_timeout_seconds() -> int:
+    return parse_positive_int_env(
+        REVIEW_POST_API_TIMEOUT_SECONDS_ENV,
+        DEFAULT_REVIEW_POST_API_TIMEOUT_SECONDS,
+    )
+
+
+def configured_review_post_retry_delay_seconds() -> int:
+    return parse_non_negative_int_env(
+        REVIEW_POST_RETRY_DELAY_SECONDS_ENV,
+        DEFAULT_REVIEW_POST_RETRY_DELAY_SECONDS,
+    )
 
 
 def configured_current_file_context_line_radius() -> int:
@@ -3720,6 +3770,54 @@ def build_review_payload(
     }
 
 
+def strip_review_payload_fingerprint(body: Any) -> str:
+    if not isinstance(body, str):
+        return ""
+    return REVIEW_PAYLOAD_FINGERPRINT_RE.sub("", body).rstrip()
+
+
+def extract_review_payload_fingerprint(body: Any) -> str:
+    if not isinstance(body, str):
+        return ""
+    match = REVIEW_PAYLOAD_FINGERPRINT_RE.search(body)
+    return match.group("fingerprint") if match else ""
+
+
+def review_payload_fingerprint(payload: dict[str, Any], head_sha: str) -> str:
+    comments = payload.get("comments")
+    raw_comments = comments if isinstance(comments, list) else []
+    normalized_comments = [
+        {
+            "path": normalize_text(comment.get("path")),
+            "line": comment.get("line") if isinstance(comment.get("line"), int) else None,
+            "side": normalize_text(comment.get("side")),
+            "body": normalize_text(comment.get("body")),
+        }
+        for comment in raw_comments
+        if isinstance(comment, dict)
+    ]
+    identity = {
+        "head_sha": normalize_text(head_sha),
+        "event": normalize_text(payload.get("event")),
+        "body": strip_review_payload_fingerprint(payload.get("body")),
+        "comments": normalized_comments,
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def attach_review_payload_identity(payload: dict[str, Any], head_sha: str) -> dict[str, Any]:
+    normalized_head_sha = normalize_text(head_sha)
+    if not normalized_head_sha:
+        return payload
+    review_payload = dict(payload)
+    review_payload["commit_id"] = normalized_head_sha
+    body = strip_review_payload_fingerprint(review_payload.get("body"))
+    fingerprint = review_payload_fingerprint(review_payload, normalized_head_sha)
+    review_payload["body"] = f"{body}\n\n<!-- mlx-review-payload-fingerprint:{fingerprint} -->"
+    return review_payload
+
+
 def should_retry_review_as_comment(error: RuntimeError, payload: dict[str, Any]) -> bool:
     """자기 PR에 REQUEST_CHANGES를 달 수 없는 경우만 안전하게 재시도한다."""
     if payload.get("event") != "REQUEST_CHANGES":
@@ -3735,6 +3833,28 @@ def is_bad_credentials_error(error: RuntimeError) -> bool:
         return False
     message = normalize_text(error.response_body).lower()
     return "bad credentials" in message
+
+
+def is_retryable_review_post_error(error: BaseException) -> bool:
+    """생성 완료 리뷰를 잃지 않기 위해 GitHub post 일시 장애만 재시도 대상으로 본다."""
+    if isinstance(error, GitHubApiError):
+        body = normalize_text(error.response_body).lower()
+        if error.status == 429 or error.status >= 500:
+            return True
+        if error.status == 403 and any(
+            marker in body
+            for marker in (
+                "rate limit",
+                "secondary rate limit",
+                "abuse detection",
+                "too many requests",
+            )
+        ):
+            return True
+        return False
+    # POST 네트워크 오류는 서버가 요청을 처리했지만 응답만 끊긴 상태일 수 있어
+    # 자동 재시도하면 같은 리뷰와 라인 코멘트를 중복 등록할 수 있다.
+    return False
 
 
 def refresh_github_app_token_for_review_post(
@@ -3753,6 +3873,47 @@ def refresh_github_app_token_for_review_post(
     github.token = refreshed.token
     log_progress(log_prefix, f"Refreshed GitHub token for review post via {refreshed.source}")
     return True
+
+
+def find_existing_review_with_same_identity(
+    github: GitHubApi,
+    pull_number: int,
+    payload: dict[str, Any],
+    *,
+    timeout: float | None = None,
+    log_prefix: str = "",
+) -> dict[str, Any] | None:
+    """POST 응답만 실패한 경우를 대비해 같은 payload 리뷰가 이미 등록됐는지 확인한다."""
+    expected_fingerprint = extract_review_payload_fingerprint(payload.get("body"))
+    expected_commit_id = normalize_text(payload.get("commit_id"))
+    if not expected_fingerprint or not expected_commit_id:
+        return None
+    expected_state = {
+        "APPROVE": "APPROVED",
+        "COMMENT": "COMMENTED",
+        "REQUEST_CHANGES": "CHANGES_REQUESTED",
+    }.get(normalize_text(payload.get("event")))
+    try:
+        reviews = github.list_reviews(pull_number, timeout=timeout)
+    except (AttributeError, RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+        error_detail = truncate_context(
+            normalize_text(str(exc)),
+            300,
+            suffix="GitHub existing review lookup error truncated",
+        )
+        log_progress(log_prefix, f"Could not check existing reviews before retry: {error_detail}")
+        return None
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        if extract_review_payload_fingerprint(review.get("body")) != expected_fingerprint:
+            continue
+        if normalize_text(review.get("commit_id")) != expected_commit_id:
+            continue
+        review_state = normalize_text(review.get("state")).upper()
+        if expected_state is None or not review_state or review_state == expected_state:
+            return review
+    return None
 
 
 def build_review_result(
@@ -4425,13 +4586,17 @@ def post_review_with_fallback(
     refresh_token: Callable[[], bool] | None = None,
     log_prefix: str = "",
 ) -> PostedReviewResult:
+    retry_attempts = configured_review_post_retry_attempts()
+    post_timeout_seconds = configured_review_post_api_timeout_seconds()
+    retry_delay_seconds = configured_review_post_retry_delay_seconds()
+    active_payload = payload
     posted_event = requested_event
     fallback_note = ""
     requested_event_after_retry: str | None = None
 
     def post_with_auth_retry(review_payload: dict[str, Any]) -> Any:
         try:
-            return github.post_review(pull_number, review_payload)
+            return github.post_review(pull_number, review_payload, timeout=post_timeout_seconds)
         except RuntimeError as exc:
             if refresh_token is None or not is_bad_credentials_error(exc):
                 raise
@@ -4456,31 +4621,74 @@ def post_review_with_fallback(
                 )
                 raise
             log_progress(log_prefix, "Refreshed GitHub token after 401 Bad credentials; retrying review post")
-            return github.post_review(pull_number, review_payload)
+            return github.post_review(pull_number, review_payload, timeout=post_timeout_seconds)
 
-    try:
-        log_progress(log_prefix, f"Posting GitHub review as {requested_event}")
-        response = post_with_auth_retry(payload)
-    except RuntimeError as exc:
-        if not should_retry_review_as_comment(exc, payload):
-            raise
+    def build_posted_result(response: Any) -> PostedReviewResult:
+        return PostedReviewResult(
+            response=response,
+            posted_event=posted_event,
+            payload=active_payload,
+            fallback_note=fallback_note,
+            requested_event=requested_event_after_retry,
+        )
 
-        retry_payload = dict(payload)
-        retry_payload["event"] = "COMMENT"
-        log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
-        response = post_with_auth_retry(retry_payload)
-        payload = retry_payload
-        posted_event = "COMMENT"
-        requested_event_after_retry = requested_event
-        fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            log_progress(log_prefix, f"Posting GitHub review as {active_payload.get('event', requested_event)}")
+            response = post_with_auth_retry(active_payload)
+            return build_posted_result(response)
+        except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
+            if should_retry_review_as_comment(exc, active_payload):
+                active_payload = dict(active_payload)
+                active_payload["event"] = "COMMENT"
+                posted_event = "COMMENT"
+                requested_event_after_retry = requested_event
+                fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
+                log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
+                try:
+                    response = post_with_auth_retry(active_payload)
+                    return build_posted_result(response)
+                except (RuntimeError, urllib.error.URLError, TimeoutError) as retry_exc:
+                    exc = retry_exc
+            if attempt >= retry_attempts or not is_retryable_review_post_error(exc):
+                raise
+            existing_review = find_existing_review_with_same_identity(
+                github,
+                pull_number,
+                active_payload,
+                timeout=post_timeout_seconds,
+                log_prefix=log_prefix,
+            )
+            if existing_review is not None:
+                fallback_note = (
+                    "같은 본문의 리뷰가 이미 등록되어 GitHub Review API 중복 POST를 건너뛰었습니다."
+                )
+                log_progress(
+                    log_prefix,
+                    f"Found existing GitHub review id={existing_review.get('id')}; skipping duplicate review post",
+                )
+                return build_posted_result(existing_review)
+            error_detail = truncate_context(
+                normalize_text(str(exc)),
+                300,
+                suffix="GitHub review post error truncated",
+            )
+            if retry_delay_seconds:
+                log_progress(
+                    log_prefix,
+                    "GitHub review post failed with retryable error "
+                    f"on attempt {attempt}/{retry_attempts}; waiting {retry_delay_seconds}s before retry: "
+                    f"{error_detail}",
+                )
+                time.sleep(retry_delay_seconds)
+            else:
+                log_progress(
+                    log_prefix,
+                    "GitHub review post failed with retryable error "
+                    f"on attempt {attempt}/{retry_attempts}; retrying immediately: {error_detail}",
+                )
 
-    return PostedReviewResult(
-        response=response,
-        posted_event=posted_event,
-        payload=payload,
-        fallback_note=fallback_note,
-        requested_event=requested_event_after_retry,
-    )
+    raise RuntimeError("Review post retry loop exited without posting or raising")
 
 
 def review_pull_request(
@@ -4512,6 +4720,17 @@ def review_pull_request(
             "skipped_by_reviewbot": file_load_result.skipped_by_reviewbot,
         }
 
+    try:
+        reviewed_head_sha = github.get_pull_head_sha(pull_number)
+    except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+        reviewed_head_sha = ""
+        error_detail = truncate_context(
+            normalize_text(str(exc)),
+            300,
+            suffix="GitHub reviewed head sha lookup error truncated",
+        )
+        log_progress(log_prefix, f"Could not record reviewed PR head sha: {error_detail}")
+
     existing_review_context = load_existing_review_context(github, pull_number, log_prefix=log_prefix)
     copilot_review_request = (
         build_copilot_review_request_result(status="dry_run", reviewer=normalize_copilot_reviewer())
@@ -4531,6 +4750,54 @@ def review_pull_request(
         existing_review_context=existing_review_context,
         log_prefix=log_prefix,
     )
+    post_head_sha = reviewed_head_sha
+    stale_head_skip: dict[str, Any] | None = None
+    if not dry_run:
+        if reviewed_head_sha:
+            try:
+                current_head_sha = github.get_pull_head_sha(pull_number, force_refresh=True)
+            except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+                error_detail = truncate_context(
+                    normalize_text(str(exc)),
+                    300,
+                    suffix="GitHub current head sha lookup error truncated",
+                )
+                message = f"Could not verify current PR head before review post: {error_detail}"
+                log_progress(log_prefix, message)
+                stale_head_skip = {
+                    "status": "skipped",
+                    "reason": "Could not verify current PR head before posting review.",
+                    "message": message,
+                    "reviewed_head_sha": reviewed_head_sha,
+                }
+            else:
+                if current_head_sha != reviewed_head_sha:
+                    message = (
+                        "PR HEAD changed during review; skipping stale review post "
+                        f"(reviewed={reviewed_head_sha}, current={current_head_sha})"
+                    )
+                    log_progress(log_prefix, message)
+                    stale_head_skip = {
+                        "status": "skipped",
+                        "reason": "PR head changed during review; skipped stale review post.",
+                        "message": message,
+                        "reviewed_head_sha": reviewed_head_sha,
+                        "current_head_sha": current_head_sha,
+                    }
+                else:
+                    post_head_sha = current_head_sha
+        else:
+            try:
+                post_head_sha = github.get_pull_head_sha(pull_number, force_refresh=True)
+            except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+                error_detail = truncate_context(
+                    normalize_text(str(exc)),
+                    300,
+                    suffix="GitHub current head sha lookup error truncated",
+                )
+                log_progress(log_prefix, f"Could not attach review post identity: {error_detail}")
+        if post_head_sha and stale_head_skip is None:
+            artifacts.payload = attach_review_payload_identity(artifacts.payload, post_head_sha)
     result = build_review_result(
         repository,
         pull_number,
@@ -4541,6 +4808,10 @@ def review_pull_request(
     result["existing_review_context_count"] = len(existing_review_context)
     result["repository_context_count"] = len(file_load_result.repository_context)
     result["copilot_review_request"] = copilot_review_request
+
+    if stale_head_skip is not None:
+        result.update(stale_head_skip)
+        return result
 
     if dry_run:
         log_progress(log_prefix, f"Dry run completed in {time.monotonic() - started_at:.1f}s")
