@@ -454,6 +454,24 @@ class GitHubApiTests(unittest.TestCase):
 
         request_json.assert_called_once_with("GET", "/repos/swift-man/app/pulls/4")
 
+    def test_get_pull_head_sha_can_force_refresh_cached_result(self) -> None:
+        with mock.patch.object(review_service, "build_ssl_context", return_value=mock.Mock()):
+            github = review_service.GitHubApi(token="token", repository="swift-man/app")
+
+        with mock.patch.object(
+            github,
+            "request_json",
+            side_effect=[
+                {"head": {"sha": "abc123"}},
+                {"head": {"sha": "def456"}},
+            ],
+        ) as request_json:
+            self.assertEqual(github.get_pull_head_sha(4), "abc123")
+            self.assertEqual(github.get_pull_head_sha(4, force_refresh=True), "def456")
+            self.assertEqual(github.get_pull_head_sha(4), "def456")
+
+        self.assertEqual(request_json.call_count, 2)
+
 
 class ReviewBotConfigTests(unittest.TestCase):
     def _pr_file(self, filename: str) -> "review_service.PullRequestFile":
@@ -2599,7 +2617,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                     }
                 ]
 
-            def get_pull_head_sha(self, pull_number: int) -> str:
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
@@ -2692,7 +2710,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                     }
                 ]
 
-            def get_pull_head_sha(self, pull_number: int) -> str:
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
@@ -2793,7 +2811,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                     }
                 ]
 
-            def get_pull_head_sha(self, pull_number: int) -> str:
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
                 self._assert_pull_number(pull_number)
                 return "abc123"
 
@@ -2842,6 +2860,89 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["repository"], "swift-man/app")
         self.assertEqual(len(FakeGitHub.instances), 1)
+        self.assertFalse(FakeGitHub.instances[0].post_review_called)
+
+    def test_review_pull_request_skips_post_when_head_changes_during_review(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            instances: list["FakeGitHub"] = []
+
+            def __init__(self, token: str, repository: str, api_url: str) -> None:
+                self.token = token
+                self.repository = repository
+                self.api_url = api_url
+                self.post_review_called = False
+                FakeGitHub.instances.append(self)
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return [
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+                        "additions": 1,
+                        "deletions": 1,
+                    }
+                ]
+
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
+                self._assert_pull_number(pull_number)
+                return "def456" if force_refresh else "abc123"
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual(ref, "abc123")
+                if path == review_service.REVIEWBOT_CONFIG_PATH:
+                    raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+                if path == "Sources/App.swift":
+                    return "let value = new\n"
+                raise AssertionError(f"unexpected file path: {path}")
+
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.post_review_called = True
+                raise AssertionError("stale PR HEAD must skip review post")
+
+            def _assert_pull_number(self, pull_number: int) -> None:
+                if pull_number != 4:
+                    raise AssertionError(f"unexpected pull number: {pull_number}")
+
+        mlx_result = {
+            "summary": "요약",
+            "event": "COMMENT",
+            "positives": [],
+            "must_fix": [],
+            "suggestions": [],
+            "comments": [],
+        }
+
+        with mock.patch("review_runner.review_service.GitHubApi", FakeGitHub):
+            with mock.patch("review_runner.review_service.run_mlx", return_value=mlx_result):
+                with mock.patch(
+                    "review_runner.review_service.maybe_request_copilot_review",
+                    return_value=review_service.build_copilot_review_request_result(
+                        status="skipped",
+                        reviewer="copilot",
+                    ),
+                ):
+                    result = review_service.review_pull_request(
+                        "swift-man/app",
+                        4,
+                        token="token",
+                    )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reviewed_head_sha"], "abc123")
+        self.assertEqual(result["current_head_sha"], "def456")
+        self.assertIn("HEAD changed", result["message"])
         self.assertFalse(FakeGitHub.instances[0].post_review_called)
 
 

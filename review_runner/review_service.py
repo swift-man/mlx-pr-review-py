@@ -1023,9 +1023,9 @@ class GitHubApi:
             timeout=timeout,
         )
 
-    def get_pull_head_sha(self, pull_number: int) -> str:
+    def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
         cached_sha = self._pull_head_sha_cache.get(pull_number)
-        if cached_sha:
+        if cached_sha and not force_refresh:
             return cached_sha
         pull = self.request_json("GET", f"/repos/{self.repository}/pulls/{pull_number}")
         head = pull.get("head") if isinstance(pull, dict) else None
@@ -4720,6 +4720,17 @@ def review_pull_request(
             "skipped_by_reviewbot": file_load_result.skipped_by_reviewbot,
         }
 
+    try:
+        reviewed_head_sha = github.get_pull_head_sha(pull_number)
+    except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+        reviewed_head_sha = ""
+        error_detail = truncate_context(
+            normalize_text(str(exc)),
+            300,
+            suffix="GitHub reviewed head sha lookup error truncated",
+        )
+        log_progress(log_prefix, f"Could not record reviewed PR head sha: {error_detail}")
+
     existing_review_context = load_existing_review_context(github, pull_number, log_prefix=log_prefix)
     copilot_review_request = (
         build_copilot_review_request_result(status="dry_run", reviewer=normalize_copilot_reviewer())
@@ -4739,17 +4750,54 @@ def review_pull_request(
         existing_review_context=existing_review_context,
         log_prefix=log_prefix,
     )
-    try:
-        review_head_sha = github.get_pull_head_sha(pull_number)
-    except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
-        error_detail = truncate_context(
-            normalize_text(str(exc)),
-            300,
-            suffix="GitHub head sha lookup error truncated",
-        )
-        log_progress(log_prefix, f"Could not attach review post identity: {error_detail}")
-    else:
-        artifacts.payload = attach_review_payload_identity(artifacts.payload, review_head_sha)
+    post_head_sha = reviewed_head_sha
+    stale_head_skip: dict[str, Any] | None = None
+    if not dry_run:
+        if reviewed_head_sha:
+            try:
+                current_head_sha = github.get_pull_head_sha(pull_number, force_refresh=True)
+            except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+                error_detail = truncate_context(
+                    normalize_text(str(exc)),
+                    300,
+                    suffix="GitHub current head sha lookup error truncated",
+                )
+                message = f"Could not verify current PR head before review post: {error_detail}"
+                log_progress(log_prefix, message)
+                stale_head_skip = {
+                    "status": "skipped",
+                    "reason": "Could not verify current PR head before posting review.",
+                    "message": message,
+                    "reviewed_head_sha": reviewed_head_sha,
+                }
+            else:
+                if current_head_sha != reviewed_head_sha:
+                    message = (
+                        "PR HEAD changed during review; skipping stale review post "
+                        f"(reviewed={reviewed_head_sha}, current={current_head_sha})"
+                    )
+                    log_progress(log_prefix, message)
+                    stale_head_skip = {
+                        "status": "skipped",
+                        "reason": "PR head changed during review; skipped stale review post.",
+                        "message": message,
+                        "reviewed_head_sha": reviewed_head_sha,
+                        "current_head_sha": current_head_sha,
+                    }
+                else:
+                    post_head_sha = current_head_sha
+        else:
+            try:
+                post_head_sha = github.get_pull_head_sha(pull_number, force_refresh=True)
+            except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+                error_detail = truncate_context(
+                    normalize_text(str(exc)),
+                    300,
+                    suffix="GitHub current head sha lookup error truncated",
+                )
+                log_progress(log_prefix, f"Could not attach review post identity: {error_detail}")
+        if post_head_sha and stale_head_skip is None:
+            artifacts.payload = attach_review_payload_identity(artifacts.payload, post_head_sha)
     result = build_review_result(
         repository,
         pull_number,
@@ -4760,6 +4808,10 @@ def review_pull_request(
     result["existing_review_context_count"] = len(existing_review_context)
     result["repository_context_count"] = len(file_load_result.repository_context)
     result["copilot_review_request"] = copilot_review_request
+
+    if stale_head_skip is not None:
+        result.update(stale_head_skip)
+        return result
 
     if dry_run:
         log_progress(log_prefix, f"Dry run completed in {time.monotonic() - started_at:.1f}s")

@@ -127,6 +127,8 @@ remote backend 요청 body가 `MLX_GENERATE_CLIENT_MAX_BODY_BYTES`를 넘으면 
 POST를 중복 등록하지 않게 건너뜁니다. POST 호출에는 `MLX_REVIEW_POST_API_TIMEOUT_SECONDS` timeout을 적용합니다.
 네트워크 오류는 GitHub가 리뷰를
 이미 생성했지만 응답만 끊긴 상태일 수 있어, 중복 리뷰를 막기 위해 자동 재시도하지 않습니다.
+긴 리뷰 중 PR HEAD가 바뀌면 오래된 코드 기준 리뷰를 남기지 않도록 post 직전 HEAD를 재확인하고
+리뷰 등록을 건너뜁니다.
 401은 GitHub App 토큰 갱신 경로로 처리하고, 422 같은 payload 검증 실패는 기다려도
 회복되지 않으므로 즉시 실패 로그를 남깁니다.
 실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client` 같은 커스텀 커맨드로 바꿔서 테스트할 수 있습니다.
