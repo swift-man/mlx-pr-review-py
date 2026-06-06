@@ -59,10 +59,14 @@ REPOSITORY_CONTEXT_MAX_FILES_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_FILES"
 REPOSITORY_CONTEXT_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_MAX_CHARS"
 REPOSITORY_CONTEXT_FILE_MAX_CHARS_ENV = "MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS"
 REVIEW_CONTEXT_API_TIMEOUT_SECONDS_ENV = "MLX_REVIEW_CONTEXT_API_TIMEOUT_SECONDS"
+REVIEW_POST_RETRY_ATTEMPTS_ENV = "MLX_REVIEW_POST_RETRY_ATTEMPTS"
+REVIEW_POST_RETRY_DELAY_SECONDS_ENV = "MLX_REVIEW_POST_RETRY_DELAY_SECONDS"
 DEFAULT_REPOSITORY_CONTEXT_MAX_FILES = 120
 DEFAULT_REPOSITORY_CONTEXT_MAX_CHARS = 320_000
 DEFAULT_REPOSITORY_CONTEXT_FILE_MAX_CHARS = 18_000
 DEFAULT_REVIEW_CONTEXT_API_TIMEOUT_SECONDS = 20
+DEFAULT_REVIEW_POST_RETRY_ATTEMPTS = 3
+DEFAULT_REVIEW_POST_RETRY_DELAY_SECONDS = 15
 COPILOT_REVIEW_REQUEST_ENV = "COPILOT_REVIEW_REQUEST"
 COPILOT_REVIEWER_ENV = "COPILOT_REVIEWER"
 COPILOT_REVIEW_MONTHLY_BUDGET_ENV = "COPILOT_REVIEW_MONTHLY_BUDGET"
@@ -1874,6 +1878,20 @@ def parse_non_negative_int_env(name: str, default: int) -> int:
     except ValueError:
         return default
     return max(parsed, 0)
+
+
+def configured_review_post_retry_attempts() -> int:
+    return parse_positive_int_env(
+        REVIEW_POST_RETRY_ATTEMPTS_ENV,
+        DEFAULT_REVIEW_POST_RETRY_ATTEMPTS,
+    )
+
+
+def configured_review_post_retry_delay_seconds() -> int:
+    return parse_non_negative_int_env(
+        REVIEW_POST_RETRY_DELAY_SECONDS_ENV,
+        DEFAULT_REVIEW_POST_RETRY_DELAY_SECONDS,
+    )
 
 
 def configured_current_file_context_line_radius() -> int:
@@ -3737,6 +3755,26 @@ def is_bad_credentials_error(error: RuntimeError) -> bool:
     return "bad credentials" in message
 
 
+def is_retryable_review_post_error(error: BaseException) -> bool:
+    """생성 완료 리뷰를 잃지 않기 위해 GitHub post 일시 장애만 재시도 대상으로 본다."""
+    if isinstance(error, GitHubApiError):
+        body = normalize_text(error.response_body).lower()
+        if error.status == 429 or error.status >= 500:
+            return True
+        if error.status == 403 and any(
+            marker in body
+            for marker in (
+                "rate limit",
+                "secondary rate limit",
+                "abuse detection",
+                "too many requests",
+            )
+        ):
+            return True
+        return False
+    return isinstance(error, (urllib.error.URLError, TimeoutError))
+
+
 def refresh_github_app_token_for_review_post(
     github: GitHubApi,
     repository: str,
@@ -4425,9 +4463,8 @@ def post_review_with_fallback(
     refresh_token: Callable[[], bool] | None = None,
     log_prefix: str = "",
 ) -> PostedReviewResult:
-    posted_event = requested_event
-    fallback_note = ""
-    requested_event_after_retry: str | None = None
+    retry_attempts = configured_review_post_retry_attempts()
+    retry_delay_seconds = configured_review_post_retry_delay_seconds()
 
     def post_with_auth_retry(review_payload: dict[str, Any]) -> Any:
         try:
@@ -4458,29 +4495,63 @@ def post_review_with_fallback(
             log_progress(log_prefix, "Refreshed GitHub token after 401 Bad credentials; retrying review post")
             return github.post_review(pull_number, review_payload)
 
-    try:
-        log_progress(log_prefix, f"Posting GitHub review as {requested_event}")
-        response = post_with_auth_retry(payload)
-    except RuntimeError as exc:
-        if not should_retry_review_as_comment(exc, payload):
-            raise
+    def post_once() -> PostedReviewResult:
+        posted_event = requested_event
+        fallback_note = ""
+        requested_event_after_retry: str | None = None
+        review_payload = payload
 
-        retry_payload = dict(payload)
-        retry_payload["event"] = "COMMENT"
-        log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
-        response = post_with_auth_retry(retry_payload)
-        payload = retry_payload
-        posted_event = "COMMENT"
-        requested_event_after_retry = requested_event
-        fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
+        try:
+            log_progress(log_prefix, f"Posting GitHub review as {requested_event}")
+            response = post_with_auth_retry(review_payload)
+        except RuntimeError as exc:
+            if not should_retry_review_as_comment(exc, review_payload):
+                raise
 
-    return PostedReviewResult(
-        response=response,
-        posted_event=posted_event,
-        payload=payload,
-        fallback_note=fallback_note,
-        requested_event=requested_event_after_retry,
-    )
+            retry_payload = dict(review_payload)
+            retry_payload["event"] = "COMMENT"
+            log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
+            response = post_with_auth_retry(retry_payload)
+            review_payload = retry_payload
+            posted_event = "COMMENT"
+            requested_event_after_retry = requested_event
+            fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
+
+        return PostedReviewResult(
+            response=response,
+            posted_event=posted_event,
+            payload=review_payload,
+            fallback_note=fallback_note,
+            requested_event=requested_event_after_retry,
+        )
+
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            return post_once()
+        except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
+            if attempt >= retry_attempts or not is_retryable_review_post_error(exc):
+                raise
+            error_detail = truncate_context(
+                normalize_text(str(exc)),
+                300,
+                suffix="GitHub review post error truncated",
+            )
+            if retry_delay_seconds:
+                log_progress(
+                    log_prefix,
+                    "GitHub review post failed with retryable error "
+                    f"on attempt {attempt}/{retry_attempts}; waiting {retry_delay_seconds}s before retry: "
+                    f"{error_detail}",
+                )
+                time.sleep(retry_delay_seconds)
+            else:
+                log_progress(
+                    log_prefix,
+                    "GitHub review post failed with retryable error "
+                    f"on attempt {attempt}/{retry_attempts}; retrying immediately: {error_detail}",
+                )
+
+    raise RuntimeError("Review post retry loop exited without posting or raising")
 
 
 def review_pull_request(

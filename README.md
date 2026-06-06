@@ -99,6 +99,8 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_REVIEW_REPO_CONTEXT_MAX_CHARS=320000` (옵션, `repository_context` 전체 문자 상한)
 - `MLX_REVIEW_REPO_CONTEXT_FILE_MAX_CHARS=18000` (옵션, `repository_context` 파일별 문자 상한)
 - `MLX_REVIEW_CONTEXT_API_TIMEOUT_SECONDS=20` (옵션, current/repository context 수집용 GitHub contents/tree API 호출 timeout)
+- `MLX_REVIEW_POST_RETRY_ATTEMPTS=3` (옵션, 리뷰 생성 완료 후 GitHub Review API post 일시 장애를 재시도할 총 시도 횟수)
+- `MLX_REVIEW_POST_RETRY_DELAY_SECONDS=15` (옵션, post 재시도 사이 대기 시간. 0이면 즉시 재시도)
 - `MLX_TRUST_REMOTE_CODE=0` (옵션)
 - `COPILOT_REVIEW_BUDGET_FILE=/absolute/path/to/copilot-budget.json` (옵션, Copilot 요청 budget 파일 경로 직접 지정)
 - `COPILOT_REVIEW_API_TIMEOUT_SECONDS=10` (옵션, Copilot reviewer 조회/요청 GitHub API timeout)
@@ -117,6 +119,10 @@ GitHub App으로 인증하면 리뷰 작성자가 개인 계정이 아니라 App
 remote backend 요청 body가 `MLX_GENERATE_CLIENT_MAX_BODY_BYTES`를 넘으면 큰 diff를 전송하다
 `Broken pipe`로 실패하기 전에 명확한 오류를 남깁니다. 큰 PR은 대상 저장소의 `.reviewbot.yml`
 또는 내장 generated-file 필터로 빌드 산출물과 생성 문서를 제외하는 쪽을 우선합니다.
+리뷰 생성이 끝난 뒤 GitHub Review API가 5xx, 429, secondary rate limit, 네트워크 오류처럼
+일시적인 post 실패를 반환하면 `MLX_REVIEW_POST_RETRY_ATTEMPTS`와
+`MLX_REVIEW_POST_RETRY_DELAY_SECONDS` 기준으로 대기 후 재시도합니다. 401은 GitHub App 토큰
+갱신 경로로 처리하고, 422 같은 payload 검증 실패는 기다려도 회복되지 않으므로 즉시 실패 로그를 남깁니다.
 실제 GitHub Review API 연동만 검증할 때는 `review_runner.mock_review_client` 같은 커스텀 커맨드로 바꿔서 테스트할 수 있습니다.
 
 Copilot과 함께 리뷰하려면 먼저 GitHub PR에서 Copilot 리뷰어를 요청한 뒤 이 봇을 실행하면 됩니다.

@@ -2326,6 +2326,82 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             "\n".join(logs),
         )
 
+    def test_post_review_with_fallback_waits_and_retries_transient_post_error(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise review_service.GitHubApiError(
+                        method="POST",
+                        url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                        status=502,
+                        response_body='{"message":"Bad Gateway"}',
+                    )
+                return {"id": 321, "pull_number": pull_number, "event": body["event"]}
+
+        github = FakeGitHub()
+        logs: list[str] = []
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "2",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with mock.patch(
+                "review_runner.review_service.log_progress",
+                side_effect=lambda _prefix, message: logs.append(message),
+            ):
+                posted = review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.calls, 2)
+        self.assertEqual(posted.response["id"], 321)
+        self.assertIn("retrying immediately", "\n".join(logs))
+
+    def test_post_review_with_fallback_does_not_wait_on_non_retryable_post_error(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any]) -> dict[str, Any]:
+                self.calls += 1
+                raise review_service.GitHubApiError(
+                    method="POST",
+                    url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                    status=422,
+                    response_body='{"message":"Validation Failed"}',
+                )
+
+        github = FakeGitHub()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "3",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(review_service.GitHubApiError):
+                review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.calls, 1)
+
     def test_review_pull_request_refreshes_github_app_token_before_posting(self) -> None:
         case = self
 
