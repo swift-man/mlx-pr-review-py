@@ -2374,6 +2374,57 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(posted.response["id"], 321)
         self.assertIn("retrying immediately", "\n".join(logs))
 
+    def test_post_review_with_fallback_skips_duplicate_retry_when_same_review_exists(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.post_calls = 0
+                self.list_calls = 0
+                self.list_timeouts: list[float | None] = []
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.post_calls += 1
+                raise review_service.GitHubApiError(
+                    method="POST",
+                    url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                    status=502,
+                    response_body='{"message":"Bad Gateway"}',
+                )
+
+            def list_reviews(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
+                self.list_calls += 1
+                self.list_timeouts.append(timeout)
+                return [{"id": 654, "body": "ok", "state": "APPROVED"}]
+
+        github = FakeGitHub()
+        logs: list[str] = []
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_API_TIMEOUT_SECONDS_ENV: "7",
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "3",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with mock.patch(
+                "review_runner.review_service.log_progress",
+                side_effect=lambda _prefix, message: logs.append(message),
+            ):
+                posted = review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                )
+
+        self.assertEqual(github.post_calls, 1)
+        self.assertEqual(github.list_calls, 1)
+        self.assertEqual(github.list_timeouts, [7])
+        self.assertEqual(posted.response["id"], 654)
+        self.assertIn("중복 POST", posted.fallback_note)
+        self.assertIn("skipping duplicate review post", "\n".join(logs))
+
     def test_post_review_with_fallback_does_not_wait_on_non_retryable_post_error(self) -> None:
         class FakeGitHub:
             def __init__(self) -> None:

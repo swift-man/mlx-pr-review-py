@@ -122,8 +122,10 @@ remote backend 요청 body가 `MLX_GENERATE_CLIENT_MAX_BODY_BYTES`를 넘으면 
 또는 내장 generated-file 필터로 빌드 산출물과 생성 문서를 제외하는 쪽을 우선합니다.
 리뷰 생성이 끝난 뒤 GitHub Review API가 5xx, 429, secondary rate limit처럼 명시적인
 일시 post 실패를 반환하면 `MLX_REVIEW_POST_RETRY_ATTEMPTS`와
-`MLX_REVIEW_POST_RETRY_DELAY_SECONDS` 기준으로 대기 후 재시도합니다. POST 호출에는
-`MLX_REVIEW_POST_API_TIMEOUT_SECONDS` timeout을 적용합니다. 네트워크 오류는 GitHub가 리뷰를
+`MLX_REVIEW_POST_RETRY_DELAY_SECONDS` 기준으로 대기 후 재시도합니다. 재시도 전에는
+같은 body/state의 리뷰가 이미 등록됐는지 조회해, 응답만 실패한 POST를 중복 등록하지 않게
+건너뜁니다. POST 호출에는 `MLX_REVIEW_POST_API_TIMEOUT_SECONDS` timeout을 적용합니다.
+네트워크 오류는 GitHub가 리뷰를
 이미 생성했지만 응답만 끊긴 상태일 수 있어, 중복 리뷰를 막기 위해 자동 재시도하지 않습니다.
 401은 GitHub App 토큰 갱신 경로로 처리하고, 422 같은 payload 검증 실패는 기다려도
 회복되지 않으므로 즉시 실패 로그를 남깁니다.

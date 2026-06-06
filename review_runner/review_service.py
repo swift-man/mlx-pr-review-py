@@ -980,6 +980,24 @@ class GitHubApi:
             page += 1
         return comments
 
+    def list_reviews(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
+        reviews: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = self.request_json(
+                "GET",
+                f"/repos/{self.repository}/pulls/{pull_number}/reviews",
+                params={"per_page": 100, "page": page},
+                timeout=timeout,
+            )
+            if not batch:
+                break
+            reviews.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return reviews
+
     def list_requested_reviewers(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
         response = self.request_json(
             "GET",
@@ -3805,6 +3823,42 @@ def refresh_github_app_token_for_review_post(
     return True
 
 
+def find_existing_review_with_same_body(
+    github: GitHubApi,
+    pull_number: int,
+    payload: dict[str, Any],
+    *,
+    timeout: float | None = None,
+    log_prefix: str = "",
+) -> dict[str, Any] | None:
+    """POST 응답만 실패한 경우를 대비해 같은 본문의 리뷰가 이미 등록됐는지 확인한다."""
+    body = normalize_text(payload.get("body"))
+    if not body:
+        return None
+    expected_state = {
+        "APPROVE": "APPROVED",
+        "COMMENT": "COMMENTED",
+        "REQUEST_CHANGES": "CHANGES_REQUESTED",
+    }.get(normalize_text(payload.get("event")))
+    try:
+        reviews = github.list_reviews(pull_number, timeout=timeout)
+    except (AttributeError, RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+        error_detail = truncate_context(
+            normalize_text(str(exc)),
+            300,
+            suffix="GitHub existing review lookup error truncated",
+        )
+        log_progress(log_prefix, f"Could not check existing reviews before retry: {error_detail}")
+        return None
+    for review in reviews:
+        if not isinstance(review, dict) or normalize_text(review.get("body")) != body:
+            continue
+        review_state = normalize_text(review.get("state")).upper()
+        if expected_state is None or not review_state or review_state == expected_state:
+            return review
+    return None
+
+
 def build_review_result(
     repository: str,
     pull_number: int,
@@ -4478,6 +4532,10 @@ def post_review_with_fallback(
     retry_attempts = configured_review_post_retry_attempts()
     post_timeout_seconds = configured_review_post_api_timeout_seconds()
     retry_delay_seconds = configured_review_post_retry_delay_seconds()
+    active_payload = payload
+    posted_event = requested_event
+    fallback_note = ""
+    requested_event_after_retry: str | None = None
 
     def post_with_auth_retry(review_payload: dict[str, Any]) -> Any:
         try:
@@ -4508,42 +4566,51 @@ def post_review_with_fallback(
             log_progress(log_prefix, "Refreshed GitHub token after 401 Bad credentials; retrying review post")
             return github.post_review(pull_number, review_payload, timeout=post_timeout_seconds)
 
-    def post_once() -> PostedReviewResult:
-        posted_event = requested_event
-        fallback_note = ""
-        requested_event_after_retry: str | None = None
-        review_payload = payload
-
-        try:
-            log_progress(log_prefix, f"Posting GitHub review as {requested_event}")
-            response = post_with_auth_retry(review_payload)
-        except RuntimeError as exc:
-            if not should_retry_review_as_comment(exc, review_payload):
-                raise
-
-            retry_payload = dict(review_payload)
-            retry_payload["event"] = "COMMENT"
-            log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
-            response = post_with_auth_retry(retry_payload)
-            review_payload = retry_payload
-            posted_event = "COMMENT"
-            requested_event_after_retry = requested_event
-            fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
-
+    def build_posted_result(response: Any) -> PostedReviewResult:
         return PostedReviewResult(
             response=response,
             posted_event=posted_event,
-            payload=review_payload,
+            payload=active_payload,
             fallback_note=fallback_note,
             requested_event=requested_event_after_retry,
         )
 
     for attempt in range(1, retry_attempts + 1):
         try:
-            return post_once()
+            log_progress(log_prefix, f"Posting GitHub review as {active_payload.get('event', requested_event)}")
+            response = post_with_auth_retry(active_payload)
+            return build_posted_result(response)
         except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
+            if should_retry_review_as_comment(exc, active_payload):
+                active_payload = dict(active_payload)
+                active_payload["event"] = "COMMENT"
+                posted_event = "COMMENT"
+                requested_event_after_retry = requested_event
+                fallback_note = "본인 PR에는 REQUEST_CHANGES를 남길 수 없어 COMMENT로 다시 등록했습니다."
+                log_progress(log_prefix, "Retrying review post as COMMENT because REQUEST_CHANGES was rejected")
+                try:
+                    response = post_with_auth_retry(active_payload)
+                    return build_posted_result(response)
+                except (RuntimeError, urllib.error.URLError, TimeoutError) as retry_exc:
+                    exc = retry_exc
             if attempt >= retry_attempts or not is_retryable_review_post_error(exc):
                 raise
+            existing_review = find_existing_review_with_same_body(
+                github,
+                pull_number,
+                active_payload,
+                timeout=post_timeout_seconds,
+                log_prefix=log_prefix,
+            )
+            if existing_review is not None:
+                fallback_note = (
+                    "같은 본문의 리뷰가 이미 등록되어 GitHub Review API 중복 POST를 건너뛰었습니다."
+                )
+                log_progress(
+                    log_prefix,
+                    f"Found existing GitHub review id={existing_review.get('id')}; skipping duplicate review post",
+                )
+                return build_posted_result(existing_review)
             error_detail = truncate_context(
                 normalize_text(str(exc)),
                 300,
