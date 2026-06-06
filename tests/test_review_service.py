@@ -2393,10 +2393,21 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             def list_reviews(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
                 self.list_calls += 1
                 self.list_timeouts.append(timeout)
-                return [{"id": 654, "body": "ok", "state": "APPROVED"}]
+                return [
+                    {
+                        "id": 654,
+                        "body": payload["body"],
+                        "state": "APPROVED",
+                        "commit_id": "abc123",
+                    }
+                ]
 
         github = FakeGitHub()
         logs: list[str] = []
+        payload = review_service.attach_review_payload_identity(
+            {"body": "ok", "event": "APPROVE", "comments": []},
+            "abc123",
+        )
 
         with mock.patch.dict(
             os.environ,
@@ -2414,7 +2425,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 posted = review_service.post_review_with_fallback(
                     github,  # type: ignore[arg-type]
                     4,
-                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    payload=payload,
                     requested_event="APPROVE",
                 )
 
@@ -2424,6 +2435,48 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(posted.response["id"], 654)
         self.assertIn("중복 POST", posted.fallback_note)
         self.assertIn("skipping duplicate review post", "\n".join(logs))
+
+    def test_post_review_with_fallback_does_not_skip_duplicate_without_payload_identity(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.post_calls = 0
+                self.list_calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.post_calls += 1
+                if self.post_calls == 1:
+                    raise review_service.GitHubApiError(
+                        method="POST",
+                        url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                        status=502,
+                        response_body='{"message":"Bad Gateway"}',
+                    )
+                return {"id": 655, "pull_number": pull_number, "event": body["event"]}
+
+            def list_reviews(self, pull_number: int, *, timeout: float | None = None) -> list[dict[str, Any]]:
+                self.list_calls += 1
+                return [{"id": 654, "body": "ok", "state": "APPROVED", "commit_id": "abc123"}]
+
+        github = FakeGitHub()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "2",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            posted = review_service.post_review_with_fallback(
+                github,  # type: ignore[arg-type]
+                4,
+                payload={"body": "ok", "event": "APPROVE", "comments": []},
+                requested_event="APPROVE",
+            )
+
+        self.assertEqual(github.post_calls, 2)
+        self.assertEqual(github.list_calls, 0)
+        self.assertEqual(posted.response["id"], 655)
 
     def test_post_review_with_fallback_does_not_wait_on_non_retryable_post_error(self) -> None:
         class FakeGitHub:
@@ -2569,6 +2622,11 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
                 self._assert_pull_number(pull_number)
                 case.assertEqual(self.token, "fresh-token")
+                case.assertEqual(body["commit_id"], "abc123")
+                case.assertRegex(
+                    body["body"],
+                    r"<!-- mlx-review-payload-fingerprint:[a-f0-9]{24} -->$",
+                )
                 return {"id": 456}
 
             def _assert_pull_number(self, pull_number: int) -> None:
@@ -4183,6 +4241,47 @@ class ExtractModelNameFromResultTests(unittest.TestCase):
 
 
 class BuildReviewPayloadTests(unittest.TestCase):
+    def test_review_payload_identity_changes_when_line_comments_change(self) -> None:
+        first_payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[
+                review_service.ReviewComment(
+                    path="Sources/App.swift",
+                    line=10,
+                    body="Problem: A. Why it matters: B. Suggested fix: C. Confidence: High",
+                    confidence=0.95,
+                )
+            ],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+        )
+        second_payload = review_service.build_review_payload(
+            summary="요약",
+            event="COMMENT",
+            comments=[
+                review_service.ReviewComment(
+                    path="Sources/App.swift",
+                    line=11,
+                    body="Problem: A. Why it matters: B. Suggested fix: C. Confidence: High",
+                    confidence=0.95,
+                )
+            ],
+            positives=[],
+            must_fix=[],
+            suggestions=[],
+        )
+
+        first_identified = review_service.attach_review_payload_identity(first_payload, "abc123")
+        second_identified = review_service.attach_review_payload_identity(second_payload, "abc123")
+
+        self.assertEqual(first_identified["commit_id"], "abc123")
+        self.assertNotEqual(
+            review_service.extract_review_payload_fingerprint(first_identified["body"]),
+            review_service.extract_review_payload_fingerprint(second_identified["body"]),
+        )
+
     def test_body_separates_mlx_and_copilot_review_sections(self) -> None:
         payload = review_service.build_review_payload(
             summary="요약",

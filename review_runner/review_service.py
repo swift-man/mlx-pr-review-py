@@ -8,6 +8,7 @@ import binascii
 import calendar
 import contextlib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -198,6 +199,9 @@ SECRET_LOG_RE = re.compile(r"\b(token|secret|password|passwd|api[_-]?key|authori
 LOG_CALL_RE = re.compile(r"\b(print|logging\.\w+|logger\.\w+)\s*\(")
 DIFF_STAT_RE = re.compile(r"\d+\s*개\s*(?:추가|삭제|변경)")
 HUNK_HEADER_RE = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+(?P<start>\d+)(?:,(?P<length>\d+))?\s+@@")
+REVIEW_PAYLOAD_FINGERPRINT_RE = re.compile(
+    r"\n*<!--\s*mlx-review-payload-fingerprint:(?P<fingerprint>[a-f0-9]{24,64})\s*-->\s*$"
+)
 PROMPT_ECHO_MARKERS = (
     "review_runner/",
     "valid_comment_lines",
@@ -3766,6 +3770,54 @@ def build_review_payload(
     }
 
 
+def strip_review_payload_fingerprint(body: Any) -> str:
+    if not isinstance(body, str):
+        return ""
+    return REVIEW_PAYLOAD_FINGERPRINT_RE.sub("", body).rstrip()
+
+
+def extract_review_payload_fingerprint(body: Any) -> str:
+    if not isinstance(body, str):
+        return ""
+    match = REVIEW_PAYLOAD_FINGERPRINT_RE.search(body)
+    return match.group("fingerprint") if match else ""
+
+
+def review_payload_fingerprint(payload: dict[str, Any], head_sha: str) -> str:
+    comments = payload.get("comments")
+    raw_comments = comments if isinstance(comments, list) else []
+    normalized_comments = [
+        {
+            "path": normalize_text(comment.get("path")),
+            "line": comment.get("line") if isinstance(comment.get("line"), int) else None,
+            "side": normalize_text(comment.get("side")),
+            "body": normalize_text(comment.get("body")),
+        }
+        for comment in raw_comments
+        if isinstance(comment, dict)
+    ]
+    identity = {
+        "head_sha": normalize_text(head_sha),
+        "event": normalize_text(payload.get("event")),
+        "body": strip_review_payload_fingerprint(payload.get("body")),
+        "comments": normalized_comments,
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def attach_review_payload_identity(payload: dict[str, Any], head_sha: str) -> dict[str, Any]:
+    normalized_head_sha = normalize_text(head_sha)
+    if not normalized_head_sha:
+        return payload
+    review_payload = dict(payload)
+    review_payload["commit_id"] = normalized_head_sha
+    body = strip_review_payload_fingerprint(review_payload.get("body"))
+    fingerprint = review_payload_fingerprint(review_payload, normalized_head_sha)
+    review_payload["body"] = f"{body}\n\n<!-- mlx-review-payload-fingerprint:{fingerprint} -->"
+    return review_payload
+
+
 def should_retry_review_as_comment(error: RuntimeError, payload: dict[str, Any]) -> bool:
     """자기 PR에 REQUEST_CHANGES를 달 수 없는 경우만 안전하게 재시도한다."""
     if payload.get("event") != "REQUEST_CHANGES":
@@ -3823,7 +3875,7 @@ def refresh_github_app_token_for_review_post(
     return True
 
 
-def find_existing_review_with_same_body(
+def find_existing_review_with_same_identity(
     github: GitHubApi,
     pull_number: int,
     payload: dict[str, Any],
@@ -3831,9 +3883,10 @@ def find_existing_review_with_same_body(
     timeout: float | None = None,
     log_prefix: str = "",
 ) -> dict[str, Any] | None:
-    """POST 응답만 실패한 경우를 대비해 같은 본문의 리뷰가 이미 등록됐는지 확인한다."""
-    body = normalize_text(payload.get("body"))
-    if not body:
+    """POST 응답만 실패한 경우를 대비해 같은 payload 리뷰가 이미 등록됐는지 확인한다."""
+    expected_fingerprint = extract_review_payload_fingerprint(payload.get("body"))
+    expected_commit_id = normalize_text(payload.get("commit_id"))
+    if not expected_fingerprint or not expected_commit_id:
         return None
     expected_state = {
         "APPROVE": "APPROVED",
@@ -3851,7 +3904,11 @@ def find_existing_review_with_same_body(
         log_progress(log_prefix, f"Could not check existing reviews before retry: {error_detail}")
         return None
     for review in reviews:
-        if not isinstance(review, dict) or normalize_text(review.get("body")) != body:
+        if not isinstance(review, dict):
+            continue
+        if extract_review_payload_fingerprint(review.get("body")) != expected_fingerprint:
+            continue
+        if normalize_text(review.get("commit_id")) != expected_commit_id:
             continue
         review_state = normalize_text(review.get("state")).upper()
         if expected_state is None or not review_state or review_state == expected_state:
@@ -4595,7 +4652,7 @@ def post_review_with_fallback(
                     exc = retry_exc
             if attempt >= retry_attempts or not is_retryable_review_post_error(exc):
                 raise
-            existing_review = find_existing_review_with_same_body(
+            existing_review = find_existing_review_with_same_identity(
                 github,
                 pull_number,
                 active_payload,
@@ -4682,6 +4739,17 @@ def review_pull_request(
         existing_review_context=existing_review_context,
         log_prefix=log_prefix,
     )
+    try:
+        review_head_sha = github.get_pull_head_sha(pull_number)
+    except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
+        error_detail = truncate_context(
+            normalize_text(str(exc)),
+            300,
+            suffix="GitHub head sha lookup error truncated",
+        )
+        log_progress(log_prefix, f"Could not attach review post identity: {error_detail}")
+    else:
+        artifacts.payload = attach_review_payload_identity(artifacts.payload, review_head_sha)
     result = build_review_result(
         repository,
         pull_number,
