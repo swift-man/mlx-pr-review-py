@@ -4750,12 +4750,56 @@ def review_pull_request(
         existing_review_context=existing_review_context,
         log_prefix=log_prefix,
     )
+    review_post_token_refreshed = False
+
+    def refresh_review_post_token() -> bool:
+        nonlocal review_post_token_refreshed
+        refreshed = refresh_github_app_token_for_review_post(
+            github,
+            repository,
+            api_url,
+            auth_source,
+            log_prefix=log_prefix,
+        )
+        if refreshed:
+            review_post_token_refreshed = True
+        return refreshed
+
+    def get_pull_head_sha_for_review_post(*, force_refresh: bool) -> str:
+        try:
+            return github.get_pull_head_sha(pull_number, force_refresh=force_refresh)
+        except RuntimeError as exc:
+            if not is_bad_credentials_error(exc):
+                raise
+            try:
+                refreshed = refresh_review_post_token()
+            except (RuntimeError, OSError) as refresh_exc:
+                error_detail = truncate_context(
+                    normalize_text(str(refresh_exc)),
+                    300,
+                    suffix="github token refresh error truncated",
+                )
+                log_progress(
+                    log_prefix,
+                    "GitHub token refresh after PR head 401 Bad credentials failed "
+                    f"({type(refresh_exc).__name__}): {error_detail}",
+                )
+                raise
+            if not refreshed:
+                log_progress(
+                    log_prefix,
+                    "PR head verification hit 401 Bad credentials, but GitHub token refresh was unavailable",
+                )
+                raise
+            log_progress(log_prefix, "Refreshed GitHub token after 401 Bad credentials; retrying PR head verification")
+            return github.get_pull_head_sha(pull_number, force_refresh=force_refresh)
+
     post_head_sha = reviewed_head_sha
     stale_head_skip: dict[str, Any] | None = None
     if not dry_run:
         if reviewed_head_sha:
             try:
-                current_head_sha = github.get_pull_head_sha(pull_number, force_refresh=True)
+                current_head_sha = get_pull_head_sha_for_review_post(force_refresh=True)
             except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
                 error_detail = truncate_context(
                     normalize_text(str(exc)),
@@ -4788,7 +4832,7 @@ def review_pull_request(
                     post_head_sha = current_head_sha
         else:
             try:
-                post_head_sha = github.get_pull_head_sha(pull_number, force_refresh=True)
+                post_head_sha = get_pull_head_sha_for_review_post(force_refresh=True)
             except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
                 error_detail = truncate_context(
                     normalize_text(str(exc)),
@@ -4817,28 +4861,20 @@ def review_pull_request(
         log_progress(log_prefix, f"Dry run completed in {time.monotonic() - started_at:.1f}s")
         return result
 
-    def refresh_review_post_token() -> bool:
-        return refresh_github_app_token_for_review_post(
-            github,
-            repository,
-            api_url,
-            auth_source,
-            log_prefix=log_prefix,
-        )
-
-    try:
-        refresh_review_post_token()
-    except (RuntimeError, OSError) as exc:
-        error_detail = truncate_context(
-            normalize_text(str(exc)),
-            300,
-            suffix="github token refresh error truncated",
-        )
-        log_progress(
-            log_prefix,
-            "Could not refresh GitHub token before review post; posting with existing token "
-            f"and will retry on 401 ({type(exc).__name__}): {error_detail}",
-        )
+    if not review_post_token_refreshed:
+        try:
+            refresh_review_post_token()
+        except (RuntimeError, OSError) as exc:
+            error_detail = truncate_context(
+                normalize_text(str(exc)),
+                300,
+                suffix="github token refresh error truncated",
+            )
+            log_progress(
+                log_prefix,
+                "Could not refresh GitHub token before review post; posting with existing token "
+                f"and will retry on 401 ({type(exc).__name__}): {error_detail}",
+            )
     posted = post_review_with_fallback(
         github,
         pull_number,
