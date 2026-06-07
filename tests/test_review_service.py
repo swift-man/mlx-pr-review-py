@@ -2685,6 +2685,115 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(result["review_id"], 456)
         resolve.assert_called_once_with(repository="swift-man/app", api_url=review_service.DEFAULT_API_URL)
 
+    def test_review_pull_request_refreshes_token_when_head_verification_gets_bad_credentials(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            instances: list["FakeGitHub"] = []
+
+            def __init__(self, token: str, repository: str, api_url: str) -> None:
+                self.token = token
+                self.repository = repository
+                self.api_url = api_url
+                self.post_review_calls = 0
+                self.force_head_calls = 0
+                FakeGitHub.instances.append(self)
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return [
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+                        "additions": 1,
+                        "deletions": 1,
+                    }
+                ]
+
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
+                self._assert_pull_number(pull_number)
+                if not force_refresh:
+                    return "abc123"
+                self.force_head_calls += 1
+                if self.token == "stale-token":
+                    raise review_service.GitHubApiError(
+                        method="GET",
+                        url="https://api.github.com/repos/swift-man/app/pulls/4",
+                        status=401,
+                        response_body='{"message":"Bad credentials"}',
+                    )
+                case.assertEqual(self.token, "fresh-token")
+                return "abc123"
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual(ref, "abc123")
+                if path == review_service.REVIEWBOT_CONFIG_PATH:
+                    raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+                if path == "Sources/App.swift":
+                    return "let value = new\n"
+                raise AssertionError(f"unexpected file path: {path}")
+
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self._assert_pull_number(pull_number)
+                self.post_review_calls += 1
+                case.assertEqual(self.token, "fresh-token")
+                case.assertEqual(body["commit_id"], "abc123")
+                case.assertRegex(
+                    body["body"],
+                    r"<!-- mlx-review-payload-fingerprint:[a-f0-9]{24} -->$",
+                )
+                return {"id": 654}
+
+            def _assert_pull_number(self, pull_number: int) -> None:
+                if pull_number != 4:
+                    raise AssertionError(f"unexpected pull number: {pull_number}")
+
+        mlx_result = {
+            "summary": "요약",
+            "event": "COMMENT",
+            "positives": [],
+            "must_fix": [],
+            "suggestions": [],
+            "comments": [],
+        }
+        fresh_auth = review_service.ResolvedGitHubToken(
+            token="fresh-token",
+            source="github_app_installation",
+            installation_id=123,
+        )
+
+        with mock.patch("review_runner.review_service.GitHubApi", FakeGitHub):
+            with mock.patch("review_runner.review_service.run_mlx", return_value=mlx_result):
+                with mock.patch(
+                    "review_runner.review_service.maybe_request_copilot_review",
+                    return_value=review_service.build_copilot_review_request_result(
+                        status="skipped",
+                        reviewer="copilot",
+                    ),
+                ):
+                    with mock.patch("review_runner.review_service.resolve_github_token", return_value=fresh_auth) as resolve:
+                        result = review_service.review_pull_request(
+                            "swift-man/app",
+                            4,
+                            token="stale-token",
+                            auth_source="github_app_installation",
+                        )
+
+        github = FakeGitHub.instances[0]
+        self.assertEqual(result["review_id"], 654)
+        self.assertEqual(github.force_head_calls, 2)
+        self.assertEqual(github.post_review_calls, 1)
+        resolve.assert_called_once_with(repository="swift-man/app", api_url=review_service.DEFAULT_API_URL)
+
     def test_review_pull_request_retries_401_when_pre_post_token_refresh_fails(self) -> None:
         case = self
 
