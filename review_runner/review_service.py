@@ -4832,6 +4832,10 @@ def review_pull_request(
         )
     except ReviewSupersededError as exc:
         return superseded_result(exc)
+    try:
+        ensure_review_still_latest("review post")
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
     review_post_token_refreshed = False
 
     def refresh_review_post_token() -> bool:

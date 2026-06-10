@@ -9,7 +9,7 @@ import time
 import types
 import unittest
 from contextlib import redirect_stdout
-from typing import Any
+from typing import Any, Callable
 from unittest import mock
 
 if "certifi" not in sys.modules:
@@ -2667,6 +2667,105 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(result["status"], "skipped")
         self.assertEqual(result["reason"], "Superseded by newer PR delivery; skipped stale review work.")
         self.assertEqual(result["stage"], "file loading")
+
+    def test_review_pull_request_skips_superseded_delivery_before_posting(self) -> None:
+        case = self
+
+        class FakeGitHub:
+            instances: list["FakeGitHub"] = []
+
+            def __init__(self, token: str, repository: str, api_url: str) -> None:
+                self.token = token
+                self.repository = repository
+                self.api_url = api_url
+                self.post_review_called = False
+                FakeGitHub.instances.append(self)
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return [
+                    {
+                        "filename": "Sources/App.swift",
+                        "status": "modified",
+                        "patch": "@@ -1,1 +1,1 @@\n-let value = old\n+let value = new\n",
+                        "additions": 1,
+                        "deletions": 1,
+                    }
+                ]
+
+            def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
+                self._assert_pull_number(pull_number)
+                return "abc123"
+
+            def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
+                case.assertEqual(ref, "abc123")
+                if path == review_service.REVIEWBOT_CONFIG_PATH:
+                    raise RuntimeError("GitHub API GET /contents/.reviewbot.yml failed: 404 Not Found")
+                if path == "Sources/App.swift":
+                    return "let value = new\n"
+                raise AssertionError(f"unexpected file path: {path}")
+
+            def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def list_issue_comments(self, pull_number: int) -> list[dict[str, Any]]:
+                self._assert_pull_number(pull_number)
+                return []
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.post_review_called = True
+                raise AssertionError("superseded delivery must not post a GitHub review")
+
+            def _assert_pull_number(self, pull_number: int) -> None:
+                if pull_number != 4:
+                    raise AssertionError(f"unexpected pull number: {pull_number}")
+
+        mlx_result = {
+            "summary": "요약",
+            "event": "COMMENT",
+            "positives": [],
+            "must_fix": [],
+            "suggestions": [],
+            "comments": [],
+        }
+        continue_checks = {"count": 0}
+
+        def should_continue() -> bool:
+            continue_checks["count"] += 1
+            return continue_checks["count"] <= 6
+
+        def fake_run_mlx(
+            prompt: str,
+            *,
+            log_prefix: str = "",
+            before_model_run: Callable[[], None] | None = None,
+        ) -> dict[str, Any]:
+            if before_model_run is not None:
+                before_model_run()
+            return mlx_result
+
+        with mock.patch("review_runner.review_service.GitHubApi", FakeGitHub):
+            with mock.patch("review_runner.review_service.run_mlx", side_effect=fake_run_mlx):
+                with mock.patch(
+                    "review_runner.review_service.maybe_request_copilot_review",
+                    return_value=review_service.build_copilot_review_request_result(
+                        status="skipped",
+                        reviewer="copilot",
+                    ),
+                ):
+                    result = review_service.review_pull_request(
+                        "swift-man/app",
+                        4,
+                        token="token",
+                        should_continue=should_continue,
+                    )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "Superseded by newer PR delivery; skipped stale review work.")
+        self.assertEqual(result["stage"], "review post")
+        self.assertEqual(continue_checks["count"], 7)
+        self.assertFalse(FakeGitHub.instances[0].post_review_called)
 
     def test_review_pull_request_refreshes_github_app_token_before_posting(self) -> None:
         case = self
