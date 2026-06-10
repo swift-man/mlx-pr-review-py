@@ -2445,6 +2445,54 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(posted.response["id"], 321)
         self.assertIn("retrying immediately", "\n".join(logs))
 
+    def test_post_review_with_fallback_checks_before_each_post_attempt(self) -> None:
+        class FakeGitHub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def post_review(self, pull_number: int, body: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise review_service.GitHubApiError(
+                        method="POST",
+                        url="https://api.github.com/repos/swift-man/app/pulls/4/reviews",
+                        status=502,
+                        response_body='{"message":"Bad Gateway"}',
+                    )
+                raise AssertionError("superseded retry must not post a GitHub review")
+
+        github = FakeGitHub()
+        before_post_calls = 0
+
+        def before_post() -> None:
+            nonlocal before_post_calls
+            before_post_calls += 1
+            if before_post_calls == 2:
+                raise review_service.ReviewSupersededError(
+                    stage="review post",
+                    message="Review superseded before retry",
+                )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                review_service.REVIEW_POST_RETRY_ATTEMPTS_ENV: "2",
+                review_service.REVIEW_POST_RETRY_DELAY_SECONDS_ENV: "0",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(review_service.ReviewSupersededError):
+                review_service.post_review_with_fallback(
+                    github,  # type: ignore[arg-type]
+                    4,
+                    payload={"body": "ok", "event": "APPROVE", "comments": []},
+                    requested_event="APPROVE",
+                    before_post=before_post,
+                )
+
+        self.assertEqual(before_post_calls, 2)
+        self.assertEqual(github.calls, 1)
+
     def test_post_review_with_fallback_skips_duplicate_retry_when_same_review_exists(self) -> None:
         class FakeGitHub:
             def __init__(self) -> None:
@@ -2679,6 +2727,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 self.repository = repository
                 self.api_url = api_url
                 self.post_review_called = False
+                self.force_head_verified = False
                 FakeGitHub.instances.append(self)
 
             def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
@@ -2695,6 +2744,9 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
 
             def get_pull_head_sha(self, pull_number: int, *, force_refresh: bool = False) -> str:
                 self._assert_pull_number(pull_number)
+                if force_refresh:
+                    self.force_head_verified = True
+                    latest_state["latest"] = False
                 return "abc123"
 
             def get_file_text(self, path: str, *, ref: str, timeout=None) -> str:
@@ -2729,11 +2781,10 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
             "suggestions": [],
             "comments": [],
         }
-        continue_checks = {"count": 0}
+        latest_state = {"latest": True}
 
         def should_continue() -> bool:
-            continue_checks["count"] += 1
-            return continue_checks["count"] <= 6
+            return latest_state["latest"]
 
         def fake_run_mlx(
             prompt: str,
@@ -2764,7 +2815,7 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
         self.assertEqual(result["status"], "skipped")
         self.assertEqual(result["reason"], "Superseded by newer PR delivery; skipped stale review work.")
         self.assertEqual(result["stage"], "review post")
-        self.assertEqual(continue_checks["count"], 7)
+        self.assertTrue(FakeGitHub.instances[0].force_head_verified)
         self.assertFalse(FakeGitHub.instances[0].post_review_called)
 
     def test_review_pull_request_refreshes_github_app_token_before_posting(self) -> None:

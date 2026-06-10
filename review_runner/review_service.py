@@ -4623,6 +4623,7 @@ def post_review_with_fallback(
     payload: dict[str, Any],
     requested_event: str,
     refresh_token: Callable[[], bool] | None = None,
+    before_post: Callable[[], None] | None = None,
     log_prefix: str = "",
 ) -> PostedReviewResult:
     retry_attempts = configured_review_post_retry_attempts()
@@ -4633,9 +4634,16 @@ def post_review_with_fallback(
     fallback_note = ""
     requested_event_after_retry: str | None = None
 
+    def run_before_post() -> None:
+        if before_post is not None:
+            before_post()
+
     def post_with_auth_retry(review_payload: dict[str, Any]) -> Any:
         try:
+            run_before_post()
             return github.post_review(pull_number, review_payload, timeout=post_timeout_seconds)
+        except ReviewSupersededError:
+            raise
         except RuntimeError as exc:
             if refresh_token is None or not is_bad_credentials_error(exc):
                 raise
@@ -4660,6 +4668,7 @@ def post_review_with_fallback(
                 )
                 raise
             log_progress(log_prefix, "Refreshed GitHub token after 401 Bad credentials; retrying review post")
+            run_before_post()
             return github.post_review(pull_number, review_payload, timeout=post_timeout_seconds)
 
     def build_posted_result(response: Any) -> PostedReviewResult:
@@ -4676,6 +4685,8 @@ def post_review_with_fallback(
             log_progress(log_prefix, f"Posting GitHub review as {active_payload.get('event', requested_event)}")
             response = post_with_auth_retry(active_payload)
             return build_posted_result(response)
+        except ReviewSupersededError:
+            raise
         except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
             if should_retry_review_as_comment(exc, active_payload):
                 active_payload = dict(active_payload)
@@ -4687,6 +4698,8 @@ def post_review_with_fallback(
                 try:
                     response = post_with_auth_retry(active_payload)
                     return build_posted_result(response)
+                except ReviewSupersededError:
+                    raise
                 except (RuntimeError, urllib.error.URLError, TimeoutError) as retry_exc:
                     exc = retry_exc
             if attempt >= retry_attempts or not is_retryable_review_post_error(exc):
@@ -4961,14 +4974,18 @@ def review_pull_request(
                 "Could not refresh GitHub token before review post; posting with existing token "
                 f"and will retry on 401 ({type(exc).__name__}): {error_detail}",
             )
-    posted = post_review_with_fallback(
-        github,
-        pull_number,
-        payload=artifacts.payload,
-        requested_event=artifacts.validated_review.event,
-        refresh_token=refresh_review_post_token,
-        log_prefix=log_prefix,
-    )
+    try:
+        posted = post_review_with_fallback(
+            github,
+            pull_number,
+            payload=artifacts.payload,
+            requested_event=artifacts.validated_review.event,
+            refresh_token=refresh_review_post_token,
+            before_post=lambda: ensure_review_still_latest("review post"),
+            log_prefix=log_prefix,
+        )
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
     if posted.requested_event is not None:
         result["requested_event"] = posted.requested_event
         result["event"] = posted.posted_event
