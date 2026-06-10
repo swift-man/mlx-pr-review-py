@@ -4100,6 +4100,8 @@ def generate_review_artifacts(
     log_progress(log_prefix, "Running MLX review model")
     try:
         mlx_result = run_mlx_for_review(prompt, log_prefix=log_prefix, before_model_run=before_model_run)
+    except ReviewSupersededError:
+        raise
     except RuntimeError as exc:
         if not should_retry_as_batched_review(exc, pr_files):
             raise
@@ -4441,6 +4443,8 @@ def generate_single_batch_review_artifacts(
     )
     try:
         mlx_result = run_mlx_for_review(batch_prompt, log_prefix=log_prefix, before_model_run=before_model_run)
+    except ReviewSupersededError:
+        raise
     except RuntimeError as exc:
         if (
             not should_retry_as_batched_review(exc, batch_files)

@@ -221,7 +221,7 @@ class RunMlxTests(unittest.TestCase):
         entered_first = threading.Event()
         release_first = threading.Event()
         checks: list[str] = []
-        second_errors: list[BaseException] = []
+        second_errors: list[Exception] = []
 
         def fake_review_payload(payload: dict[str, str]) -> dict[str, str]:
             if payload["id"] == "first":
@@ -251,7 +251,7 @@ class RunMlxTests(unittest.TestCase):
                             '{"id":"second"}',
                             before_model_run=before_second_model_run,
                         )
-                    except BaseException as exc:
+                    except Exception as exc:
                         second_errors.append(exc)
 
                 first = threading.Thread(target=invoke_first)

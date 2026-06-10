@@ -78,6 +78,10 @@ def is_latest_pull_request_delivery(
     marker: DeliveryMarker | None,
 ) -> bool:
     if marker is None:
+        print(
+            f"[delivery tracking] No marker provided for {repository}#{pull_number}; treating as latest",
+            flush=True,
+        )
         return True
     with _LATEST_DELIVERY_LOCK:
         return _LATEST_PULL_REQUEST_DELIVERIES.get((repository, pull_number)) == marker
