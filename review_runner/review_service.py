@@ -445,6 +445,12 @@ class GitHubApiError(RuntimeError):
         super().__init__(f"GitHub API {method} {url} failed: {status} {response_body}")
 
 
+class ReviewSupersededError(RuntimeError):
+    def __init__(self, *, stage: str, message: str) -> None:
+        self.stage = stage
+        super().__init__(message)
+
+
 def request_json_url(
     method: str,
     url: str,
@@ -3324,16 +3330,25 @@ def run_mlx_subprocess(command: list[str], prompt: str, *, log_prefix: str = "")
     return parse_mlx_subprocess_output(completed)
 
 
-def run_mlx(prompt: str, *, log_prefix: str = "") -> dict[str, Any]:
+def run_mlx(
+    prompt: str,
+    *,
+    log_prefix: str = "",
+    before_model_run: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """MLX 리뷰 실행은 한 번에 하나씩 처리해 모델 중복 로드와 메모리 급증을 막는다."""
     backend = configured_mlx_backend()
     command = configured_mlx_review_command()
+    if before_model_run is not None:
+        before_model_run()
     lock_acquired = _MLX_RUN_LOCK.acquire(blocking=False)
     if not lock_acquired:
         log_progress(log_prefix, "Another MLX review is already running; waiting for the shared model slot")
         _MLX_RUN_LOCK.acquire()
 
     try:
+        if before_model_run is not None:
+            before_model_run()
         if backend == "remote":
             return run_mlx_remote(prompt)
         if uses_inprocess_mlx_client(command):
@@ -4036,6 +4051,17 @@ def load_patchable_pr_files(github: GitHubApi, pull_number: int, *, log_prefix: 
     return load_patchable_pr_files_result(github, pull_number, log_prefix=log_prefix).files
 
 
+def run_mlx_for_review(
+    prompt: str,
+    *,
+    log_prefix: str = "",
+    before_model_run: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    if before_model_run is None:
+        return run_mlx(prompt, log_prefix=log_prefix)
+    return run_mlx(prompt, log_prefix=log_prefix, before_model_run=before_model_run)
+
+
 def generate_review_artifacts(
     repository: str,
     pull_number: int,
@@ -4043,6 +4069,7 @@ def generate_review_artifacts(
     *,
     repository_context: list[RepositoryContextEntry] | None = None,
     existing_review_context: list[dict[str, Any]] | None = None,
+    before_model_run: Callable[[], None] | None = None,
     log_prefix: str = "",
 ) -> ReviewGenerationArtifacts:
     prompt = make_prompt(
@@ -4065,13 +4092,16 @@ def generate_review_artifacts(
             prompt_max_chars=prompt_max_chars,
             initial_prompt_chars=len(prompt),
             fallback_trigger="prompt_budget",
+            before_model_run=before_model_run,
             log_prefix=log_prefix,
         )
 
     mlx_started_at = time.monotonic()
     log_progress(log_prefix, "Running MLX review model")
     try:
-        mlx_result = run_mlx(prompt, log_prefix=log_prefix)
+        mlx_result = run_mlx_for_review(prompt, log_prefix=log_prefix, before_model_run=before_model_run)
+    except ReviewSupersededError:
+        raise
     except RuntimeError as exc:
         if not should_retry_as_batched_review(exc, pr_files):
             raise
@@ -4086,6 +4116,7 @@ def generate_review_artifacts(
             prompt_max_chars=retry_prompt_max_chars,
             initial_prompt_chars=len(prompt),
             fallback_trigger="mlx_413",
+            before_model_run=before_model_run,
             log_prefix=log_prefix,
         )
     log_progress(log_prefix, f"MLX review completed in {time.monotonic() - mlx_started_at:.1f}s")
@@ -4394,6 +4425,7 @@ def generate_single_batch_review_artifacts(
     batch_index: int,
     batch_total: int,
     retry_depth: int,
+    before_model_run: Callable[[], None] | None = None,
     log_prefix: str = "",
 ) -> list[ReviewGenerationArtifacts]:
     batch_prompt = make_prompt(
@@ -4410,7 +4442,9 @@ def generate_single_batch_review_artifacts(
         f"files={len(batch_files)} prompt_chars={len(batch_prompt)}",
     )
     try:
-        mlx_result = run_mlx(batch_prompt, log_prefix=log_prefix)
+        mlx_result = run_mlx_for_review(batch_prompt, log_prefix=log_prefix, before_model_run=before_model_run)
+    except ReviewSupersededError:
+        raise
     except RuntimeError as exc:
         if (
             not should_retry_as_batched_review(exc, batch_files)
@@ -4437,6 +4471,7 @@ def generate_single_batch_review_artifacts(
             initial_prompt_chars=len(batch_prompt),
             fallback_trigger=batch_retry_fallback_trigger(fallback_trigger, retry_depth + 1),
             retry_depth=retry_depth + 1,
+            before_model_run=before_model_run,
             log_prefix=log_prefix,
         )
 
@@ -4475,6 +4510,7 @@ def generate_batched_review_artifact_list(
     initial_prompt_chars: int,
     fallback_trigger: str,
     retry_depth: int = 0,
+    before_model_run: Callable[[], None] | None = None,
     log_prefix: str = "",
 ) -> list[ReviewGenerationArtifacts]:
     """큰 PR을 여러 요청으로 나눠 generate 서버 입력 상한을 넘지 않게 한다."""
@@ -4505,6 +4541,7 @@ def generate_batched_review_artifact_list(
                 batch_index=index,
                 batch_total=len(batches),
                 retry_depth=retry_depth,
+                before_model_run=before_model_run,
                 log_prefix=log_prefix,
             )
         )
@@ -4520,6 +4557,7 @@ def generate_batched_review_artifacts(
     prompt_max_chars: int,
     initial_prompt_chars: int,
     fallback_trigger: str,
+    before_model_run: Callable[[], None] | None = None,
     log_prefix: str = "",
 ) -> ReviewGenerationArtifacts:
     batch_artifacts = generate_batched_review_artifact_list(
@@ -4530,6 +4568,7 @@ def generate_batched_review_artifacts(
         prompt_max_chars=prompt_max_chars,
         initial_prompt_chars=initial_prompt_chars,
         fallback_trigger=fallback_trigger,
+        before_model_run=before_model_run,
         log_prefix=log_prefix,
     )
     if not batch_artifacts:
@@ -4698,11 +4737,34 @@ def review_pull_request(
     api_url: str = DEFAULT_API_URL,
     dry_run: bool = False,
     auth_source: str | None = None,
+    should_continue: Callable[[], bool] | None = None,
     log_prefix: str = "",
 ) -> dict[str, Any]:
     """PR diff를 수집하고 모델 리뷰를 생성한 뒤 GitHub에 등록한다."""
     started_at = time.monotonic()
     github = GitHubApi(token=token, repository=repository, api_url=api_url)
+
+    def superseded_result(error: ReviewSupersededError) -> dict[str, Any]:
+        return {
+            "status": "skipped",
+            "repository": repository,
+            "pull_number": pull_number,
+            "reason": "Superseded by newer PR delivery; skipped stale review work.",
+            "message": str(error),
+            "stage": error.stage,
+        }
+
+    def ensure_review_still_latest(stage: str) -> None:
+        if should_continue is None or should_continue():
+            return
+        message = f"Review superseded by newer PR delivery before {stage}; skipping stale review work"
+        log_progress(log_prefix, message)
+        raise ReviewSupersededError(stage=stage, message=message)
+
+    try:
+        ensure_review_still_latest("file loading")
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
     file_load_result = load_patchable_pr_files_result(github, pull_number, log_prefix=log_prefix)
     pr_files = file_load_result.files
 
@@ -4721,6 +4783,10 @@ def review_pull_request(
         }
 
     try:
+        ensure_review_still_latest("head sha recording")
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
+    try:
         reviewed_head_sha = github.get_pull_head_sha(pull_number)
     except (RuntimeError, OSError, urllib.error.URLError, TimeoutError) as exc:
         reviewed_head_sha = ""
@@ -4731,7 +4797,15 @@ def review_pull_request(
         )
         log_progress(log_prefix, f"Could not record reviewed PR head sha: {error_detail}")
 
+    try:
+        ensure_review_still_latest("existing discussion loading")
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
     existing_review_context = load_existing_review_context(github, pull_number, log_prefix=log_prefix)
+    try:
+        ensure_review_still_latest("copilot review request")
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
     copilot_review_request = (
         build_copilot_review_request_result(status="dry_run", reviewer=normalize_copilot_reviewer())
         if dry_run
@@ -4742,14 +4816,22 @@ def review_pull_request(
             log_prefix=log_prefix,
         )
     )
-    artifacts = generate_review_artifacts(
-        repository,
-        pull_number,
-        pr_files,
-        repository_context=file_load_result.repository_context,
-        existing_review_context=existing_review_context,
-        log_prefix=log_prefix,
-    )
+    try:
+        ensure_review_still_latest("model review")
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
+    try:
+        artifacts = generate_review_artifacts(
+            repository,
+            pull_number,
+            pr_files,
+            repository_context=file_load_result.repository_context,
+            existing_review_context=existing_review_context,
+            before_model_run=lambda: ensure_review_still_latest("MLX model run"),
+            log_prefix=log_prefix,
+        )
+    except ReviewSupersededError as exc:
+        return superseded_result(exc)
     review_post_token_refreshed = False
 
     def refresh_review_post_token() -> bool:

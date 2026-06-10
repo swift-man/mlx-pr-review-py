@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 from typing import Any
 
@@ -18,6 +19,11 @@ from review_runner.review_service import DEFAULT_API_URL, resolve_github_token, 
 SUPPORTED_PULL_REQUEST_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 
 app = FastAPI(title="GitHub MLX Review Webhook", version="1.0.0")
+
+DeliveryMarker = tuple[int, str | None]
+_LATEST_DELIVERY_LOCK = threading.Lock()
+_LATEST_DELIVERY_SEQUENCE = 0
+_LATEST_PULL_REQUEST_DELIVERIES: dict[tuple[str, int], DeliveryMarker] = {}
 
 
 def require_env(name: str) -> str:
@@ -53,6 +59,45 @@ def should_process_pull_request(event: dict[str, Any]) -> tuple[bool, str]:
 def build_delivery_prefix(delivery_id: str | None) -> str:
     """서버 로그에서 같은 webhook 흐름을 쉽게 묶어보기 위한 접두사다."""
     return f"[delivery={delivery_id}] " if delivery_id else ""
+
+
+def register_pull_request_delivery(repository: str, pull_number: int, delivery_id: str | None) -> DeliveryMarker:
+    """같은 PR에 대해 가장 최근 webhook delivery만 실제 모델 슬롯을 쓰게 한다."""
+    global _LATEST_DELIVERY_SEQUENCE
+    key = (repository, pull_number)
+    with _LATEST_DELIVERY_LOCK:
+        _LATEST_DELIVERY_SEQUENCE += 1
+        marker = (_LATEST_DELIVERY_SEQUENCE, delivery_id)
+        _LATEST_PULL_REQUEST_DELIVERIES[key] = marker
+        return marker
+
+
+def is_latest_pull_request_delivery(
+    repository: str,
+    pull_number: int,
+    marker: DeliveryMarker | None,
+) -> bool:
+    if marker is None:
+        print(
+            f"[delivery tracking] No marker provided for {repository}#{pull_number}; treating as latest",
+            flush=True,
+        )
+        return True
+    with _LATEST_DELIVERY_LOCK:
+        return _LATEST_PULL_REQUEST_DELIVERIES.get((repository, pull_number)) == marker
+
+
+def clear_pull_request_delivery(
+    repository: str,
+    pull_number: int,
+    marker: DeliveryMarker | None,
+) -> None:
+    if marker is None:
+        return
+    key = (repository, pull_number)
+    with _LATEST_DELIVERY_LOCK:
+        if _LATEST_PULL_REQUEST_DELIVERIES.get(key) == marker:
+            _LATEST_PULL_REQUEST_DELIVERIES.pop(key, None)
 
 
 def describe_exception(exc: Exception) -> str:
@@ -93,7 +138,12 @@ def extract_pull_request_target(event: dict[str, Any]) -> tuple[str, int]:
     return repository, pull_number
 
 
-def handle_pull_request_event(repository: str, pull_number: int, delivery_id: str | None) -> None:
+def handle_pull_request_event(
+    repository: str,
+    pull_number: int,
+    delivery_id: str | None,
+    delivery_marker: DeliveryMarker | None = None,
+) -> None:
     """백그라운드 스레드에서 실제 리뷰 생성과 GitHub 등록을 처리한다."""
     started_at = time.monotonic()
     prefix = build_delivery_prefix(delivery_id)
@@ -117,6 +167,7 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
         )
         print(f"{prefix}Review failed in {duration:.1f}s during auth_resolution: {failure_result['error']}", flush=True)
         print(prefix + json.dumps(failure_result, ensure_ascii=False))
+        clear_pull_request_delivery(repository, pull_number, delivery_marker)
         return
 
     # background task 예외가 ASGI traceback으로만 보이지 않도록 구조화된 실패 결과를 남긴다.
@@ -128,6 +179,7 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
             api_url=api_url,
             dry_run=os.environ.get("DRY_RUN") == "1",
             auth_source=auth_source,
+            should_continue=lambda: is_latest_pull_request_delivery(repository, pull_number, delivery_marker),
             log_prefix=prefix,
         )
     except Exception as exc:
@@ -145,11 +197,13 @@ def handle_pull_request_event(repository: str, pull_number: int, delivery_id: st
             flush=True,
         )
         print(prefix + json.dumps(failure_result, ensure_ascii=False))
+        clear_pull_request_delivery(repository, pull_number, delivery_marker)
         return
 
     duration = time.monotonic() - started_at
     print(f"{prefix}Review finished in {duration:.1f}s", flush=True)
     print(prefix + json.dumps(result, ensure_ascii=False))
+    clear_pull_request_delivery(repository, pull_number, delivery_marker)
 
 
 @app.get("/healthz")
@@ -184,8 +238,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
         return {"status": "ignored", "reason": reason, "delivery_id": delivery_id}
 
     repository, pull_number = extract_pull_request_target(event)
+    delivery_marker = register_pull_request_delivery(repository, pull_number, delivery_id)
     # GitHub에는 빠르게 202를 돌려주고, 무거운 리뷰 작업은 별도 스레드에서 이어간다.
-    background_tasks.add_task(handle_pull_request_event, repository, pull_number, delivery_id)
+    background_tasks.add_task(handle_pull_request_event, repository, pull_number, delivery_id, delivery_marker)
     return {
         "status": "accepted",
         "delivery_id": delivery_id,

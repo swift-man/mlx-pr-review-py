@@ -49,6 +49,50 @@ from review_runner import webhook_app
 
 
 class HandlePullRequestEventTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with webhook_app._LATEST_DELIVERY_LOCK:
+            webhook_app._LATEST_DELIVERY_SEQUENCE = 0
+            webhook_app._LATEST_PULL_REQUEST_DELIVERIES.clear()
+
+    def test_delivery_registry_marks_only_latest_pr_delivery_current(self) -> None:
+        first = webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-1")
+        second = webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-2")
+
+        self.assertFalse(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, first))
+        self.assertTrue(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, second))
+
+        webhook_app.clear_pull_request_delivery("demo/repo", 7, first)
+        self.assertTrue(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, second))
+
+        webhook_app.clear_pull_request_delivery("demo/repo", 7, second)
+        self.assertFalse(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, second))
+
+    def test_handle_pull_request_event_passes_superseded_delivery_check(self) -> None:
+        first = webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-1")
+        webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-2")
+        auth = mock.Mock(token="token-123", source="github_app_installation")
+
+        def fake_review_pull_request(**kwargs):
+            self.assertFalse(kwargs["should_continue"]())
+            return {
+                "status": "skipped",
+                "repository": kwargs["repository"],
+                "pull_number": kwargs["pull_number"],
+                "reason": "superseded",
+            }
+
+        stdout = io.StringIO()
+        with mock.patch("review_runner.webhook_app.resolve_github_token", return_value=auth):
+            with mock.patch("review_runner.webhook_app.review_pull_request", side_effect=fake_review_pull_request):
+                with mock.patch("review_runner.webhook_app.time.monotonic", side_effect=[10.0, 11.0]):
+                    with redirect_stdout(stdout):
+                        webhook_app.handle_pull_request_event("demo/repo", 7, "delivery-1", first)
+
+        lines = stdout.getvalue().splitlines()
+        payload = json.loads(lines[3].removeprefix("[delivery=delivery-1] "))
+        self.assertEqual(payload["status"], "skipped")
+        self.assertEqual(payload["reason"], "superseded")
+
     def test_handle_pull_request_event_logs_structured_auth_failure(self) -> None:
         stdout = io.StringIO()
         with mock.patch("review_runner.webhook_app.resolve_github_token", side_effect=RuntimeError("bad auth")):
