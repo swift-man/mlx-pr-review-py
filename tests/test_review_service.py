@@ -217,6 +217,59 @@ class RunMlxTests(unittest.TestCase):
         self.assertEqual(max_active_calls, 1)
         self.assertCountEqual(results, [{"summary": "first"}, {"summary": "second"}])
 
+    def test_run_mlx_checks_before_model_run_after_waiting_for_slot(self) -> None:
+        entered_first = threading.Event()
+        release_first = threading.Event()
+        checks: list[str] = []
+        second_errors: list[BaseException] = []
+
+        def fake_review_payload(payload: dict[str, str]) -> dict[str, str]:
+            if payload["id"] == "first":
+                entered_first.set()
+                release_first.wait(timeout=2)
+                return {"summary": "first"}
+            raise AssertionError("superseded review must not call the model")
+
+        def before_second_model_run() -> None:
+            checks.append("check")
+            if len(checks) == 2:
+                raise review_service.ReviewSupersededError(
+                    stage="MLX model run",
+                    message="superseded before model run",
+                )
+
+        with mock.patch.dict(os.environ, _mlx_env(), clear=False):
+            os.environ.pop("MLX_REVIEW_CMD", None)
+            with mock.patch("review_runner.mlx_review_client.review_payload", side_effect=fake_review_payload):
+
+                def invoke_first() -> None:
+                    review_service.run_mlx('{"id":"first"}')
+
+                def invoke_second() -> None:
+                    try:
+                        review_service.run_mlx(
+                            '{"id":"second"}',
+                            before_model_run=before_second_model_run,
+                        )
+                    except BaseException as exc:
+                        second_errors.append(exc)
+
+                first = threading.Thread(target=invoke_first)
+                second = threading.Thread(target=invoke_second)
+
+                first.start()
+                self.assertTrue(entered_first.wait(timeout=1))
+                second.start()
+                time.sleep(0.1)
+                self.assertEqual(checks, ["check"])
+                release_first.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(len(second_errors), 1)
+        self.assertIsInstance(second_errors[0], review_service.ReviewSupersededError)
+
 
 class ReviewNormalizationTests(unittest.TestCase):
     def test_detect_secret_logging_emits_one_comment_per_file(self) -> None:
@@ -2592,6 +2645,28 @@ class ReviewPullRequestFlowTests(unittest.TestCase):
                 )
 
         self.assertEqual(github.calls, 3)
+
+    def test_review_pull_request_skips_superseded_delivery_before_file_loading(self) -> None:
+        class FakeGitHub:
+            def __init__(self, token: str, repository: str, api_url: str) -> None:
+                self.token = token
+                self.repository = repository
+                self.api_url = api_url
+
+            def list_pr_files(self, pull_number: int) -> list[dict[str, Any]]:
+                raise AssertionError("superseded delivery must not load PR files")
+
+        with mock.patch("review_runner.review_service.GitHubApi", FakeGitHub):
+            result = review_service.review_pull_request(
+                "swift-man/app",
+                4,
+                token="token",
+                should_continue=lambda: False,
+            )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "Superseded by newer PR delivery; skipped stale review work.")
+        self.assertEqual(result["stage"], "file loading")
 
     def test_review_pull_request_refreshes_github_app_token_before_posting(self) -> None:
         case = self
