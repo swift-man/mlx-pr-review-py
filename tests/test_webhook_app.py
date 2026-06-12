@@ -67,6 +67,23 @@ class HandlePullRequestEventTests(unittest.TestCase):
         webhook_app.clear_pull_request_delivery("demo/repo", 7, second)
         self.assertFalse(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, second))
 
+    def test_delivery_registry_ignores_duplicate_active_head(self) -> None:
+        first = webhook_app.register_pull_request_delivery_result("demo/repo", 7, "delivery-1", "abc123")
+        duplicate = webhook_app.register_pull_request_delivery_result("demo/repo", 7, "delivery-2", "abc123")
+
+        self.assertTrue(first.accepted)
+        self.assertFalse(duplicate.accepted)
+        self.assertEqual(duplicate.marker, first.marker)
+        self.assertIn("Duplicate delivery for active PR head abc123", duplicate.reason)
+        self.assertTrue(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, first.marker))
+
+    def test_delivery_registry_accepts_new_head(self) -> None:
+        first = webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-1", "abc123")
+        second = webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-2", "def456")
+
+        self.assertFalse(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, first))
+        self.assertTrue(webhook_app.is_latest_pull_request_delivery("demo/repo", 7, second))
+
     def test_handle_pull_request_event_passes_superseded_delivery_check(self) -> None:
         first = webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-1")
         webhook_app.register_pull_request_delivery("demo/repo", 7, "delivery-2")
