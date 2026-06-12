@@ -9,6 +9,7 @@ import json
 import os
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -20,7 +21,20 @@ SUPPORTED_PULL_REQUEST_ACTIONS = {"opened", "synchronize", "reopened", "ready_fo
 
 app = FastAPI(title="GitHub MLX Review Webhook", version="1.0.0")
 
-DeliveryMarker = tuple[int, str | None]
+@dataclass(frozen=True)
+class DeliveryMarker:
+    sequence: int
+    delivery_id: str | None
+    head_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class DeliveryRegistration:
+    marker: DeliveryMarker
+    accepted: bool
+    reason: str = ""
+
+
 _LATEST_DELIVERY_LOCK = threading.Lock()
 _LATEST_DELIVERY_SEQUENCE = 0
 _LATEST_PULL_REQUEST_DELIVERIES: dict[tuple[str, int], DeliveryMarker] = {}
@@ -61,15 +75,41 @@ def build_delivery_prefix(delivery_id: str | None) -> str:
     return f"[delivery={delivery_id}] " if delivery_id else ""
 
 
-def register_pull_request_delivery(repository: str, pull_number: int, delivery_id: str | None) -> DeliveryMarker:
-    """같은 PR에 대해 가장 최근 webhook delivery만 실제 모델 슬롯을 쓰게 한다."""
+def short_sha(value: str | None) -> str:
+    return value[:12] if value else "unknown"
+
+
+def register_pull_request_delivery_result(
+    repository: str,
+    pull_number: int,
+    delivery_id: str | None,
+    head_sha: str | None = None,
+) -> DeliveryRegistration:
+    """같은 PR에 대해 최신 HEAD 작업만 모델 슬롯을 쓰게 한다."""
     global _LATEST_DELIVERY_SEQUENCE
     key = (repository, pull_number)
     with _LATEST_DELIVERY_LOCK:
+        current = _LATEST_PULL_REQUEST_DELIVERIES.get(key)
+        if current and current.head_sha and head_sha and current.head_sha == head_sha:
+            return DeliveryRegistration(
+                marker=current,
+                accepted=False,
+                reason=f"Duplicate delivery for active PR head {short_sha(head_sha)} ignored",
+            )
         _LATEST_DELIVERY_SEQUENCE += 1
-        marker = (_LATEST_DELIVERY_SEQUENCE, delivery_id)
+        marker = DeliveryMarker(_LATEST_DELIVERY_SEQUENCE, delivery_id, head_sha)
         _LATEST_PULL_REQUEST_DELIVERIES[key] = marker
-        return marker
+        return DeliveryRegistration(marker=marker, accepted=True)
+
+
+def register_pull_request_delivery(
+    repository: str,
+    pull_number: int,
+    delivery_id: str | None,
+    head_sha: str | None = None,
+) -> DeliveryMarker:
+    """테스트와 직접 호출용으로 delivery marker만 반환한다."""
+    return register_pull_request_delivery_result(repository, pull_number, delivery_id, head_sha).marker
 
 
 def is_latest_pull_request_delivery(
@@ -138,6 +178,13 @@ def extract_pull_request_target(event: dict[str, Any]) -> tuple[str, int]:
     return repository, pull_number
 
 
+def extract_pull_request_head_sha(event: dict[str, Any]) -> str | None:
+    pull_request = event.get("pull_request") or {}
+    head = pull_request.get("head") or {}
+    value = head.get("sha")
+    return value if isinstance(value, str) and value else None
+
+
 def handle_pull_request_event(
     repository: str,
     pull_number: int,
@@ -147,7 +194,8 @@ def handle_pull_request_event(
     """백그라운드 스레드에서 실제 리뷰 생성과 GitHub 등록을 처리한다."""
     started_at = time.monotonic()
     prefix = build_delivery_prefix(delivery_id)
-    print(f"{prefix}Starting review for {repository}#{pull_number}", flush=True)
+    head_detail = f" head={short_sha(delivery_marker.head_sha)}" if delivery_marker and delivery_marker.head_sha else ""
+    print(f"{prefix}Starting review for {repository}#{pull_number}{head_detail}", flush=True)
     api_url = os.environ.get("GITHUB_API_URL", DEFAULT_API_URL)
     auth_source: str | None = None
 
@@ -238,7 +286,18 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
         return {"status": "ignored", "reason": reason, "delivery_id": delivery_id}
 
     repository, pull_number = extract_pull_request_target(event)
-    delivery_marker = register_pull_request_delivery(repository, pull_number, delivery_id)
+    head_sha = extract_pull_request_head_sha(event)
+    delivery_registration = register_pull_request_delivery_result(repository, pull_number, delivery_id, head_sha)
+    if not delivery_registration.accepted:
+        return {
+            "status": "ignored",
+            "reason": delivery_registration.reason,
+            "delivery_id": delivery_id,
+            "repository": repository,
+            "pull_number": pull_number,
+            "head_sha": head_sha,
+        }
+    delivery_marker = delivery_registration.marker
     # GitHub에는 빠르게 202를 돌려주고, 무거운 리뷰 작업은 별도 스레드에서 이어간다.
     background_tasks.add_task(handle_pull_request_event, repository, pull_number, delivery_id, delivery_marker)
     return {
@@ -246,4 +305,5 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
         "delivery_id": delivery_id,
         "repository": repository,
         "pull_number": pull_number,
+        "head_sha": head_sha,
     }
