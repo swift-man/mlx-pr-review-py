@@ -216,10 +216,10 @@ def run_forever() -> None:
     # 기다려야만 회수된다.
     try:
         for message_id, fields in review_queue.read_own_pending(client, consumer):
-            log("job_resumed", message_id=message_id)
-            process_message(client, message_id, fields)
             if _SHUTDOWN:
                 break
+            log("job_resumed", message_id=message_id)
+            process_message(client, message_id, fields)
     except redis.RedisError as exc:
         log("redis_error", stage="read_own_pending", error=str(exc))
 
@@ -230,17 +230,21 @@ def run_forever() -> None:
             for message_id, fields in review_queue.claim_abandoned_jobs(
                 client, consumer, min_idle_ms=reclaim_idle_ms()
             ):
-                log("job_reclaimed", message_id=message_id)
-                process_message(client, message_id, fields)
                 if _SHUTDOWN:
                     break
+                log("job_reclaimed", message_id=message_id)
+                process_message(client, message_id, fields)
             if _SHUTDOWN:
                 break
 
             for message_id, fields in review_queue.read_new_jobs(client, consumer):
-                process_message(client, message_id, fields)
+                # 종료 요청을 먼저 확인한다. 순서가 반대면 SIGTERM 을 받은 뒤에도
+                # 수 분 걸리는 새 리뷰를 시작해버려, launchd 의 종료 유예(기본 20초)를
+                # 넘겨 SIGKILL 당한다. 여기서 빠져나가면 job 은 ACK 되지 않은 채
+                # 자기 PEL 에 남고, 재기동 시 read_own_pending 이 그대로 이어받는다.
                 if _SHUTDOWN:
                     break
+                process_message(client, message_id, fields)
         except redis.RedisError as exc:
             log("redis_error", error_type=exc.__class__.__name__, error=str(exc))
             time.sleep(REDIS_RETRY_DELAY_SECONDS)

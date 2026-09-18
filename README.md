@@ -49,7 +49,7 @@ receiver repo 와 **공유하는 계약**입니다. 한쪽만 바꾸면 job 이 
 | 환경 변수 | 기본값 | 의미 |
 |---|---|---|
 | `REVIEW_REDIS_URL` | `redis://127.0.0.1:6379/0` | 큐 위치 |
-| `REVIEW_WORKER_NAME` | `<hostname>-<pid>` | consumer 이름. 2대 구성에서 서로 달라야 함 |
+| `REVIEW_WORKER_NAME` | `<hostname>` | consumer 이름. 머신마다 달라야 하고 재기동 사이에는 같아야 함. **한 머신에서 워커를 2개 이상 돌릴 때는 반드시 서로 다른 값을 지정** (기본값이 같아 PEL 이 뒤섞임) |
 | `REVIEW_WORKER_MAX_ATTEMPTS` | `3` | 초과 시 dead letter 로 격리 |
 | `REVIEW_WORKER_RECLAIM_IDLE_MS` | `1800000` | 죽은 워커 job 회수 기준 (30분) |
 

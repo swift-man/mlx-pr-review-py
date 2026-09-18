@@ -20,8 +20,10 @@ fi
 export PYTHONPATH="$ROOT_DIR"
 export REVIEW_REDIS_URL="${REVIEW_REDIS_URL:-redis://127.0.0.1:6379/0}"
 
-# 2대 구성에서는 반드시 서로 다른 이름이어야 한다. 비워두면 hostname-pid 를 쓰므로
-# 보통은 지정할 필요가 없다.
+# 비워두면 hostname 을 쓴다. 머신마다 다르므로 노드가 1대 1워커면 지정할 필요가 없다.
+# 재기동 사이에 이름이 같아야 자기 PEL 을 이어받을 수 있어서 pid 는 넣지 않는다.
+# 다만 한 머신에서 워커를 2개 이상 돌릴 때는 반드시 서로 다른 값을 지정해야 한다.
+# 기본값이 같으면 두 프로세스가 같은 consumer 이름을 공유해 PEL 이 뒤섞인다.
 if [[ -n "${REVIEW_WORKER_NAME:-}" ]]; then
   export REVIEW_WORKER_NAME
 fi

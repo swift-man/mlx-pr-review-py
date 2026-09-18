@@ -93,6 +93,10 @@ def parse_job(fields: dict[str, str]) -> dict[str, Any]:
         pull_number = int(fields.get("pull_number", ""))
     except ValueError as exc:
         raise ValueError(f"invalid pull_number in job: {fields.get('pull_number')!r}") from exc
+    if pull_number <= 0:
+        # GitHub PR 번호는 1 이상이다. 0 이나 음수는 재시도해도 복구되지 않으므로
+        # 여기서 막아 즉시 dead letter 로 보낸다.
+        raise ValueError(f"pull_number must be positive, got {pull_number}")
     return {
         "v": fields.get("v", ""),
         "delivery_id": fields.get("delivery_id", ""),
@@ -166,7 +170,10 @@ def read_new_jobs(
     if not response:
         return []
     _, entries = response[0]
-    return entries
+    # MAXLEN/XDEL 로 정리된 빈 항목이 섞여 올 수 있다. 그대로 넘기면 process_message
+    # 가 repository 누락으로 보고 dead letter 로 오격리한다. 다른 읽기 경로와
+    # 동일하게 걸러낸다.
+    return [entry for entry in entries if entry and entry[1]]
 
 
 def claim_abandoned_jobs(

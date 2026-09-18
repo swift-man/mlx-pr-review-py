@@ -138,6 +138,19 @@ class QueueContractTestCase(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotIn(str(__import__("os").getpid()), first)
 
+    def test_parse_job_rejects_non_positive_pull_number(self) -> None:
+        """0 이나 음수는 재시도해도 복구되지 않으므로 즉시 격리한다."""
+        for bad in ("0", "-3"):
+            with self.assertRaises(ValueError):
+                review_queue.parse_job({**JOB_FIELDS, "pull_number": bad})
+
+    def test_read_new_jobs_filters_empty_entries(self) -> None:
+        """빈 항목을 넘기면 process_message 가 repository 누락으로 오격리한다."""
+        client = FakeRedis()
+        client.new_jobs = [("1-0", {}), ("2-0", dict(JOB_FIELDS))]
+        got = review_queue.read_new_jobs(client, "c1")
+        self.assertEqual([mid for mid, _ in got], ["2-0"])
+
     def test_reclaim_follows_the_cursor(self) -> None:
         """cursor 를 무시하면 스캔 한도 뒤쪽의 버려진 job 에 영영 닿지 못한다."""
         client = FakeRedis()
@@ -158,6 +171,29 @@ class QueueContractTestCase(unittest.TestCase):
     def test_parse_job_rejects_non_numeric_pull_number(self) -> None:
         with self.assertRaises(ValueError):
             review_queue.parse_job({**JOB_FIELDS, "pull_number": "not-a-number"})
+
+
+class ShutdownOrderingTestCase(unittest.TestCase):
+    """종료 요청 뒤에는 새 리뷰를 시작하지 않는다.
+
+    순서가 반대면 SIGTERM 을 받고도 수 분 걸리는 리뷰를 시작해 launchd 의 종료
+    유예(기본 20초)를 넘겨 SIGKILL 당한다.
+    """
+
+    def test_shutdown_is_checked_before_processing_a_new_job(self) -> None:
+        client = FakeRedis()
+        client.new_jobs = [("1-0", dict(JOB_FIELDS))]
+        client.own_pending = [("9-0", dict(JOB_FIELDS))]
+        processed: list[str] = []
+
+        with mock.patch.object(review_worker, "_SHUTDOWN", True), \
+             mock.patch.object(review_worker, "process_message",
+                               side_effect=lambda _c, mid, _f: processed.append(mid)), \
+             mock.patch.object(review_worker.review_queue, "build_redis_client", return_value=client), \
+             mock.patch.object(review_worker.review_queue, "ensure_consumer_group"):
+            review_worker.run_forever()
+
+        self.assertEqual(processed, [], "종료 요청 상태에서는 어떤 job 도 시작하지 않아야 한다")
 
 
 class StaleDetectionTestCase(unittest.TestCase):
