@@ -126,7 +126,35 @@ if ! command -v launchctl >/dev/null 2>&1; then
   exit 1
 fi
 
+# ────────────────────────────────────────────────────────────────────────────
+# 자기 갱신 대응
+#
+# 이 스크립트는 sync_latest_source 단계에서 **자기 자신을 덮어쓴다**. 그런데
+# LAUNCH_AGENT_LABEL 같은 설정은 파일 상단에서 이미 읽힌 뒤라, 스크립트 자체가
+# 바뀐 배포에서는 이번 실행이 옛 설정으로 돌아간다. 실제로 큐 전환 직후 이 문제로
+# 존재하지 않는 서비스를 재시동하려다 실패했고, 두 번 돌려야 반영됐다.
+#
+# sync 전후로 자기 파일의 체크섬을 비교해 바뀌었으면 새 내용으로 exec 한다.
+# 재귀 방지는 환경변수 가드로 한다.
+# ────────────────────────────────────────────────────────────────────────────
+SELF_PATH="${${(%):-%x}:A}"
+script_checksum() {
+  [[ -f "$SELF_PATH" ]] && shasum -a 256 "$SELF_PATH" 2>/dev/null | awk '{print $1}'
+}
+
+checksum_before="$(script_checksum)"
 sync_latest_source
+checksum_after="$(script_checksum)"
+
+if [[ -n "$checksum_before" && -n "$checksum_after" \
+      && "$checksum_before" != "$checksum_after" \
+      && "${LOCAL_REVIEW_KICKSTART_REEXEC:-0}" != "1" ]]; then
+  echo "kickstart 스크립트 자체가 갱신되었습니다. 새 내용으로 다시 실행합니다."
+  export LOCAL_REVIEW_KICKSTART_REEXEC=1
+  # 방금 동기화된 소스를 또 덮어쓸 필요는 없다.
+  export LOCAL_REVIEW_SYNC_SOURCE=0
+  exec zsh "$SELF_PATH" "$@"
+fi
 
 if ! launchctl print "$LAUNCH_AGENT_SERVICE" >/dev/null 2>&1; then
   echo "LaunchAgent not loaded: $LAUNCH_AGENT_SERVICE" >&2
