@@ -742,16 +742,53 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 - `swift-man/MaterialDesignColor` PR #7 (commit `7c3a0d6`, `40a11fe`) — 패턴 1·3 동시 재현
 - 같은 PR 의 ESM/CJS 이슈 (commit `38c8d92` 로 수정) — 차단성 이슈를 **정확히 잡는지** 확인용 positive control
 
-### 15-2. A 계층 — 프롬프트 가드레일 (`review_runner/mlx_review_prompt.py`)
+### 15-2. A 계층 — 프롬프트 (`review_runner/mlx_review_prompt.py`)
 
-`SYSTEM_PROMPT_RULES` 내부에 명시된 규칙들로, 모델에게 직접 "이런 패턴을 내지 말라"고 지시.
+**2026-09 재작성됨.** 7B 시절에는 관찰된 실패마다 금지 규칙을 하나씩 덧대는 방식이었고,
+그 결과 규칙 61개(금지형 26개) / 10,480자까지 커졌습니다. 코딩 특화 모델로 바꾼 뒤
+열거형 금지를 **증거 기준 하나**로 접었습니다.
 
-| 규칙 위치 | 역할 |
-|---------|------|
-| `Anti-hallucination guardrails` 섹션 전체 | 리뷰 생성 전 self-check + 번역 금지 + add-already-exists 금지 + confidence gradient |
-| `Do not restate what the diff already does` 규칙 | narration 금지 (패턴 3 일부) |
-| `~가 추가되었습니다 / 변경되었습니다 / 수정되었습니다 are narration` | 서술형 어미 식별 |
-| `Severity levels for comments[]` + severity/confidence enforcement | Blocking/Major 남용 억제 |
+| 구분 | 이전 (7B 대응) | 현재 |
+|---|---|---|
+| 크기 | 10,480자 / 규칙 61개 | 6,647자 / 금지 7개 (**-37%**) |
+| prefill 비용 | 규칙만으로 약 11초 | 약 7초 (960 chars/s 실측) |
+| 실패 프레이밍 | "false positives are worse than missed suggestions" | 오탐과 누락을 **대칭**으로 ("equally bad") |
+| confidence 문턱 | 전 등급 0.8 균일 | Blocking/Major 0.8, **Minor/Suggestion 0.6** |
+| 유지보수·설계 지적 | 금지 ("no maintainability-only comments") | Suggestion/Minor 로 허용 |
+
+**증거 기준 (a)~(e)** 가 이전의 금지 규칙 다수를 대체합니다. 모든 지적이 통과해야 합니다:
+실제 라인을 읽었는가 / 근처에서 이미 처리되지 않는가 / 트리거와 영향을 댈 수 있는가 /
+수정을 한 문장으로 말할 수 있는가 / **외부 시스템 의미론을 기억에서 꺼내 쓰지 않았는가**.
+
+> (e) 는 실제 오탐에서 나왔습니다. launchd 의 `KeepAlive/SuccessfulExit=false` 를 두고
+> "종료될 때마다 재시작된다" 고 confidence 0.95 Major 로 단언한 사례가 있었는데, 실제
+> 의미는 정반대(비정상 종료 시에만 재시작)였습니다. 모델은 라인을 읽었고 트리거도 댈 수
+> 있었으므로 (a)~(d) 로는 걸러지지 않습니다. 이런 주장은 버리지 않되 등급을 제한해
+> 머지를 막지 못하게 합니다.
+>
+> **제약을 어디에 두느냐가 결과를 갈랐습니다.** 증거 기준 섹션에만 (e) 를 두었을 때는
+> 같은 지적이 그대로 Major 0.95 로 나왔습니다. severity 를 고르는 시점에 참조되지 않기
+> 때문입니다. Blocking/Major 정의 안에 직접 박고 등급 선택 직전 체크포인트를 둔 뒤에야
+> Minor 0.75 로 내려왔습니다. 같은 입력 3회 실측:
+>
+> | 프롬프트 상태 | severity | confidence | 주장 정확도 |
+> |---|---|---|---|
+> | 증거 기준 (a)~(d) 만 | Major | 0.95 | 완전히 틀림 |
+> | + (e) 를 증거 기준에만 추가 | Major | 0.95 | 부분적으로 맞음 |
+> | + 등급 정의에 직접 삽입 | **Minor** | **0.75** | 맞음 |
+>
+> 이 0.75 는 기존 0.8 균일 문턱이었다면 통째로 버려졌을 지적입니다. 등급별 문턱과
+> 외부 의미론 상한이 함께 작동해야 "버리지 않되 막지도 않는" 상태가 됩니다.
+
+**confidence 문턱을 등급별로 나눈 이유**: 머지를 막는 Blocking/Major 는 오탐 비용이 커서
+0.8 을 유지하고, 머지를 막지 않는 Minor/Suggestion 만 0.6 으로 낮춰 신호를 살립니다.
+`mlx_review_prompt.MIN_COMMENT_CONFIDENCE` / `MIN_BLOCKING_CONFIDENCE` 와
+`review_service.MIN_MODEL_COMMENT_CONFIDENCE` / `MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE` 는
+**같은 값이어야 하며**, 한쪽만 바꾸면 모델이 내보낸 지적을 런타임이 조용히 버립니다.
+`tests/test_mlx_review_client.py` 가 이 일치를 고정합니다.
+
+**프롬프트 비대화 방지**: `test_system_prompt_stays_lean` 이 8000자 상한을 겁니다.
+규칙을 덧대는 비용은 눈에 안 보이지만 리뷰마다 prefill 로 지불됩니다.
 
 **제거 기준**: 15-1 의 회귀 PR 4 개 케이스를 새 모델로 돌려 다음 두 조건을 모두 만족하면 해당 규칙 제거.
 1. 세 패턴(역해석 / 환각 / 중복 출력) 이 **한 건도 재현되지 않음**.

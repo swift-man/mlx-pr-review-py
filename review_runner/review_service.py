@@ -634,7 +634,20 @@ SEVERITY_MAJOR = "Major"
 SEVERITY_MINOR = "Minor"
 SEVERITY_SUGGESTION = "Suggestion"
 ALL_SEVERITIES = (SEVERITY_BLOCKING, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
-MIN_MODEL_COMMENT_CONFIDENCE = 0.8
+# confidence 문턱은 등급별로 다르다.
+#
+# 머지를 막는 Blocking/Major 는 오탐 비용이 커서 0.8 을 유지한다. 반대로 머지를 막지
+# 않는 Minor/Suggestion 까지 0.8 을 요구하면, 확신 0.6~0.8 구간의 정당한 지적이 전부
+# 버려져 리뷰가 "치명적 버그 아니면 침묵" 이 된다. 프롬프트의 등급 정의
+# (mlx_review_prompt.MIN_COMMENT_CONFIDENCE / MIN_BLOCKING_CONFIDENCE) 와 같은 값이어야
+# 하며, 한쪽만 바꾸면 모델이 내보낸 지적을 런타임이 조용히 버린다.
+MIN_MODEL_COMMENT_CONFIDENCE = 0.6
+MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE = 0.8
+
+# top-level finding(must_fix/suggestions) 복구 경로는 모델이 numeric confidence 를
+# 주지 않아 본문 라벨에서 역산한다. comments[] 보다 증거가 약하므로 문턱을 따로 둔다.
+# comment 문턱과 공유하면 0.6 으로 낮출 때 medium 라벨(0.7)까지 조용히 통과한다.
+MIN_TOP_LEVEL_FINDING_CONFIDENCE = 0.8
 MAX_EXISTING_REVIEW_CONTEXT_ITEMS = 30
 MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS = 900
 MAX_COPILOT_REVIEW_SECTION_ITEMS = 5
@@ -735,7 +748,8 @@ def confidence_score_for_label(label: str | None) -> float | None:
 
     top-level finding 복구 경로는 모델이 별도 numeric confidence 필드를 제공하지
     못하는 경우가 많다. 그래도 High 라벨과 line anchor 가 모두 있으면 0.9 로
-    보수적으로 흡수하고, Medium/Low 는 기존 0.8 gate 를 넘지 못하게 둔다.
+    보수적으로 흡수하고, Medium/Low 는 MIN_TOP_LEVEL_FINDING_CONFIDENCE gate 를
+    넘지 못하게 둔다.
     """
     if label == "high":
         return 0.9
@@ -2907,7 +2921,7 @@ def collect_line_anchored_top_level_findings(
                 continue
 
             confidence = confidence_score_for_label(confidence_label)
-            if confidence is None or confidence < MIN_MODEL_COMMENT_CONFIDENCE:
+            if confidence is None or confidence < MIN_TOP_LEVEL_FINDING_CONFIDENCE:
                 increment_reason(stats.dropped_top_level_finding_reasons, "low_confidence")
                 continue
 
@@ -3109,8 +3123,9 @@ def make_prompt(
                 "각 코멘트에는 severity, numeric confidence, Problem, Why it matters, Suggested fix, Confidence(High/Medium/Low)를 포함하세요.",
                 "최신 PR HEAD의 현재 파일과 line을 기준으로만 지적하고, outdated diff나 이미 수정된 코드는 지적하지 마세요.",
                 "guard, early return, optional 여부, 타입 선언, 배열 empty 방어, 상태 전이 조건을 먼저 확인하세요.",
-                "Blocking/Major는 재현 가능한 입력, 상태, 실행 순서와 High confidence가 있을 때만 사용하세요.",
+                f"Blocking/Major는 재현 가능한 입력, 상태, 실행 순서와 High confidence, 그리고 confidence {MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE:.2f} 이상이 모두 있을 때만 사용하세요.",
                 "테스트 지적은 현재 테스트를 확인한 뒤 어떤 실패 모드를 막는지 설명할 수 있을 때만 작성하세요.",
+                f"Minor/Suggestion은 confidence {MIN_MODEL_COMMENT_CONFIDENCE:.2f} 이상이면 작성하세요. 확신이 낮다고 침묵하지 말고, 근거를 댈 수 있으면 등급을 낮춰 남기세요.",
                 f"confidence가 {MIN_MODEL_COMMENT_CONFIDENCE:.2f} 미만이면 코멘트를 작성하지 마세요.",
             ],
             "file_context_rules": [
@@ -3464,11 +3479,17 @@ def collect_validated_comments(
         if confidence is None:
             increment_reason(stats.dropped_model_comment_reasons, "missing_or_invalid_confidence")
             continue
-        if confidence < MIN_MODEL_COMMENT_CONFIDENCE:
+        # severity 를 먼저 정규화해야 등급별 문턱을 적용할 수 있다.
+        severity = normalize_severity(raw.get("severity"))
+        minimum_confidence = (
+            MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE
+            if severity in BLOCKING_SEVERITIES
+            else MIN_MODEL_COMMENT_CONFIDENCE
+        )
+        if confidence < minimum_confidence:
             increment_reason(stats.dropped_model_comment_reasons, "low_confidence")
             continue
 
-        severity = normalize_severity(raw.get("severity"))
         if severity in BLOCKING_SEVERITIES and confidence_label != "high":
             increment_reason(stats.dropped_model_comment_reasons, "blocking_without_high_confidence")
             continue

@@ -4,7 +4,7 @@ import types
 import unittest
 from unittest import mock
 
-from review_runner import mlx_review_client
+from review_runner import mlx_review_client, mlx_review_prompt, review_service
 
 
 class MlxReviewClientDefaultsTests(unittest.TestCase):
@@ -70,142 +70,91 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "MLX_DEVICE must be one of: auto, cpu, gpu"):
                 mlx_review_client.configure_default_device()
 
-    def test_build_messages_uses_strict_reviewer_persona_and_new_schema(self) -> None:
-        """Phase 2 프롬프트 재작성 결과를 고정한다.
+    def test_build_messages_holds_the_runtime_contract(self) -> None:
+        """프롬프트가 런타임과 맺은 계약을 고정한다.
 
-        시스템 프롬프트는 역할 프라이밍 + 우선순위 리스트 + 새 스키마 계약(must_fix/
-        suggestions/positives 삼분할) 을 담고 있어야 한다. 유저 프롬프트는 규칙 나열
-        대신 짧은 지시만 유지한다.
+        문구가 아니라 **계약**만 검증한다. 이전 버전은 프롬프트 문장을 리터럴로 고정해
+        표현을 다듬을 때마다 깨졌고, 정작 계약이 깨졌는지는 알려주지 못했다. 여기서
+        고정할 것은 런타임이 실제로 의존하는 것들이다: 스키마 키, comments[] 필드,
+        body 형식, severity enum, 등급별 confidence 문턱, 한국어 강제.
         """
         messages = mlx_review_client.build_messages({"repository": "demo/repo", "pull_request": 1, "files": []})
-
         system_prompt = messages[0]["content"]
         user_prompt = messages[1]["content"]
 
-        # 역할 프라이밍
-        self.assertIn("senior software engineer acting as a strict, evidence-driven", system_prompt)
-        self.assertIn("accuracy, not finding many issues", system_prompt)
-        self.assertIn("False positives are worse", system_prompt)
-        self.assertIn("missing a reproducible correctness", system_prompt)
-
-        # 우선순위 리스트 (1~6번이 명시되는지)
-        self.assertIn("Review priority", system_prompt)
-        self.assertIn("Bugs, missing exception handling", system_prompt)
-        self.assertIn("Concurrency, thread-safety", system_prompt)
-        self.assertIn("Security", system_prompt)
-        self.assertIn("Bug-finding pass before APPROVE", system_prompt)
-
-        # 새 스키마 키 계약
+        # 스키마 키 계약 — validate_mlx_output 가 이 키들을 읽는다.
         self.assertIn("summary, event, positives, must_fix, suggestions, comments", system_prompt)
-        self.assertIn("must_fix and suggestions must be empty arrays", system_prompt)
         self.assertIn("{path, line, severity, confidence, body}", system_prompt)
-        self.assertIn("numeric fields such as comments[].line and comments[].confidence must not be quoted", system_prompt)
+        # must_fix / suggestions 는 런타임이 무시하므로 빈 배열이어야 한다.
+        self.assertIn("must_fix and suggestions must always be empty arrays", system_prompt)
 
-        # 핵심 원칙
-        self.assertIn("Never speculate", system_prompt)
-        self.assertIn("emit no finding", system_prompt)
-        self.assertIn("Reject vague phrasing", system_prompt)
-        self.assertIn("'~가 추가되었습니다'", system_prompt)
-        self.assertIn("Prefer empty arrays over padding", system_prompt)
-
-        # 필드 정의가 line-scoped finding 계약을 명시하는지
-        self.assertIn("must_fix: always return []", system_prompt)
-        self.assertIn("suggestions: always return []", system_prompt)
+        # body 형식 — extract_confidence_label / has_required_finding_sections 가 파싱한다.
         self.assertIn(
-            "positives: optional. Include only things THIS PR actually improves",
+            "Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low",
             system_prompt,
         )
-        self.assertIn("positives must be a JSON array of strings and may be empty", system_prompt)
 
-        # event 규칙이 runtime 강제 안내를 포함
-        self.assertIn("runtime rewrites event based on accepted line comments", system_prompt)
+        # severity enum 4단계 — normalize_severity 와 BLOCKING_SEVERITIES 가 의존한다.
+        for severity in ("Blocking", "Major", "Minor", "Suggestion"):
+            self.assertIn(severity, system_prompt)
 
-        # 보안/계약 체크리스트 보존
-        self.assertIn("disable validation", system_prompt)
-        self.assertIn("bypass auth/signature", system_prompt)
-        self.assertIn("log a token/secret", system_prompt)
+        # 등급별 confidence 문턱이 런타임 상수와 일치해야 한다. 어긋나면 모델이
+        # 내보낸 지적을 런타임이 조용히 버린다.
+        self.assertIn(f"confidence >= {mlx_review_prompt.MIN_BLOCKING_CONFIDENCE:.1f}", system_prompt)
+        self.assertIn(f"confidence >= {mlx_review_prompt.MIN_COMMENT_CONFIDENCE:.1f}", system_prompt)
+        self.assertEqual(
+            mlx_review_prompt.MIN_COMMENT_CONFIDENCE,
+            review_service.MIN_MODEL_COMMENT_CONFIDENCE,
+        )
+        self.assertEqual(
+            mlx_review_prompt.MIN_BLOCKING_CONFIDENCE,
+            review_service.MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE,
+        )
 
-        # 스키마 예시와 빈 결과 예시가 새 키로 갱신됐는지
+        # 출력 형식 계약 — 파서가 strict JSON 을 기대한다.
+        self.assertIn("exactly one JSON object", system_prompt)
+        self.assertIn("Never wrap it in markdown fences", system_prompt)
         self.assertIn('"must_fix":[],"suggestions":[]', system_prompt)
         self.assertIn('"event":"APPROVE","positives":[]', system_prompt)
 
-        # 라인 코멘트 severity 4단계 정의가 프롬프트에 노출되는지
-        self.assertIn("Severity levels for comments", system_prompt)
-        self.assertIn("Blocking", system_prompt)
-        self.assertIn("Major", system_prompt)
-        self.assertIn("Minor", system_prompt)
-        self.assertIn("Suggestion", system_prompt)
-        self.assertIn('"severity":"Major"', system_prompt)
-        self.assertIn('"confidence":0.92', system_prompt)
-        # event 강제 규칙이 세 분기(REQUEST_CHANGES / APPROVE / COMMENT) 를 모두 노출하는지.
-        self.assertIn(
-            "REQUEST_CHANGES is triggered by any accepted Blocking/Major line comment",
-            system_prompt,
-        )
-        self.assertIn(
-            "APPROVE is used ONLY when comments is empty",
-            system_prompt,
-        )
-        self.assertIn(
-            "Minor/Suggestion line comments keep event at COMMENT",
-            system_prompt,
-        )
-        # event enum 자체에 APPROVE 가 포함돼 있는지
-        self.assertIn('"APPROVE"', system_prompt)
-        # 빈 결과 템플릿도 APPROVE 를 기본 event 로 제시하는지
-        self.assertIn('"event":"APPROVE"', system_prompt)
+        # 한국어 강제 — 리뷰 대상 독자가 한국어 사용자다.
+        self.assertIn("Write every natural-language string in Korean", system_prompt)
 
-        # 환각 방지 가드레일 4가지가 프롬프트에 그대로 노출되는지 — 7B 모델이 추측성
-        # 지적/중복 제안을 내지 않도록 라인 코멘트 생성 전 자체 점검을 강제하는 규칙.
-        self.assertIn("Anti-hallucination guardrails", system_prompt)
-        self.assertIn("have I actually read the affected lines", system_prompt)
-        self.assertIn("already implemented nearby or elsewhere", system_prompt)
-        self.assertIn("code flow rather than variable names", system_prompt)
-        self.assertIn("below 0.8, omit the finding", system_prompt)
-        self.assertIn("missing or low confidence", system_prompt)
-        self.assertIn("Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low", system_prompt)
-        self.assertIn("Review only the latest PR HEAD", system_prompt)
-        self.assertIn("Every finding must be reproducible", system_prompt)
-        self.assertIn("Performance findings must include expected call frequency", system_prompt)
-        self.assertIn("Test findings must name the exact missing failure mode", system_prompt)
-        self.assertIn("Do not suggest 'translate this comment/docstring to Korean'", system_prompt)
-        self.assertIn("U+AC00 to U+D7A3", system_prompt)
-        # 영문 판정 기준이 'entirely ASCII' 에서 'contains no Hangul characters' 로 바뀐 것을
-        # 고정한다. em-dash 나 이모지 같은 비-ASCII 기호가 섞여도 영문 주석으로 판정 가능.
-        self.assertIn(
-            "Treat a comment as English only when it contains no Hangul characters",
-            system_prompt,
-        )
-        self.assertNotIn("Only treat a comment as English when it is entirely ASCII", system_prompt)
-        self.assertIn(
-            "verify that the same string or logic is not already present in the diff or base file",
-            system_prompt,
-        )
-        # Confidence gradient 가 두 단계로 나뉘고, comments[] severity 양쪽을 모두
-        # 포함하는지 고정한다.
-        self.assertIn("Confidence gradient:", system_prompt)
-        self.assertIn(
-            "if a finding's validity itself is uncertain, drop it or demote to 'Suggestion'",
-            system_prompt,
-        )
-        self.assertNotIn("move from must_fix to suggestions", system_prompt)
-        self.assertIn(
-            "if the finding is valid but its severity is ambiguous, default to 'Minor'",
-            system_prompt,
-        )
-        self.assertIn(
-            "Blocking and Major require concrete code evidence",
-            system_prompt,
-        )
-        # 기존 severity 섹션의 "When in doubt use Minor" 는 gradient 로 흡수돼 빠졌는지 확인.
-        self.assertNotIn("When in doubt use Minor", system_prompt)
+        # line anchor 계약 — valid_comment_lines 밖의 라인은 GitHub 이 거부한다.
+        self.assertIn("valid_comment_lines", system_prompt)
 
-        # 유저 프롬프트는 짧게 유지하면서 한국어 강제와 빈 결과 허용만 분명히 전달
+        # 보안 스윕이 남아 있는지 (모델 성능과 무관하게 유지할 체크리스트)
+        self.assertIn("auth or signature checks", system_prompt)
+
+        # 유저 프롬프트는 짧게 유지한다.
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)
-        self.assertIn("Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low", user_prompt)
-        self.assertIn("APPROVE 전에 correctness/security/regression/test-failure 체크", user_prompt)
-        self.assertIn("diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요", user_prompt)
+
+    def test_system_prompt_stays_lean(self) -> None:
+        """프롬프트 비대화를 막는다.
+
+        규칙 하나를 덧붙이는 비용은 눈에 안 보이지만 리뷰마다 prefill 로 지불된다.
+        실측 960 chars/s 기준 10,480자 프롬프트는 규칙만으로 약 11초였다. 관찰된
+        실패마다 금지 규칙을 덧대는 방식으로 되돌아가면 이 테스트가 먼저 깨진다.
+        """
+        system_prompt = mlx_review_prompt.build_system_prompt()
+        self.assertLess(
+            len(system_prompt),
+            8000,
+            "시스템 프롬프트가 8000자를 넘었습니다. 금지 규칙을 덧대는 대신 "
+            "'증거 기준' 으로 접을 수 있는지 먼저 검토하세요.",
+        )
+
+    def test_prompt_frames_false_positives_and_misses_symmetrically(self) -> None:
+        """침묵을 안전한 선택으로 만들지 않는다.
+
+        이전 프롬프트는 'false positives are worse than missed suggestions' 로 한쪽에만
+        비용을 매겨, 모델이 확신 없는 정당한 지적까지 버리도록 유도했다.
+        """
+        system_prompt = mlx_review_prompt.build_system_prompt()
+        self.assertIn("equally bad", system_prompt)
+        self.assertIn("Do not treat silence as the safe answer", system_prompt)
+        self.assertNotIn("False positives are worse", system_prompt)
 
 
 if __name__ == "__main__":
