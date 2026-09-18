@@ -292,6 +292,18 @@ class ProcessMessageTestCase(unittest.TestCase):
             review_worker.process_message(self.client, "1-0", JOB_FIELDS)
         self.assertEqual(self.client.pipeline_executions, 1)
 
+    def test_dead_letter_releases_the_delivery_marker(self) -> None:
+        """격리는 포기 선언이다. 마커가 남으면 재전송으로도 복구할 수 없다.
+
+        실제로 PR #57 리뷰 job 이 격리된 뒤, 마커가 6.7일 남아 있어 GitHub
+        redelivery 를 보내도 receiver 가 중복으로 걸러내는 상태였다.
+        """
+        marker = review_queue.delivery_marker_key("d-1")
+        self.client.store[marker] = "claimed"
+        review_worker.process_message(self.client, "1-0", {**JOB_FIELDS, "pull_number": "xx"})
+        self.assertEqual(len(self.client.dead), 1)
+        self.assertNotIn(marker, self.client.store, "격리 시 마커를 풀어야 재전송이 통한다")
+
     def test_malformed_job_goes_straight_to_dead_letter(self) -> None:
         with mock.patch.object(review_worker, "run_review_job") as run:
             review_worker.process_message(self.client, "1-0", {**JOB_FIELDS, "pull_number": "xx"})
