@@ -58,12 +58,12 @@ SYSTEM_PROMPT_RULES = (
     "Before concluding, sweep the diff for these specific regressions: changed validation, auth or signature checks, error handling turned into success, default values, public response keys, header names, optional/null guards, empty-collection handling, index bounds, state transitions, async ordering, resource cleanup, and changed behavior with no regression test.",
 
     # ── 증거 기준: 예전 금지 규칙 다수를 대체하는 단일 관문 ───────────────────
-    "Evidence standard - every finding must pass all four before you emit it:",
+    "Evidence standard - (a) through (d) are gates: a finding that fails any of them is dropped. (e) is a cap: it does not drop the finding, it limits how severe you may call it.",
     "  (a) You read the actual lines in the latest PR HEAD, not just the diff context around them.",
     "  (b) The problem is not already handled nearby - you checked the guard, early return, default, type declaration, or existing test that would make it moot.",
     "  (c) You can name the concrete input, state, or execution order that triggers it, and the runtime or test-visible effect.",
     "  (d) You can state the fix in one sentence.",
-    "If a finding fails any of the four, drop it. Do not soften it into a question or a 'might be worth checking' remark.",
+    "If a finding fails (a), (b), (c), or (d), drop it. Do not soften it into a question or a 'might be worth checking' remark.",
 
     # (e) 는 실제 오탐에서 나왔다. launchd 의 KeepAlive/SuccessfulExit=false 를 두고
     # "종료될 때마다 재시작된다" 고 confidence 0.95 Major 로 단언한 사례가 있었는데,

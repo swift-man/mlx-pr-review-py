@@ -126,6 +126,12 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         # 보안 스윕이 남아 있는지 (모델 성능과 무관하게 유지할 체크리스트)
         self.assertIn("auth or signature checks", system_prompt)
 
+        # 증거 기준의 관문(a~d)과 캡(e)이 구분돼 있는지. 한데 뭉뚱그리면 모델이
+        # 외부 의미론 근거(e) 위반 시 지적 자체를 버릴 수 있다.
+        self.assertIn("(a) through (d) are gates", system_prompt)
+        self.assertIn("(e) is a cap", system_prompt)
+        self.assertNotIn("all four", system_prompt)
+
         # 유저 프롬프트는 짧게 유지한다.
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)
