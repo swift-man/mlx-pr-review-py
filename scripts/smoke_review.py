@@ -4,14 +4,16 @@
 실제 git diff 로 리뷰 payload 를 만들어 8002 /v1/generate 에 보내고,
 (1) prefill+generate 소요시간 (2) strict JSON 파싱 성공 여부 를 확인한다.
 """
-import json, os, subprocess, sys, time, urllib.request
+import json, os, pathlib, subprocess, sys, time, urllib.request
 
-sys.path.insert(0, "/Users/m4_ai/mlx-pr-review-py")
+# 저장소 루트를 스크립트 위치에서 구한다. 절대 경로를 박으면 운영 러너
+# (/Users/runner/pr-review) 나 다른 개발자 머신에서 바로 깨진다.
+REPO = str(pathlib.Path(__file__).resolve().parent.parent)
+sys.path.insert(0, REPO)
 from review_runner.mlx_review_prompt import build_messages
 from review_runner.mlx_review_parser import parse_and_normalize_model_output
 
 URL = os.environ.get("MLX_GENERATE_URL", "http://127.0.0.1:8002/v1/generate")
-REPO = "/Users/m4_ai/mlx-pr-review-py"
 BASE = os.environ.get("SMOKE_BASE", "HEAD~3")
 
 
@@ -60,7 +62,12 @@ body = json.dumps({
 print(f"files={len(files)}  prompt_chars={prompt_chars:,}  (~{prompt_chars//3.2:,.0f} tokens est)")
 print(f"POST {URL}  body={len(body):,} bytes")
 
-req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+headers = {"Content-Type": "application/json"}
+# generate 서버가 Bearer 인증을 쓰는 환경에서는 토큰이 없으면 401 로 검증이 실패한다.
+auth_token = os.environ.get("MLX_GENERATE_AUTH_TOKEN", "").strip()
+if auth_token:
+    headers["Authorization"] = f"Bearer {auth_token}"
+req = urllib.request.Request(URL, data=body, headers=headers)
 t0 = time.monotonic()
 with urllib.request.urlopen(req, timeout=900) as resp:
     data = json.loads(resp.read().decode())

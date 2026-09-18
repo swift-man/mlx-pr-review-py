@@ -48,11 +48,19 @@ def log(message: str, **fields: Any) -> None:
 
 
 def consumer_name() -> str:
-    """머신마다 달라야 한다 — 2대 구성에서 같은 이름을 쓰면 PEL 이 뒤섞인다."""
+    """머신마다 달라야 하고, 재기동 사이에는 **같아야** 한다.
+
+    pid 를 넣으면 재기동할 때마다 consumer group 에 새 이름이 쌓인다. 죽은 consumer
+    는 스스로 사라지지 않아서 XINFO GROUPS 의 consumers 가 계속 늘어난다 (운영 중
+    재기동 3회만에 3개가 됐다). 이름을 고정하면 재기동 후 자기 PEL 을 그대로
+    이어받을 수 있다는 이점도 있다.
+
+    한 머신에서 워커를 여러 개 돌려야 하면 REVIEW_WORKER_NAME 으로 구분한다.
+    """
     override = os.environ.get("REVIEW_WORKER_NAME")
     if override:
         return override
-    return f"{socket.gethostname()}-{os.getpid()}"
+    return socket.gethostname()
 
 
 def max_attempts() -> int:
@@ -105,6 +113,30 @@ def process_message(client: redis.Redis, message_id: str, fields: dict[str, str]
         return
 
     prefix = f"[delivery={job['delivery_id']}] "
+
+    # stale 검사를 재시도 카운트보다 먼저 한다. 순서가 반대면 큐에서 대기하는 동안
+    # 무효가 된 job 도 INCR 을 소모하고, 한도에 걸린 상태로 stale 이 되면 '건너뜀'
+    # 이 아니라 dead letter 로 잘못 격리돼 거짓 경보가 된다.
+    #
+    # Redis 가 잠깐 안 되면 stale 판정을 포기하고 그냥 처리한다. 리뷰를 빠뜨리는
+    # 쪽이 중복 리뷰보다 나쁘고, 여기서 예외를 올리면 방금 집어든 job 이 ACK 되지
+    # 않은 채 최소 min_idle_ms 동안 방치된다.
+    try:
+        stale = review_queue.is_stale(client, job)
+    except redis.RedisError as exc:
+        log("stale_check_failed", message_id=message_id, error=str(exc))
+        stale = False
+    if stale:
+        log(
+            "job_stale_skipped",
+            message_id=message_id,
+            repository=job["repository"],
+            pull_number=job["pull_number"],
+            job_head=job["head_sha"][:12],
+        )
+        review_queue.ack(client, message_id)
+        return
+
     attempts = review_queue.record_attempt(client, message_id)
     limit = max_attempts()
 
@@ -117,19 +149,6 @@ def process_message(client: redis.Redis, message_id: str, fields: dict[str, str]
             pull_number=job["pull_number"],
         )
         review_queue.send_to_dead_letter(client, message_id, fields, f"max attempts ({limit}) exceeded")
-        return
-
-    if review_queue.is_stale(client, job):
-        # 이 job 이 큐에 있는 동안 같은 PR 에 새 push 가 들어왔다. 오래된 코드를
-        # 리뷰해봐야 버려지므로 모델을 돌리기 전에 버린다.
-        log(
-            "job_stale_skipped",
-            message_id=message_id,
-            repository=job["repository"],
-            pull_number=job["pull_number"],
-            job_head=job["head_sha"][:12],
-        )
-        review_queue.ack(client, message_id)
         return
 
     started_at = time.monotonic()
@@ -147,14 +166,25 @@ def process_message(client: redis.Redis, message_id: str, fields: dict[str, str]
     except Exception as exc:  # noqa: BLE001 - 어떤 실패든 job 을 잃지 않는 게 우선
         # ACK 하지 않고 빠져나간다. PEL 에 남아 min-idle-time 뒤 XAUTOCLAIM 이
         # 회수하고, attempts 가 한도를 넘으면 dead letter 로 간다.
+        detail = str(exc) or exc.__class__.__name__
         log(
             "job_failed",
             message_id=message_id,
             attempt=attempts,
             error_type=exc.__class__.__name__,
-            error=str(exc) or exc.__class__.__name__,
+            error=detail,
             elapsed=round(time.monotonic() - started_at, 1),
         )
+        if attempts >= limit:
+            # 마지막 시도였다. 여기서 ACK 없이 돌아가면 min_idle_ms 를 기다렸다가
+            # 다음 회수 주기에 'max attempts exceeded' 라는 일반 문구로만 격리되어
+            # 실제 실패 원인이 사라진다. 지금 원인과 함께 격리한다.
+            review_queue.send_to_dead_letter(
+                client,
+                message_id,
+                fields,
+                f"attempt {attempts}/{limit} failed: {exc.__class__.__name__}: {detail}",
+            )
         return
 
     review_queue.ack(client, message_id)
@@ -176,10 +206,25 @@ def run_forever() -> None:
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
 
+    # 루프 안에서 매번 호출하면 정상 상태에서도 5초마다 XGROUP CREATE 를 보내
+    # BUSYGROUP 예외를 유발한다. 기동 시 한 번이면 충분하고, 그룹이 사라지는
+    # 예외 상황은 아래 RedisError 경로에서 재생성된다.
+    review_queue.ensure_consumer_group(client)
+
+    # 재기동 직후 자기가 물고 있던 job 부터 이어받는다. consumer 이름이 고정이라
+    # 이전 프로세스의 PEL 을 그대로 승계할 수 있다. 이게 없으면 min_idle_ms 를
+    # 기다려야만 회수된다.
+    try:
+        for message_id, fields in review_queue.read_own_pending(client, consumer):
+            log("job_resumed", message_id=message_id)
+            process_message(client, message_id, fields)
+            if _SHUTDOWN:
+                break
+    except redis.RedisError as exc:
+        log("redis_error", stage="read_own_pending", error=str(exc))
+
     while not _SHUTDOWN:
         try:
-            review_queue.ensure_consumer_group(client)
-
             # 먼저 버려진 job 부터 회수한다. 새 job 만 계속 집어가면 죽은 워커가
             # 남긴 작업이 영원히 처리되지 않는다.
             for message_id, fields in review_queue.claim_abandoned_jobs(
@@ -199,6 +244,11 @@ def run_forever() -> None:
         except redis.RedisError as exc:
             log("redis_error", error_type=exc.__class__.__name__, error=str(exc))
             time.sleep(REDIS_RETRY_DELAY_SECONDS)
+            # 그룹 자체가 사라진 경우(FLUSHDB 등)를 대비해 재생성만 시도한다.
+            try:
+                review_queue.ensure_consumer_group(client)
+            except redis.RedisError:
+                pass
 
     log("worker_stopped", consumer=consumer)
 
