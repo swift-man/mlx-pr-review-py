@@ -643,6 +643,17 @@ MIN_MODEL_COMMENT_CONFIDENCE = review_thresholds.MIN_COMMENT_CONFIDENCE
 MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE = review_thresholds.MIN_BLOCKING_CONFIDENCE
 MIN_TOP_LEVEL_FINDING_CONFIDENCE = review_thresholds.MIN_TOP_LEVEL_FINDING_CONFIDENCE
 MAX_EXISTING_REVIEW_CONTEXT_ITEMS = 30
+# 기존 리뷰 코멘트 본문을 프롬프트에 몇 자까지 실을지. **기본값 0 = 싣지 않음.**
+#
+# A/B 실측(PR #57, 같은 파일 3개)에서 본문을 25,444자 실었더니 모델이 낸 지적 3건이
+# 전부 기존 코멘트와 같은 (path, line) 이었다. 셋 다 이미 고치고 답글까지 단
+# 내용인데 코드에는 수정본이 들어 있는데도 confidence 0.93~0.96 으로 단언했다.
+# 본문을 빼자 그 행동이 사라졌고, 리뷰 시간도 313초 → 72초로 줄었다.
+#
+# 중복 방지라는 원래 목적은 (path, line) 목록만으로도 달성된다 — "이 위치에는 이미
+# 지적이 있다" 가 필요한 전부다. 본문은 베낄 거리만 제공했다.
+# 되돌리려면 MLX_REVIEW_EXISTING_CONTEXT_BODY_CHARS=900 으로 지정한다.
+DEFAULT_EXISTING_REVIEW_CONTEXT_BODY_CHARS = 0
 MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS = 900
 MAX_COPILOT_REVIEW_SECTION_ITEMS = 5
 MAX_COPILOT_REVIEW_SECTION_BODY_CHARS = 220
@@ -826,8 +837,11 @@ class PullRequestDiscussionItem:
         payload: dict[str, Any] = {
             "source": self.source,
             "author": self.author,
-            "body": self.body,
         }
+        # 본문이 비면 키 자체를 넣지 않는다. 빈 문자열을 남기면 모델이 그 자리를
+        # 채워야 할 빈칸으로 오해할 수 있다. 중복 판정에 필요한 건 path/line 이다.
+        if self.body:
+            payload["body"] = self.body
         if self.comment_id is not None:
             payload["comment_id"] = self.comment_id
         if self.path:
@@ -1109,11 +1123,25 @@ def coerce_optional_int(value: Any) -> int | None:
     return None
 
 
+def existing_review_context_body_limit() -> int:
+    """기존 코멘트 본문을 몇 자까지 실을지. 0 이면 싣지 않는다."""
+    raw = os.environ.get("MLX_REVIEW_EXISTING_CONTEXT_BODY_CHARS")
+    if raw is None or not raw.strip():
+        return DEFAULT_EXISTING_REVIEW_CONTEXT_BODY_CHARS
+    try:
+        return max(0, int(raw.strip()))
+    except ValueError:
+        return DEFAULT_EXISTING_REVIEW_CONTEXT_BODY_CHARS
+
+
 def truncate_existing_review_context_body(value: Any) -> str:
+    limit = existing_review_context_body_limit()
+    if limit <= 0:
+        return ""
     normalized = normalize_text(value)
-    if len(normalized) <= MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS:
+    if len(normalized) <= limit:
         return normalized
-    return normalized[: MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS - 3].rstrip() + "..."
+    return normalized[: limit - 3].rstrip() + "..."
 
 
 def github_comment_author(raw_comment: dict[str, Any]) -> str:
@@ -1146,13 +1174,15 @@ def build_issue_comment_context(raw_comment: dict[str, Any]) -> PullRequestDiscu
 
 
 def build_review_comment_context(raw_comment: dict[str, Any]) -> PullRequestDiscussionItem | None:
-    body = truncate_existing_review_context_body(raw_comment.get("body"))
-    if not body:
+    # 항목을 버릴지는 **원본** 본문 유무로 판단한다. 절단 결과로 판단하면 본문을
+    # 싣지 않는 설정(길이 0)에서 모든 항목이 사라져, 중복 판정에 필요한 path/line
+    # 까지 함께 잃는다.
+    if not normalize_text(raw_comment.get("body")):
         return None
     return PullRequestDiscussionItem(
         source="review_comment",
         author=github_comment_author(raw_comment),
-        body=body,
+        body=truncate_existing_review_context_body(raw_comment.get("body")),
         comment_id=coerce_optional_int(raw_comment.get("id")),
         path=normalize_text(raw_comment.get("path")) or None,
         line=coerce_optional_int(raw_comment.get("line")),
@@ -3129,11 +3159,10 @@ def make_prompt(
                 "문제가 current_file_context의 unchanged line에서 드러나더라도, comments[].line은 반드시 valid_comment_lines 중 이 문제를 새로 만든 changed/context line으로 선택하세요. 적절한 valid line이 없으면 코멘트를 작성하지 마세요.",
             ],
             "existing_review_context_rules": [
-                "existing_review_context가 있으면 Copilot, 다른 봇, 사용자 댓글과 대댓글의 최근 논의를 참고하세요.",
-                "이미 제기된 지적은 최신 PR HEAD의 diff와 파일 컨텍스트로 다시 증명될 때만 반복하세요.",
-                "동일한 path/line의 동일한 문제가 Copilot 리뷰 코멘트에 이미 있으면 comments에 중복 작성하지 마세요.",
-                "이미 반박되었거나 해결된 false positive를 다시 코멘트하지 마세요.",
-                "다른 리뷰어의 코멘트를 그대로 복사하지 말고, 코드 증거와 재현 가능한 조건이 있을 때만 comments에 작성하세요.",
+                "existing_review_context는 이미 지적이 달린 위치 목록입니다. 본문은 싣지 않습니다.",
+                "같은 path/line에 이미 지적이 있으면 comments에 다시 작성하지 마세요. 이미 다뤄진 자리입니다.",
+                "그 자리에 다른 문제가 있다고 판단되더라도 현재 코드에서 직접 증명할 수 있을 때만 작성하세요.",
+                "목록에 없는 위치를 우선 보세요. 새로 들어온 변경이 거기에 있습니다.",
             ],
             "summary_rules": [
                 "summary는 전체 변경을 한두 문장으로 요약하세요.",

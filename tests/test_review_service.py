@@ -972,9 +972,40 @@ class ExistingReviewContextTests(unittest.TestCase):
 
         self.assertEqual(prompt["existing_review_context"], context)
         rules = prompt["instructions"]["existing_review_context_rules"]
-        self.assertTrue(any("false positive" in rule for rule in rules))
-        self.assertTrue(any("최신 PR HEAD" in rule for rule in rules))
-        self.assertTrue(any("Copilot" in rule and "중복" in rule for rule in rules))
+        # 문구가 아니라 계약을 고정한다. 이 컨텍스트의 목적은 '이미 지적이 달린
+        # 위치를 다시 건드리지 않게 하는 것' 하나다.
+        self.assertTrue(any("path/line" in rule and "다시 작성하지" in rule for rule in rules))
+        self.assertTrue(any("증명" in rule for rule in rules))
+
+    def test_existing_review_context_omits_bodies_by_default(self) -> None:
+        """본문을 실으면 모델이 코드 대신 그것을 베낀다.
+
+        A/B 실측(PR #57): 본문 25,444자를 실었을 때 모델이 낸 지적 3건이 전부 기존
+        코멘트와 같은 (path, line) 이었고, 셋 다 이미 수정된 내용이었다. 본문을 빼자
+        그 행동이 사라졌다. 중복 판정에 필요한 건 위치뿐이다.
+        """
+        raw = {
+            "body": "Problem: 아주 긴 기존 지적. " * 50,
+            "id": 7,
+            "path": "app/main.py",
+            "line": 12,
+            "user": {"login": "some-bot"},
+        }
+        item = review_service.build_review_comment_context(raw)
+        self.assertIsNotNone(item, "본문을 안 싣더라도 위치 정보는 남아야 한다")
+        payload = item.to_prompt_dict()
+        self.assertNotIn("body", payload, "기본값에서는 본문을 싣지 않는다")
+        self.assertEqual(payload["path"], "app/main.py")
+        self.assertEqual(payload["line"], 12)
+
+    def test_existing_review_context_body_can_be_restored(self) -> None:
+        """되돌릴 수 있어야 한다 — 판단이 틀렸을 때 환경변수로 복구한다."""
+        raw = {"body": "x" * 2000, "id": 7, "path": "a.py", "line": 1, "user": {"login": "b"}}
+        with mock.patch.dict(
+            "os.environ", {"MLX_REVIEW_EXISTING_CONTEXT_BODY_CHARS": "900"}
+        ):
+            payload = review_service.build_review_comment_context(raw).to_prompt_dict()
+        self.assertEqual(len(payload["body"]), 900)
 
     def test_current_file_context_excerpt_expands_hunk_context(self) -> None:
         file_text = "\n".join(f"line {line_number}" for line_number in range(1, 21))
