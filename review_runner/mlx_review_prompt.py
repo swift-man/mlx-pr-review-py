@@ -112,7 +112,9 @@ USER_PROMPT_RULES = (
     # invalid_confidence_label 로 버려진다. 두 요구를 문장으로 분리한다.
     "각 라인 코멘트의 body는 'Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low' 형식을 그대로 따르세요. Confidence 뒤에는 High/Medium/Low 라벨만 쓰고 숫자를 덧붙이지 마세요.",
     "numeric confidence는 body가 아니라 comments[] 객체의 confidence 필드에 숫자로 넣으세요.",
-    "must_fix, suggestions, comments 가 비어 있어도 괜찮지만, APPROVE 전에 correctness/security/regression/test-failure 체크를 실제로 수행하세요. 재현 가능한 오류가 있으면 반드시 comments[]에 작성하세요.",
+    # 시스템 프롬프트는 must_fix/suggestions 를 '항상 빈 배열' 로 못박는데, 여기서
+    # '비어 있어도 괜찮다' 고 쓰면 채워도 된다는 뜻으로 읽힌다. 단일 출구 규칙에 맞춘다.
+    "must_fix 와 suggestions 는 항상 빈 배열로 두세요. comments 가 비어 있어도 괜찮지만, APPROVE 전에 correctness/security/regression/test-failure 체크를 실제로 수행하세요. 재현 가능한 오류가 있으면 반드시 comments[]에 작성하세요.",
     "diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요. 문제 진술이 아니면 제외합니다.",
 )
 

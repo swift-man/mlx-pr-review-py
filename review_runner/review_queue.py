@@ -87,20 +87,29 @@ def sanitized_redis_url(url: str | None = None) -> str:
     """
     raw = url or redis_url()
     parsed = urllib.parse.urlsplit(raw)
+    has_userinfo = "@" in parsed.netloc
 
-    # 마스킹할 것도 제거할 것도 없으면 원본 그대로 둔다.
-    if not parsed.password and not parsed.query and not parsed.fragment:
+    # 가릴 것도 지울 것도 없으면 원본 그대로 둔다.
+    if not has_userinfo and not parsed.query and not parsed.fragment:
         return raw
 
     # host:port 는 netloc 원본에서 잘라 쓴다. parsed.hostname 은 IPv6 의 대괄호를
     # 벗겨내기 때문에(::1), 포트와 이어 붙이면 ::1:6379 같은 잘못된 netloc 이 된다.
     host = parsed.netloc.rpartition("@")[-1]
 
-    if parsed.password:
-        user = parsed.username or ""
-        netloc = f"{user}:***@{host}"
-    else:
+    if not has_userinfo:
         netloc = host
+    elif parsed.password is not None:
+        # user:pw@ — 콜론으로 나뉘어 있으니 앞쪽은 사용자명이 분명하다. 사용자명은
+        # 비밀이 아니고 어느 계정으로 붙는지가 진단에 도움이 되므로 남긴다.
+        netloc = f"{parsed.username or ''}:***@{host}"
+    else:
+        # token@ — 콜론이 없다. redis-py 는 이걸 username 으로 파싱하지만
+        # (password 아님), 그 자리에 비밀번호를 잘못 넣는 설정 실수가 흔하다.
+        # 사용자명인지 새어나가면 안 되는 값인지 여기서는 구분할 수 없으므로
+        # 가리는 쪽을 택한다. 로그에 사용자명이 안 보이는 손해보다 비밀이 새는
+        # 손해가 크다.
+        netloc = f"***@{host}"
 
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 

@@ -229,6 +229,21 @@ class SanitizedRedisUrlTestCase(unittest.TestCase):
         self.assertNotIn("SECRET", masked)
         self.assertEqual(masked, "redis://h:6379/0")
 
+    def test_lone_userinfo_token_is_masked(self) -> None:
+        """콜론 없는 userinfo 는 사용자명인지 잘못 넣은 비밀번호인지 알 수 없다.
+
+        redis-py 는 ``redis://tok3n@h`` 를 username 으로 파싱하지만(password 아님),
+        그 자리에 비밀번호를 넣는 설정 실수가 흔하다. 구분할 수 없으므로 가린다.
+        """
+        masked = review_queue.sanitized_redis_url("redis://tok3n@h:6379/0")
+        self.assertNotIn("tok3n", masked)
+        self.assertEqual(masked, "redis://***@h:6379/0")
+
+    def test_username_is_not_dropped_when_userinfo_exists(self) -> None:
+        """userinfo 를 통째로 버리면 어느 계정으로 붙는지 알 수 없어진다."""
+        masked = review_queue.sanitized_redis_url("redis://user:pw@h:6379/1")
+        self.assertEqual(masked, "redis://user:***@h:6379/1")
+
     def test_ipv6_brackets_are_preserved(self) -> None:
         """parsed.hostname 은 대괄호를 벗겨내 ::1:6379 같은 잘못된 netloc 을 만든다."""
         masked = review_queue.sanitized_redis_url("redis://:pw@[::1]:6379/0")
