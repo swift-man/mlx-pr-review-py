@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.swiftman.pr-review-worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/m4_ai/pr-review/scripts/run_review_worker.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/m4_ai/pr-review</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/pr-review-worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pr-review-worker.err.log</string>
+</dict>
+</plist>
