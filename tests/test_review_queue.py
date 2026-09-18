@@ -27,6 +27,7 @@ class FakeRedis:
         self.own_pending: list = []
         self.new_jobs: list = []
         self.autoclaim_calls: list[str] = []
+        self.autoclaim_counts: list[int] = []
         self.autoclaim_batches: list = []
         self.pipeline_executions = 0
 
@@ -74,8 +75,9 @@ class FakeRedis:
         return [(key, list(self.new_jobs))] if self.new_jobs else []
 
     def xautoclaim(self, stream, group, consumer, min_idle_time=0, start_id="0-0", count=1):
-        # cursor 를 따라가는지 검증하기 위해 호출 인자를 기록한다.
+        # cursor 를 따라가는지, 스캔 폭이 수집 목표와 분리됐는지 검증하기 위해 기록한다.
         self.autoclaim_calls.append(start_id)
+        self.autoclaim_counts.append(count)
         batch = self.autoclaim_batches.pop(0) if self.autoclaim_batches else ("0-0", [], [])
         return batch
 
@@ -114,6 +116,23 @@ JOB_FIELDS = {
 
 
 class QueueContractTestCase(unittest.TestCase):
+    def test_thresholds_have_a_single_source(self) -> None:
+        """프롬프트와 런타임이 같은 객체를 봐야 값이 어긋날 수 없다.
+
+        어긋나면 모델이 규칙대로 낸 지적을 런타임이 조용히 버리는데, 로그상
+        '모델이 아무것도 안 냈다' 와 구분되지 않아 원인을 찾기 어렵다.
+        """
+        from review_runner import mlx_review_prompt, review_service, review_thresholds
+
+        self.assertIs(mlx_review_prompt.MIN_COMMENT_CONFIDENCE,
+                      review_thresholds.MIN_COMMENT_CONFIDENCE)
+        self.assertIs(review_service.MIN_MODEL_COMMENT_CONFIDENCE,
+                      review_thresholds.MIN_COMMENT_CONFIDENCE)
+        self.assertIs(mlx_review_prompt.MIN_BLOCKING_CONFIDENCE,
+                      review_thresholds.MIN_BLOCKING_CONFIDENCE)
+        self.assertIs(review_service.MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE,
+                      review_thresholds.MIN_BLOCKING_CONFIDENCE)
+
     def test_contract_literals_are_pinned(self) -> None:
         """이 값들은 receiver repo 와 공유하는 계약이다. 바꾸려면 양쪽을 같이 바꿔야 한다."""
         self.assertEqual(review_queue.STREAM_KEY, "prr:review_jobs")
@@ -199,6 +218,33 @@ class SanitizedRedisUrlTestCase(unittest.TestCase):
         masked = review_queue.sanitized_redis_url("redis://:p@h:6379/0?password=p2#frag")
         self.assertNotIn("p2", masked)
         self.assertNotIn("frag", masked)
+
+    def test_query_only_password_is_not_leaked(self) -> None:
+        """userinfo 가 없어도 query 의 비밀번호를 흘리면 안 된다.
+
+        userinfo 유무로 일찍 반환하던 버전이 이 경로를 그대로 로그에 남겼다.
+        redis-py 는 ``?password=`` 형식을 지원하므로 실제로 쓰일 수 있는 구성이다.
+        """
+        masked = review_queue.sanitized_redis_url("redis://h:6379/0?password=SECRET")
+        self.assertNotIn("SECRET", masked)
+        self.assertEqual(masked, "redis://h:6379/0")
+
+    def test_ipv6_brackets_are_preserved(self) -> None:
+        """parsed.hostname 은 대괄호를 벗겨내 ::1:6379 같은 잘못된 netloc 을 만든다."""
+        masked = review_queue.sanitized_redis_url("redis://:pw@[::1]:6379/0")
+        self.assertNotIn("pw", masked)
+        self.assertEqual(masked, "redis://:***@[::1]:6379/0")
+
+    def test_reclaim_scan_count_is_independent_of_collection_target(self) -> None:
+        """XAUTOCLAIM 의 COUNT 는 반환 수가 아니라 PEL 스캔 한도다.
+
+        수집 목표(count)를 그대로 넘기면 앞쪽에 idle 이 아닌 항목이 조금만 쌓여도
+        뒤쪽의 죽은 job 에 닿지 못한다.
+        """
+        client = FakeRedis()
+        client.autoclaim_batches = [("0-0", [("9-0", dict(JOB_FIELDS))], [])]
+        review_queue.claim_abandoned_jobs(client, "c1", count=1)
+        self.assertEqual(client.autoclaim_counts, [review_queue.RECLAIM_SCAN_COUNT])
 class ShutdownOrderingTestCase(unittest.TestCase):
     """종료 요청 뒤에는 새 리뷰를 시작하지 않는다.
 

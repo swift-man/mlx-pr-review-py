@@ -44,6 +44,9 @@ ATTEMPTS_TTL_SECONDS = 24 * 60 * 60
 # 회수 루프가 한 주기를 독점하지 않게 상한을 둔다.
 MAX_RECLAIM_SCANS = 20
 
+# XAUTOCLAIM 한 번이 훑을 PEL 엔트리 수. 반환 개수 상한이 아니다.
+RECLAIM_SCAN_COUNT = 100
+
 # dead letter 보존 상한. 운영자가 원인 분석할 만큼만 남기고 그 이상은 버린다.
 DEAD_LETTER_MAXLEN = 1000
 
@@ -73,18 +76,33 @@ def sanitized_redis_url(url: str | None = None) -> str:
     REVIEW_REDIS_URL 은 ``redis://:<password>@host:port/db`` 형태라 그대로 찍으면
     운영 로그에 비밀번호가 평문으로 남는다. LaunchAgent 로그는 /tmp 에 world-readable
     로 생성되므로 특히 위험하다.
+
+    비밀번호가 실릴 수 있는 경로가 둘이라 양쪽 다 막는다:
+
+    1. userinfo (``redis://:pw@host``)
+    2. query (``redis://host/0?password=pw``) — redis-py 가 이 형식도 지원한다.
+
+    userinfo 만 보고 일찍 반환하면 (2) 가 그대로 샌다. 실제로 그렇게 새던 버전이
+    있었으므로, query/fragment 는 비밀번호 유무와 무관하게 **항상** 제거한다.
     """
     raw = url or redis_url()
     parsed = urllib.parse.urlsplit(raw)
-    if not parsed.password:
+
+    # 마스킹할 것도 제거할 것도 없으면 원본 그대로 둔다.
+    if not parsed.password and not parsed.query and not parsed.fragment:
         return raw
-    host = parsed.hostname or ""
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
-    user = parsed.username or ""
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, f"{user}:***@{host}", parsed.path, "", "")
-    )
+
+    # host:port 는 netloc 원본에서 잘라 쓴다. parsed.hostname 은 IPv6 의 대괄호를
+    # 벗겨내기 때문에(::1), 포트와 이어 붙이면 ::1:6379 같은 잘못된 netloc 이 된다.
+    host = parsed.netloc.rpartition("@")[-1]
+
+    if parsed.password:
+        user = parsed.username or ""
+        netloc = f"{user}:***@{host}"
+    else:
+        netloc = host
+
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def latest_head_key(repository: str, pull_number: int) -> str:
@@ -225,7 +243,11 @@ def claim_abandoned_jobs(
             consumer,
             min_idle_time=min_idle_ms,
             start_id=cursor,
-            count=count,
+            # XAUTOCLAIM 의 COUNT 는 '돌려줄 개수' 가 아니라 'PEL 을 몇 개까지
+            # 훑을지' 다. 여기에 수집 목표(count=1)를 그대로 넘기면 앞쪽에 아직
+            # idle 이 아닌 항목이 조금만 쌓여도 뒤쪽 job 에 닿지 못한다. 스캔 폭은
+            # 넉넉히 주고, 수집 목표는 아래 파이썬 루프에서 끊는다.
+            count=RECLAIM_SCAN_COUNT,
         )
         entries = result[1] if len(result) >= 2 else []
         claimed.extend(entry for entry in entries if entry and entry[1])

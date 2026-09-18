@@ -132,9 +132,21 @@ class MlxReviewClientDeviceTests(unittest.TestCase):
         self.assertIn("(e) is a cap", system_prompt)
         self.assertNotIn("all four", system_prompt)
 
+        # 지적 개수 제한이 comments[] 단일 출구를 가리켜야 한다. 구 스키마의
+        # "across must_fix, suggestions, and comments combined" 가 남으면 모델이
+        # 개수를 채우려고 빈 배열 규칙을 흔든다.
+        self.assertIn("findings in comments[]", system_prompt)
+        self.assertNotIn("across must_fix, suggestions, and comments combined", system_prompt)
+
         # 유저 프롬프트는 짧게 유지한다.
         self.assertIn("위 시스템 지시를 엄격히 따라", user_prompt)
         self.assertIn("JSON 객체 하나만", user_prompt)
+
+        # body 의 Confidence 라벨과 comments[].confidence 숫자를 분리해 지시해야 한다.
+        # 한 문장에 묶으면 모델이 body 에 'Confidence: High (0.92)' 를 써서
+        # extract_confidence_label(^(high|medium|low)$) 매칭이 실패하고 코멘트가 버려진다.
+        self.assertIn("숫자를 덧붙이지 마세요", user_prompt)
+        self.assertIn("comments[] 객체의 confidence 필드", user_prompt)
 
     def test_system_prompt_stays_lean(self) -> None:
         """프롬프트 비대화를 막는다.

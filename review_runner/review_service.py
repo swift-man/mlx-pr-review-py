@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Shared PR review service used by CLI entrypoints and the webhook server."""
 
+
 from __future__ import annotations
 
 import base64
@@ -26,6 +27,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
+
+from review_runner import review_thresholds
 
 import certifi
 import jwt
@@ -634,20 +637,11 @@ SEVERITY_MAJOR = "Major"
 SEVERITY_MINOR = "Minor"
 SEVERITY_SUGGESTION = "Suggestion"
 ALL_SEVERITIES = (SEVERITY_BLOCKING, SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_SUGGESTION)
-# confidence 문턱은 등급별로 다르다.
-#
-# 머지를 막는 Blocking/Major 는 오탐 비용이 커서 0.8 을 유지한다. 반대로 머지를 막지
-# 않는 Minor/Suggestion 까지 0.8 을 요구하면, 확신 0.6~0.8 구간의 정당한 지적이 전부
-# 버려져 리뷰가 "치명적 버그 아니면 침묵" 이 된다. 프롬프트의 등급 정의
-# (mlx_review_prompt.MIN_COMMENT_CONFIDENCE / MIN_BLOCKING_CONFIDENCE) 와 같은 값이어야
-# 하며, 한쪽만 바꾸면 모델이 내보낸 지적을 런타임이 조용히 버린다.
-MIN_MODEL_COMMENT_CONFIDENCE = 0.6
-MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE = 0.8
-
-# top-level finding(must_fix/suggestions) 복구 경로는 모델이 numeric confidence 를
-# 주지 않아 본문 라벨에서 역산한다. comments[] 보다 증거가 약하므로 문턱을 따로 둔다.
-# comment 문턱과 공유하면 0.6 으로 낮출 때 medium 라벨(0.7)까지 조용히 통과한다.
-MIN_TOP_LEVEL_FINDING_CONFIDENCE = 0.8
+# 문턱은 review_thresholds 한 곳에서만 정의한다 (프롬프트와 공유).
+# 이름은 기존 호출부 호환을 위해 유지한다.
+MIN_MODEL_COMMENT_CONFIDENCE = review_thresholds.MIN_COMMENT_CONFIDENCE
+MIN_BLOCKING_MODEL_COMMENT_CONFIDENCE = review_thresholds.MIN_BLOCKING_CONFIDENCE
+MIN_TOP_LEVEL_FINDING_CONFIDENCE = review_thresholds.MIN_TOP_LEVEL_FINDING_CONFIDENCE
 MAX_EXISTING_REVIEW_CONTEXT_ITEMS = 30
 MAX_EXISTING_REVIEW_CONTEXT_BODY_CHARS = 900
 MAX_COPILOT_REVIEW_SECTION_ITEMS = 5

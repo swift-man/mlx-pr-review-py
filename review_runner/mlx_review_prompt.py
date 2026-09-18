@@ -5,19 +5,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from review_runner import review_thresholds
+
 DEFAULT_MAX_FINDINGS = 10
 
-# confidence 문턱을 등급별로 나눈다.
-#
-# 7B 시절에는 모든 등급에 0.8 을 균일 적용했다. 환각이 잦아 문턱을 낮추면 오탐이
-# 그대로 새어나왔기 때문이다. 대신 확신이 0.6~0.8 구간인 정당한 Minor/Suggestion 이
-# 전부 버려져, 리뷰가 "치명적 버그 아니면 침묵" 으로 굳었다.
-#
-# 코딩 특화 모델로 바꾼 뒤에는 그 트레이드오프를 다시 나눌 수 있다. 머지를 막는
-# Blocking/Major 는 0.8 을 유지해 오탐 비용을 그대로 억제하고, 머지를 막지 않는
-# Minor/Suggestion 만 0.6 으로 낮춰 신호를 살린다.
-MIN_BLOCKING_CONFIDENCE = 0.8
-MIN_COMMENT_CONFIDENCE = 0.6
+# 문턱은 review_thresholds 한 곳에서만 정의한다. 런타임 검증(review_service)과
+# 값이 어긋나면 모델이 규칙대로 내보낸 지적을 런타임이 조용히 버린다.
+MIN_BLOCKING_CONFIDENCE = review_thresholds.MIN_BLOCKING_CONFIDENCE
+MIN_COMMENT_CONFIDENCE = review_thresholds.MIN_COMMENT_CONFIDENCE
 
 
 # 시스템 프롬프트.
@@ -111,7 +106,12 @@ SYSTEM_PROMPT_RULES = (
 USER_PROMPT_RULES = (
     "위 시스템 지시를 엄격히 따라 아래 PR diff payload 를 리뷰하세요.",
     "출력은 JSON 객체 하나만, 모든 자연어 문장은 한국어로 작성합니다.",
-    "각 라인 코멘트 body는 'Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low' 형식을 따르고, numeric confidence도 포함하세요.",
+    # body 와 numeric confidence 를 한 문장에 묶어 두면 모델이 body 안에
+    # 'Confidence: High (0.92)' 처럼 숫자를 섞어 쓴다. 런타임의 라벨 추출 정규식은
+    # ^(high|medium|low)$ 로 엄격해서, 숫자가 끼면 라벨이 None 이 되고 해당 코멘트가
+    # invalid_confidence_label 로 버려진다. 두 요구를 문장으로 분리한다.
+    "각 라인 코멘트의 body는 'Problem: ... Why it matters: ... Suggested fix: ... Confidence: High|Medium|Low' 형식을 그대로 따르세요. Confidence 뒤에는 High/Medium/Low 라벨만 쓰고 숫자를 덧붙이지 마세요.",
+    "numeric confidence는 body가 아니라 comments[] 객체의 confidence 필드에 숫자로 넣으세요.",
     "must_fix, suggestions, comments 가 비어 있어도 괜찮지만, APPROVE 전에 correctness/security/regression/test-failure 체크를 실제로 수행하세요. 재현 가능한 오류가 있으면 반드시 comments[]에 작성하세요.",
     "diff 가 이미 수행한 변경을 사실 서술로 옮기지 마세요. 문제 진술이 아니면 제외합니다.",
 )
@@ -136,7 +136,9 @@ EMPTY_RESULT_TEMPLATE = (
 def build_system_prompt(max_findings: int = DEFAULT_MAX_FINDINGS) -> str:
     rules = [
         *SYSTEM_PROMPT_RULES,
-        f"Return at most {max_findings} findings across must_fix, suggestions, and comments combined.",
+        # 구 스키마(삼분할) 잔재. 지금은 comments[] 가 유일한 출구인데 세 버킷을
+        # 합산하라고 읽히면, 모델이 개수를 채우려고 빈 배열 규칙을 흔들 수 있다.
+        f"Return at most {max_findings} findings in comments[].",
         f"Follow this shape exactly: {RESPONSE_SHAPE_TEMPLATE}",
         f"If there are no actionable findings, return {EMPTY_RESULT_TEMPLATE}. Do not pad positives; a neutral summary is enough.",
     ]
