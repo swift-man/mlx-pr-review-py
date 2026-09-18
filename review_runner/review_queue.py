@@ -288,6 +288,11 @@ def ack(client: redis.Redis, message_id: str) -> None:
     clear_attempts(client, message_id)
 
 
+def delivery_marker_key(delivery_id: str) -> str:
+    """receiver 의 중복 제거 마커. 키 형식은 receiver repo 와 공유하는 계약이다."""
+    return f"{KEY_PREFIX}delivery:{delivery_id}"
+
+
 def send_to_dead_letter(
     client: redis.Redis,
     message_id: str,
@@ -297,10 +302,25 @@ def send_to_dead_letter(
     """복구 불가 job 을 별도 stream 에 남기고 원본은 ACK 한다.
 
     ACK 하지 않으면 XAUTOCLAIM 이 같은 job 을 영원히 다시 집어온다.
+
+    함께 delivery 마커도 지운다. 격리는 '이 job 을 포기했다' 는 뜻인데, 마커가
+    남아 있으면 운영자가 GitHub 에서 같은 delivery 를 재전송해도 receiver 가
+    '이미 처리됨' 으로 걸러내 복구할 길이 막힌다. receiver 가 enqueue 실패 시
+    선점을 되돌리는 것과 같은 이유다.
     """
     payload = dict(fields)
     payload["dead_reason"] = reason
     payload["original_message_id"] = message_id
     # maxlen 없이 두면 복구 불가능한 job 이 쌓여 Redis 메모리를 영구히 먹는다.
     client.xadd(DEAD_LETTER_KEY, payload, maxlen=DEAD_LETTER_MAXLEN, approximate=True)
+
+    delivery_id = fields.get("delivery_id") or ""
+    if delivery_id:
+        try:
+            client.delete(delivery_marker_key(delivery_id))
+        except redis.RedisError:
+            # 격리 자체는 끝났다. 마커는 TTL 로 만료되므로 여기서 실패해도
+            # 최악의 경우 재전송이 그때까지 막힐 뿐이다.
+            pass
+
     ack(client, message_id)
