@@ -192,6 +192,36 @@ class QueueContractTestCase(unittest.TestCase):
             review_queue.parse_job({**JOB_FIELDS, "pull_number": "not-a-number"})
 
 
+class StartupResilienceTestCase(unittest.TestCase):
+    """기동 시점 Redis 장애로 프로세스가 죽지 않아야 한다.
+
+    죽으면 KeepAlive 가 곧바로 되살려 같은 지점에서 또 죽는 crashloop 가 된다.
+    실제로 Thunderbolt 링크가 순간 끊겼을 때 'No route to host' 로 죽었다.
+    """
+
+    def test_worker_waits_instead_of_crashing_when_redis_is_down_at_startup(self) -> None:
+        client = FakeRedis()
+        calls = {"n": 0}
+
+        def flaky_ensure(_c):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise redis.ConnectionError("No route to host")
+
+        with mock.patch.object(review_worker, "_SHUTDOWN", False), \
+             mock.patch.object(review_worker.review_queue, "build_redis_client", return_value=client), \
+             mock.patch.object(review_worker.review_queue, "ensure_consumer_group", side_effect=flaky_ensure), \
+             mock.patch.object(review_worker.review_queue, "read_own_pending", return_value=[]), \
+             mock.patch.object(review_worker.review_queue, "claim_abandoned_jobs", side_effect=KeyboardInterrupt), \
+             mock.patch.object(review_worker.time, "sleep"):
+            try:
+                review_worker.run_forever()
+            except KeyboardInterrupt:
+                pass  # 기동을 통과했다는 뜻 — 본 루프까지 도달
+
+        self.assertGreaterEqual(calls["n"], 2, "첫 실패 후 재시도해야 한다")
+
+
 class SanitizedRedisUrlTestCase(unittest.TestCase):
     """로그에 비밀번호가 새지 않는지 고정한다.
 

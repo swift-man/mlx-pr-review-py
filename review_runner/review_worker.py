@@ -213,22 +213,31 @@ def run_forever() -> None:
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
 
-    # 루프 안에서 매번 호출하면 정상 상태에서도 5초마다 XGROUP CREATE 를 보내
-    # BUSYGROUP 예외를 유발한다. 기동 시 한 번이면 충분하고, 그룹이 사라지는
-    # 예외 상황은 아래 RedisError 경로에서 재생성된다.
-    review_queue.ensure_consumer_group(client)
+    # 기동 시점에 Redis 가 잠깐 안 될 수 있다 (링크 재협상, Redis 재기동 등).
+    # 여기서 예외가 그대로 올라가면 프로세스가 죽고, KeepAlive 가 곧바로 되살려
+    # 같은 지점에서 또 죽는 crashloop 가 된다. 실제로 Thunderbolt 링크가 순간
+    # 끊겼을 때 이 경로에서 'No route to host' 로 죽었다.
+    #
+    # 루프 안의 RedisError 처리와 같은 방식으로, 연결될 때까지 기다린다.
+    while not _SHUTDOWN:
+        try:
+            # 루프 안에서 매번 호출하면 정상 상태에서도 5초마다 XGROUP CREATE 를
+            # 보내 BUSYGROUP 예외를 유발한다. 기동 시 한 번이면 충분하고, 그룹이
+            # 사라지는 예외 상황은 아래 RedisError 경로에서 재생성된다.
+            review_queue.ensure_consumer_group(client)
 
-    # 재기동 직후 자기가 물고 있던 job 부터 이어받는다. consumer 이름이 고정이라
-    # 이전 프로세스의 PEL 을 그대로 승계할 수 있다. 이게 없으면 min_idle_ms 를
-    # 기다려야만 회수된다.
-    try:
-        for message_id, fields in review_queue.read_own_pending(client, consumer):
-            if _SHUTDOWN:
-                break
-            log("job_resumed", message_id=message_id)
-            process_message(client, message_id, fields)
-    except redis.RedisError as exc:
-        log("redis_error", stage="read_own_pending", error=str(exc))
+            # 재기동 직후 자기가 물고 있던 job 부터 이어받는다. consumer 이름이
+            # 고정이라 이전 프로세스의 PEL 을 그대로 승계할 수 있다. 이게 없으면
+            # min_idle_ms 를 기다려야만 회수된다.
+            for message_id, fields in review_queue.read_own_pending(client, consumer):
+                if _SHUTDOWN:
+                    break
+                log("job_resumed", message_id=message_id)
+                process_message(client, message_id, fields)
+            break
+        except redis.RedisError as exc:
+            log("redis_unavailable_at_startup", error_type=exc.__class__.__name__, error=str(exc))
+            time.sleep(REDIS_RETRY_DELAY_SECONDS)
 
     while not _SHUTDOWN:
         try:
