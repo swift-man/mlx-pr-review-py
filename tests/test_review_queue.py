@@ -28,6 +28,8 @@ class FakeRedis:
         self.new_jobs: list = []
         self.autoclaim_calls: list[str] = []
         self.autoclaim_counts: list[int] = []
+        self.own_stranded: list = []
+        self.xclaim_calls: list = []
         self.autoclaim_batches: list = []
         self.pipeline_executions = 0
 
@@ -65,6 +67,19 @@ class FakeRedis:
             self.dead.append(entry)
         return "9-0"
 
+    def xgroup_create(self, *args, **kwargs) -> bool:
+        self._check("xgroup_create")
+        return True
+
+    def xpending_range(self, stream, group, min=None, max=None, count=None, consumername=None):
+        self._check("xpending_range")
+        return list(self.own_stranded)
+
+    def xclaim(self, stream, group, consumer, min_idle_time, message_ids):
+        self._check("xclaim")
+        self.xclaim_calls.append((min_idle_time, list(message_ids)))
+        return [(mid, dict(JOB_FIELDS)) for mid in message_ids]
+
     def pipeline(self):
         return _FakePipeline(self)
 
@@ -98,9 +113,6 @@ class _FakePipeline:
             out.append(self.client.incr(op[1]) if op[0] == "incr" else True)
         self.client.pipeline_executions += 1
         return out
-
-    def xgroup_create(self, *args, **kwargs) -> bool:
-        return True
 
 
 JOB_FIELDS = {
@@ -290,6 +302,36 @@ class SanitizedRedisUrlTestCase(unittest.TestCase):
         client.autoclaim_batches = [("0-0", [("9-0", dict(JOB_FIELDS))], [])]
         review_queue.claim_abandoned_jobs(client, "c1", count=1)
         self.assertEqual(client.autoclaim_counts, [review_queue.RECLAIM_SCAN_COUNT])
+class OwnStrandedReclaimTestCase(unittest.TestCase):
+    """자기 PEL 에 오래 멈춘 job 만 다시 집는다.
+
+    매 루프마다 자기 PEL 을 통째로 읽으면(XREADGROUP '0') 방금 실패한 job 을 5초 뒤
+    또 집어 재시도 한도를 순식간에 태우고 dead letter 로 보낸다. 일시 장애에 대한
+    재시도 여지가 사라진다. 그래서 idle 기준을 둔다.
+    """
+
+    def test_recent_failure_is_left_alone(self) -> None:
+        client = FakeRedis()
+        client.own_stranded = [{"message_id": "1-0", "time_since_delivered": 3_000}]
+        got = review_queue.reclaim_own_stranded(client, "c1")
+        self.assertEqual(got, [], "방금 실패한 job 은 건드리지 않는다")
+        self.assertEqual(client.xclaim_calls, [])
+
+    def test_long_stranded_job_is_reclaimed(self) -> None:
+        client = FakeRedis()
+        client.own_stranded = [{"message_id": "9-0", "time_since_delivered": 999_000}]
+        got = review_queue.reclaim_own_stranded(client, "c1")
+        self.assertEqual([mid for mid, _ in got], ["9-0"])
+        self.assertEqual(client.xclaim_calls[0][1], ["9-0"])
+
+    def test_threshold_is_shorter_than_general_reclaim(self) -> None:
+        """자기 job 을 30분이나 방치할 이유가 없다."""
+        self.assertLess(
+            review_queue.OWN_PENDING_MIN_IDLE_MS,
+            review_queue.DEFAULT_RECLAIM_IDLE_MS,
+        )
+
+
 class ShutdownOrderingTestCase(unittest.TestCase):
     """종료 요청 뒤에는 새 리뷰를 시작하지 않는다.
 

@@ -47,6 +47,10 @@ MAX_RECLAIM_SCANS = 20
 # XAUTOCLAIM 한 번이 훑을 PEL 엔트리 수. 반환 개수 상한이 아니다.
 RECLAIM_SCAN_COUNT = 100
 
+# 자기 PEL 에 남은 job 을 다시 집기까지 기다릴 시간. 일반 회수(30분)보다 훨씬 짧게
+# 두되, 0 이면 방금 실패한 job 을 즉시 재시도해 한도를 태우므로 여유를 남긴다.
+OWN_PENDING_MIN_IDLE_MS = 120_000
+
 # dead letter 보존 상한. 운영자가 원인 분석할 만큼만 남기고 그 이상은 버린다.
 DEAD_LETTER_MAXLEN = 1000
 
@@ -198,6 +202,38 @@ def read_own_pending(
         return []
     _, entries = response[0]
     return [entry for entry in entries if entry and entry[1]]
+
+
+def reclaim_own_stranded(
+    client: redis.Redis,
+    consumer: str,
+    *,
+    min_idle_ms: int = OWN_PENDING_MIN_IDLE_MS,
+    count: int = 10,
+) -> list[tuple[str, dict[str, str]]]:
+    """이 consumer 가 물고 있는데 오래 진행이 없는 job 만 다시 집어온다.
+
+    워커가 살아 있는 상태에서 process_message 가 실패하면 그 job 은 자기 PEL 에
+    남고, 일반 회수(claim_abandoned_jobs)는 min_idle 이 30분이라 그만큼 방치된다.
+
+    그렇다고 매 루프마다 자기 PEL 을 통째로 다시 읽으면(XREADGROUP '0'), 방금
+    실패한 job 을 5초 뒤 또 집어 재시도 한도를 순식간에 태우고 dead letter 로
+    보내버린다. 일시 장애에 대한 재시도 여지가 사라진다.
+
+    그래서 idle 시간을 본다. 방금 실패한 건 건드리지 않고 충분히 오래 멈춘 것만
+    가져온다. 지금 처리 중인 job 은 idle 이 짧아 자연히 제외된다.
+    """
+    try:
+        pending = client.xpending_range(
+            STREAM_KEY, CONSUMER_GROUP, min="-", max="+", count=count, consumername=consumer
+        )
+    except redis.ResponseError:
+        return []
+    ids = [p["message_id"] for p in pending if p.get("time_since_delivered", 0) >= min_idle_ms]
+    if not ids:
+        return []
+    claimed = client.xclaim(STREAM_KEY, CONSUMER_GROUP, consumer, min_idle_ms, ids)
+    return [entry for entry in claimed if entry and entry[1]]
 
 
 def read_new_jobs(

@@ -241,8 +241,19 @@ def run_forever() -> None:
 
     while not _SHUTDOWN:
         try:
-            # 먼저 버려진 job 부터 회수한다. 새 job 만 계속 집어가면 죽은 워커가
-            # 남긴 작업이 영원히 처리되지 않는다.
+            # 자기가 물고 있는데 오래 멈춘 job 을 먼저 본다. 워커가 살아 있는
+            # 상태에서 실패한 job 은 일반 회수(30분)까지 방치되는데, 그 사이 같은
+            # PR 리뷰가 지연된다. idle 기준이 있어 방금 실패한 건 건드리지 않는다.
+            for message_id, fields in review_queue.reclaim_own_stranded(client, consumer):
+                if _SHUTDOWN:
+                    break
+                log("job_retry", message_id=message_id)
+                process_message(client, message_id, fields)
+            if _SHUTDOWN:
+                break
+
+            # 그 다음 죽은 워커가 버린 job 을 회수한다. 새 job 만 계속 집어가면
+            # 죽은 워커가 남긴 작업이 영원히 처리되지 않는다.
             for message_id, fields in review_queue.claim_abandoned_jobs(
                 client, consumer, min_idle_ms=reclaim_idle_ms()
             ):
