@@ -1,7 +1,76 @@
 # Mac mini MLX PR Review Webhook
 
-이 저장소는 GitHub webhook을 받아 PR diff를 읽고, MLX로 리뷰한 뒤 GitHub Review API로
-라인 코멘트와 전체 리뷰를 등록하는 서버 구성을 담고 있습니다.
+이 저장소는 PR diff를 읽고 MLX로 리뷰한 뒤 GitHub Review API로 라인 코멘트와 전체
+리뷰를 등록하는 **review worker** 입니다.
+
+## 0. 아키텍처: receiver 분리와 Redis 큐
+
+webhook 수신은 별도 repo [`pr-review-receiver`](https://github.com/swift-man/pr-review-receiver)
+가 담당합니다. **receiver 는 모델을 돌리지 않습니다** — GitHub 이 webhook 응답을 기다리는
+시간은 10초인데 MLX 리뷰는 수 분이 걸리기 때문입니다.
+
+```text
+GitHub → receiver (서명검증 · delivery 중복확인 · XADD) → Redis stream
+                                                              ↓
+                                     worker 1 (m4_ai) ─┬─ worker 2 (m4_ai2)
+                                                       ↓
+                                              GitHub Review API
+```
+
+큐를 두면 얻는 것:
+
+- **내구성** — job 이 프로세스 메모리가 아니라 Redis 에 남습니다. worker 를 재기동해도
+  진행 중이던 리뷰가 사라지지 않습니다.
+- **중복 제거** — `X-GitHub-Delivery` 는 redelivery 에서도 동일한 GUID 라서, 재전송이
+  중복 리뷰를 만들지 않습니다.
+- **수평 확장** — worker 를 여러 대 붙일 수 있습니다.
+
+### Redis 계약
+
+receiver repo 와 **공유하는 계약**입니다. 한쪽만 바꾸면 job 이 조용히 유실되므로
+`review_runner/review_queue.py` 의 `JOB_SCHEMA_VERSION` 을 올리고 양쪽을 같이 배포하세요.
+`tests/test_review_queue.py` 가 리터럴 값을 고정해 두어 잘못된 rename 은 테스트가 먼저 잡습니다.
+
+| 키 | 용도 | 관리 주체 |
+|---|---|---|
+| `prr:review_jobs` | 리뷰 job stream | receiver 가 XADD, worker 가 XREADGROUP |
+| `prr:workers` | consumer group | 양쪽 |
+| `prr:delivery:<id>` | delivery 중복 제거 마커 (7일) | receiver |
+| `prr:latest_head:<repo>#<pr>` | 최신 head sha (stale 판정 기준, 24시간) | receiver |
+| `prr:attempts:<message_id>` | 재시도 횟수 | worker |
+| `prr:review_dead` | 최대 재시도 초과 job | worker |
+
+### worker 실행
+
+```bash
+./scripts/run_review_worker.sh
+```
+
+| 환경 변수 | 기본값 | 의미 |
+|---|---|---|
+| `REVIEW_REDIS_URL` | `redis://127.0.0.1:6379/0` | 큐 위치 |
+| `REVIEW_WORKER_NAME` | `<hostname>-<pid>` | consumer 이름. 2대 구성에서 서로 달라야 함 |
+| `REVIEW_WORKER_MAX_ATTEMPTS` | `3` | 초과 시 dead letter 로 격리 |
+| `REVIEW_WORKER_RECLAIM_IDLE_MS` | `1800000` | 죽은 워커 job 회수 기준 (30분) |
+
+### 유실 방지가 걸려 있는 세 지점
+
+**stale job 은 모델을 돌리기 전에 버립니다.** job 이 큐에 있는 동안 같은 PR 에 새 push 가
+들어오면 `prr:latest_head` 와 대조해 건너뜁니다. 리뷰 도중에 새 push 가 와도
+`should_continue` 가 같은 검사를 계속 수행해 오래된 코드 기준 리뷰를 게시하지 않습니다.
+
+**실패한 job 은 ACK 하지 않습니다.** PEL 에 남겨두면 `XAUTOCLAIM` 이 회수합니다.
+worker 가 리뷰 도중 죽는 경우가 여기에 해당하는데, GitHub redelivery 로는 잡히지 않는
+구간이라 이 회수 루프가 유일한 복구 경로입니다.
+
+**항상 터지는 job 은 dead letter 로 보냅니다.** 그러지 않으면 poison job 하나가 회수 루프를
+영원히 점유합니다.
+
+### 기존 in-process webhook 모드
+
+`review_runner/webhook_app.py` 는 receiver 분리 이전의 경로입니다. 큐 전환이 끝나면
+제거 대상이지만, 현재 운영이 이 경로로 돌고 있어 cutover 전까지 남겨둡니다.
+이 모드는 job 을 프로세스 메모리에 들고 있어 재기동 시 진행 중 리뷰가 유실됩니다.
 
 ## 목표 구조
 
@@ -86,7 +155,7 @@ PYTHON_BIN="$PY311" ./scripts/install_local_review.sh /Users/runner/pr-review
 - `MLX_GENERATE_AUTH_TOKEN=...` (옵션, remote generate 서버가 Bearer 인증을 쓸 때)
 - `MLX_GENERATE_TIMEOUT=900` (옵션, remote generate 응답 timeout 초. full repo context처럼 큰 요청이 수 분 걸릴 수 있어 넉넉하게 둠. 초과 시 같은 장기 생성 요청을 재시도하지 않고 명확한 timeout 오류를 남김)
 - `MLX_GENERATE_CLIENT_MAX_BODY_BYTES=4194304` (옵션, remote generate 요청 body 상한. 서버의 `MLX_HTTP_BODY_MAX_BYTES`와 맞춰 설정)
-- `MLX_MODEL=mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` (운영 예시값. local 클라이언트 코드 기본값은 7B)
+- `MLX_MODEL=mlx-community/Qwen3-Coder-Next-4bit` (운영 값. local 클라이언트 코드 기본값도 동일. remote backend 에서는 리뷰 푸터 라벨로만 쓰이고 실제 모델은 mlx-final-py 의 `MLX_FINAL_MODEL` 이 결정)
 - `MLX_DEVICE=cpu` (옵션, Metal 장애 시 fallback. 비워두면 MLX 기본 장치 사용)
 - `GITHUB_API_URL=https://api.github.com` (옵션)
 - `MLX_MAX_TOKENS=1600` (옵션, 모델 출력 토큰 상한. Apple Silicon 64GB급 로컬 운영은 품질 우선으로 넉넉하게 둠)
@@ -183,7 +252,7 @@ cp /Users/runner/pr-review/scripts/local_review_env.example.sh /Users/runner/pr-
 
 ```bash
 export LOCAL_REVIEW_HOME=/Users/runner/pr-review
-export MLX_MODEL=mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+export MLX_MODEL=mlx-community/Qwen3-Coder-Next-4bit
 zsh /Users/runner/pr-review/scripts/warm_mlx_model.sh
 ```
 
@@ -209,7 +278,7 @@ export PORT=8000
 export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+export MLX_MODEL="mlx-community/Qwen3-Coder-Next-4bit"
 # export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
@@ -232,7 +301,7 @@ export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/github-app.private-ke
 export GITHUB_APP_INSTALLATION_ID=12345678
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+export MLX_MODEL="mlx-community/Qwen3-Coder-Next-4bit"
 # export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
@@ -314,7 +383,7 @@ export PORT=8000
 export GITHUB_TOKEN=ghp_xxx
 export GITHUB_WEBHOOK_SECRET=replace-me
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+export MLX_MODEL="mlx-community/Qwen3-Coder-Next-4bit"
 # export MLX_DEVICE=cpu
 export SSL_CERT_FILE="$CERT_PATH"
 export GITHUB_CA_BUNDLE="$CERT_PATH"
@@ -587,7 +656,7 @@ export GITHUB_TOKEN=ghp_xxx
 export GITHUB_REPOSITORY=OWNER/REPO
 export GITHUB_EVENT_PATH=/path/to/event.json
 export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.mlx_review_client"
-export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+export MLX_MODEL="mlx-community/Qwen3-Coder-Next-4bit"
 export DRY_RUN=1
 export PYTHONPATH=/Users/runner/pr-review
 /Users/runner/pr-review/venv/bin/python -m review_runner.review_pr
@@ -657,7 +726,7 @@ export MLX_REVIEW_CMD="/Users/runner/pr-review/venv/bin/python -m review_runner.
 
 ## 15. 7B 모델 전용 품질 보정 레이어 (모델 업그레이드 시 제거 대상)
 
-로컬 클라이언트 코드 기본값인 `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` 는 PR diff 를 정확히 읽지 못하고 다음 세 가지 실패 패턴을 반복합니다. 운영 env 예시는 30B 모델을 지정하지만, 이 보정 레이어는 회귀 테스트로 제거 가능성이 확인될 때까지 유지합니다. 향후 14B 이상 모델만 쓰는 구성이 확정되면 **§15-5 에 명시된 역순(C → B → A)으로 제거하고 회귀 테스트를 돌려 유지 여부를 결정**하세요. 문서 배치 순서(A → B → C)는 설명의 논리 흐름이고, 실제 제거 순서는 바깥 계층부터입니다.
+이 레이어는 과거 기본값이던 `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` 가 PR diff 를 정확히 읽지 못하고 다음 세 가지 실패 패턴을 반복해서 도입됐습니다. 현재 기본값은 `mlx-community/Qwen3-Coder-Next-4bit` (80B total / 3B active) 이라 세 패턴 모두 해소됐을 가능성이 높지만, 이 보정 레이어는 회귀 테스트로 제거 가능성이 확인될 때까지 유지합니다. 향후 14B 이상 모델만 쓰는 구성이 확정되면 **§15-5 에 명시된 역순(C → B → A)으로 제거하고 회귀 테스트를 돌려 유지 여부를 결정**하세요. 문서 배치 순서(A → B → C)는 설명의 논리 흐름이고, 실제 제거 순서는 바깥 계층부터입니다.
 
 > 📌 **위치 탐색 안내**: 아래 표의 심볼명이 `review_runner/` 디렉터리 내 어디에 있는지는 `rg <symbol> review_runner/` (또는 ripgrep 이 없으면 `git grep <symbol> review_runner/`) 로 즉시 찾을 수 있습니다. 라인 번호는 코드 변경에 따라 drift 하므로 이 문서에서는 심볼명만 유지합니다.
 
