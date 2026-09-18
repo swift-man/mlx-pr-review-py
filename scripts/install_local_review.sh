@@ -38,6 +38,7 @@ copy_into_dir "$TARGET_ROOT/review_runner" "$SOURCE_ROOT/review_runner/"*.py
 copy_file "$SOURCE_ROOT/review_runner/requirements.txt" "$TARGET_ROOT/review_runner/requirements.txt"
 copy_file "$SOURCE_ROOT/scripts/kickstart_local_review.sh" "$TARGET_ROOT/scripts/kickstart_local_review.sh"
 copy_file "$SOURCE_ROOT/scripts/run_webhook_server.sh" "$TARGET_ROOT/scripts/run_webhook_server.sh"
+copy_file "$SOURCE_ROOT/scripts/run_review_worker.sh" "$TARGET_ROOT/scripts/run_review_worker.sh"
 copy_file "$SOURCE_ROOT/scripts/send_test_webhook.sh" "$TARGET_ROOT/scripts/send_test_webhook.sh"
 copy_file "$SOURCE_ROOT/scripts/warm_mlx_model.sh" "$TARGET_ROOT/scripts/warm_mlx_model.sh"
 copy_file "$SOURCE_ROOT/scripts/local_review_env.example.sh" "$TARGET_ROOT/scripts/local_review_env.example.sh"
