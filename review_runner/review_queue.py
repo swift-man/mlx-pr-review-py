@@ -40,6 +40,13 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 ATTEMPTS_TTL_SECONDS = 24 * 60 * 60
 
+# XAUTOCLAIM cursor 를 따라가는 최대 반복 횟수. PEL 이 비정상적으로 크더라도
+# 회수 루프가 한 주기를 독점하지 않게 상한을 둔다.
+MAX_RECLAIM_SCANS = 20
+
+# dead letter 보존 상한. 운영자가 원인 분석할 만큼만 남기고 그 이상은 버린다.
+DEAD_LETTER_MAXLEN = 1000
+
 
 def redis_url() -> str:
     return os.environ.get("REVIEW_REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -98,6 +105,11 @@ def ensure_consumer_group(client: redis.Redis) -> None:
 
 def parse_job(fields: dict[str, str]) -> dict[str, Any]:
     """stream field 는 전부 문자열이므로 pull_number 만 정수로 되돌린다."""
+    repository = (fields.get("repository") or "").strip()
+    if not repository:
+        # 여기서 막지 않으면 run_review_job 의 resolve_github_token 까지 가서야 터진다.
+        # 그 경로는 재시도 대상이라 복구 불가능한 job 이 한도까지 반복된다.
+        raise ValueError("job is missing repository")
     try:
         pull_number = int(fields.get("pull_number", ""))
     except ValueError as exc:
@@ -106,7 +118,7 @@ def parse_job(fields: dict[str, str]) -> dict[str, Any]:
         "v": fields.get("v", ""),
         "delivery_id": fields.get("delivery_id", ""),
         "action": fields.get("action", ""),
-        "repository": fields.get("repository", ""),
+        "repository": repository,
         "pull_number": pull_number,
         "head_sha": fields.get("head_sha", ""),
         "enqueued_at": fields.get("enqueued_at", ""),
@@ -131,6 +143,30 @@ def is_stale(client: redis.Redis, job: dict[str, Any]) -> bool:
     if not latest:
         return False
     return latest != head_sha
+
+
+def read_own_pending(
+    client: redis.Redis,
+    consumer: str,
+    *,
+    count: int = 10,
+) -> list[tuple[str, dict[str, str]]]:
+    """이 consumer 에게 이미 할당됐지만 ACK 하지 못한 job 을 가져온다 ('0').
+
+    '>' 로만 읽으면 자기가 물고 있던 job 을 스스로 재개하지 못하고, min_idle_time
+    (기본 30분) 뒤 XAUTOCLAIM 으로 회수될 때까지 방치된다. 워커가 재기동되는 흔한
+    경우에 30분 지연이 그대로 발생하므로 기동 직후 자기 PEL 을 먼저 훑는다.
+    """
+    response = client.xreadgroup(
+        CONSUMER_GROUP,
+        consumer,
+        {STREAM_KEY: "0"},
+        count=count,
+    )
+    if not response:
+        return []
+    _, entries = response[0]
+    return [entry for entry in entries if entry and entry[1]]
 
 
 def read_new_jobs(
@@ -167,21 +203,41 @@ def claim_abandoned_jobs(
     Entries List) 에 남는다. redelivery 로는 안 잡히는 구간이라 이 회수 루프가
     유일한 복구 경로다.
     """
-    result = client.xautoclaim(
-        STREAM_KEY,
-        CONSUMER_GROUP,
-        consumer,
-        min_idle_time=min_idle_ms,
-        count=count,
-    )
-    # redis-py 는 (next_cursor, entries) 또는 (next_cursor, entries, deleted) 를 준다.
-    entries = result[1] if len(result) >= 2 else []
-    return [entry for entry in entries if entry and entry[1]]
+    # cursor 를 무시하고 매번 0-0 에서만 시작하면, 아직 idle 이 아닌 항목이 스캔
+    # 한도(COUNT 의 약 10배) 이상 앞에 쌓였을 때 뒤쪽의 버려진 job 에 영영 닿지
+    # 못한다. cursor 가 0-0 으로 돌아올 때까지 이어서 훑는다.
+    #
+    # 스트림에서 이미 지워진 메시지(result[2])는 따로 ACK 할 필요가 없다. Redis 가
+    # XAUTOCLAIM 시점에 PEL 에서 제거한 뒤 보고용으로만 돌려준다.
+    claimed: list[tuple[str, dict[str, str]]] = []
+    cursor = "0-0"
+    for _ in range(MAX_RECLAIM_SCANS):
+        result = client.xautoclaim(
+            STREAM_KEY,
+            CONSUMER_GROUP,
+            consumer,
+            min_idle_time=min_idle_ms,
+            start_id=cursor,
+            count=count,
+        )
+        entries = result[1] if len(result) >= 2 else []
+        claimed.extend(entry for entry in entries if entry and entry[1])
+        cursor = result[0] if result else "0-0"
+        if not cursor or cursor == "0-0" or len(claimed) >= count:
+            break
+    return claimed
 
 
 def record_attempt(client: redis.Redis, message_id: str) -> int:
-    count = client.incr(attempts_key(message_id))
-    client.expire(attempts_key(message_id), ATTEMPTS_TTL_SECONDS)
+    """INCR 과 EXPIRE 를 한 왕복으로 묶는다.
+
+    나눠 보내면 INCR 직후 장애가 났을 때 TTL 없는 키가 영구히 남는다.
+    """
+    key = attempts_key(message_id)
+    pipe = client.pipeline()
+    pipe.incr(key)
+    pipe.expire(key, ATTEMPTS_TTL_SECONDS)
+    count, _ = pipe.execute()
     return int(count)
 
 
@@ -207,5 +263,6 @@ def send_to_dead_letter(
     payload = dict(fields)
     payload["dead_reason"] = reason
     payload["original_message_id"] = message_id
-    client.xadd(DEAD_LETTER_KEY, payload)
+    # maxlen 없이 두면 복구 불가능한 job 이 쌓여 Redis 메모리를 영구히 먹는다.
+    client.xadd(DEAD_LETTER_KEY, payload, maxlen=DEAD_LETTER_MAXLEN, approximate=True)
     ack(client, message_id)

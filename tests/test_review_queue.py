@@ -24,6 +24,11 @@ class FakeRedis:
         self.acked: list[str] = []
         self.dead: list[dict[str, str]] = []
         self.fail_on: set[str] = set()
+        self.own_pending: list = []
+        self.new_jobs: list = []
+        self.autoclaim_calls: list[str] = []
+        self.autoclaim_batches: list = []
+        self.pipeline_executions = 0
 
     def _check(self, command: str) -> None:
         if command in self.fail_on:
@@ -52,10 +57,45 @@ class FakeRedis:
         self.acked.append(message_id)
         return 1
 
-    def xadd(self, stream: str, fields: dict[str, str]) -> str:
+    def xadd(self, stream: str, fields: dict[str, str], **kwargs) -> str:
         if stream == review_queue.DEAD_LETTER_KEY:
-            self.dead.append(dict(fields))
+            entry = dict(fields)
+            entry["_maxlen"] = str(kwargs.get("maxlen", ""))
+            self.dead.append(entry)
         return "9-0"
+
+    def pipeline(self):
+        return _FakePipeline(self)
+
+    def xreadgroup(self, group, consumer, streams, count=None, block=None):
+        key = next(iter(streams))
+        if streams[key] == "0":
+            return [(key, list(self.own_pending))] if self.own_pending else []
+        return [(key, list(self.new_jobs))] if self.new_jobs else []
+
+    def xautoclaim(self, stream, group, consumer, min_idle_time=0, start_id="0-0", count=1):
+        # cursor 를 따라가는지 검증하기 위해 호출 인자를 기록한다.
+        self.autoclaim_calls.append(start_id)
+        batch = self.autoclaim_batches.pop(0) if self.autoclaim_batches else ("0-0", [], [])
+        return batch
+
+
+class _FakePipeline:
+    """INCR/EXPIRE 를 모아 execute 에서 한 번에 적용한다."""
+
+    def __init__(self, client: "FakeRedis") -> None:
+        self.client = client
+        self.ops: list = []
+
+    def incr(self, key): self.ops.append(("incr", key)); return self
+    def expire(self, key, ttl): self.ops.append(("expire", key, ttl)); return self
+
+    def execute(self):
+        out = []
+        for op in self.ops:
+            out.append(self.client.incr(op[1]) if op[0] == "incr" else True)
+        self.client.pipeline_executions += 1
+        return out
 
     def xgroup_create(self, *args, **kwargs) -> bool:
         return True
@@ -80,6 +120,34 @@ class QueueContractTestCase(unittest.TestCase):
         self.assertEqual(review_queue.CONSUMER_GROUP, "prr:workers")
         self.assertEqual(review_queue.JOB_SCHEMA_VERSION, "1")
         self.assertEqual(review_queue.latest_head_key("o/r", 3), "prr:latest_head:o/r#3")
+        # dead letter 도 모니터링 도구와 공유하는 키다.
+        self.assertEqual(review_queue.DEAD_LETTER_KEY, "prr:review_dead")
+
+    def test_parse_job_requires_repository(self) -> None:
+        """repository 가 비면 resolve_github_token 까지 가서야 터져 재시도를 낭비한다."""
+        with self.assertRaises(ValueError):
+            review_queue.parse_job({**JOB_FIELDS, "repository": ""})
+
+    def test_consumer_name_is_stable_across_restarts(self) -> None:
+        """pid 를 넣으면 재기동마다 consumer 가 group 에 무한 누적된다."""
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("REVIEW_WORKER_NAME", None)
+            first = review_worker.consumer_name()
+            second = review_worker.consumer_name()
+        self.assertEqual(first, second)
+        self.assertNotIn(str(__import__("os").getpid()), first)
+
+    def test_reclaim_follows_the_cursor(self) -> None:
+        """cursor 를 무시하면 스캔 한도 뒤쪽의 버려진 job 에 영영 닿지 못한다."""
+        client = FakeRedis()
+        client.autoclaim_batches = [
+            ("5-0", [], []),                       # 1차: idle 항목 없음, 더 볼 게 남음
+            ("0-0", [("9-0", dict(JOB_FIELDS))], []),  # 2차: 뒤쪽에서 발견
+        ]
+        found = review_queue.claim_abandoned_jobs(client, "c1", count=1)
+        self.assertEqual(client.autoclaim_calls, ["0-0", "5-0"], "반환된 cursor 로 이어서 훑어야 한다")
+        self.assertEqual(len(found), 1)
 
     def test_parse_job_converts_pull_number_to_int(self) -> None:
         job = review_queue.parse_job(JOB_FIELDS)
@@ -168,17 +236,53 @@ class ProcessMessageTestCase(unittest.TestCase):
         self.assertEqual(self.client.acked, [], "실패한 job 을 ACK 하면 재시도 기회를 잃는다")
         self.assertEqual(self.client.dead, [])
 
-    def test_job_goes_to_dead_letter_after_max_attempts(self) -> None:
+    def test_last_attempt_failure_is_dead_lettered_with_the_real_error(self) -> None:
+        """마지막 시도 실패는 즉시 격리하고 원인을 보존한다.
+
+        ACK 없이 돌아가면 min_idle_ms 를 기다렸다가 다음 회수 주기에
+        'max attempts exceeded' 라는 일반 문구로만 격리돼 실제 원인이 사라진다.
+        """
         with mock.patch.dict("os.environ", {"REVIEW_WORKER_MAX_ATTEMPTS": "2"}):
             with mock.patch.object(review_worker, "run_review_job", side_effect=RuntimeError("boom")):
                 review_worker.process_message(self.client, "1-0", JOB_FIELDS)  # attempt 1
-                review_worker.process_message(self.client, "1-0", JOB_FIELDS)  # attempt 2
-                self.assertEqual(self.client.dead, [])
-                review_worker.process_message(self.client, "1-0", JOB_FIELDS)  # attempt 3 > 2
+                self.assertEqual(self.client.dead, [], "아직 재시도 여지가 있다")
+                review_worker.process_message(self.client, "1-0", JOB_FIELDS)  # attempt 2 == limit
 
         self.assertEqual(len(self.client.dead), 1)
-        self.assertIn("max attempts", self.client.dead[0]["dead_reason"])
-        self.assertEqual(self.client.acked, ["1-0"], "dead letter 로 보낸 뒤에는 ACK 해야 무한 회수를 막는다")
+        reason = self.client.dead[0]["dead_reason"]
+        self.assertIn("RuntimeError", reason)
+        self.assertIn("boom", reason, "일반 문구가 아니라 실제 예외를 남겨야 한다")
+        self.assertEqual(self.client.acked, ["1-0"], "격리 후에는 ACK 해야 무한 회수를 막는다")
+
+    def test_dead_letter_is_size_capped(self) -> None:
+        """maxlen 없이 두면 poison job 이 Redis 메모리를 영구히 먹는다."""
+        review_worker.process_message(self.client, "1-0", {**JOB_FIELDS, "pull_number": "xx"})
+        self.assertEqual(self.client.dead[0]["_maxlen"], str(review_queue.DEAD_LETTER_MAXLEN))
+
+    def test_stale_check_runs_before_attempt_counter(self) -> None:
+        """순서가 반대면 무효 job 이 dead letter 로 잘못 격리된다."""
+        self.client.store[review_queue.latest_head_key("swift-man/demo", 7)] = "b" * 40
+        with mock.patch.dict("os.environ", {"REVIEW_WORKER_MAX_ATTEMPTS": "1"}):
+            with mock.patch.object(review_worker, "run_review_job") as run:
+                review_worker.process_message(self.client, "1-0", JOB_FIELDS)
+        run.assert_not_called()
+        self.assertEqual(self.client.dead, [], "stale 은 격리가 아니라 건너뛰기여야 한다")
+        self.assertEqual(self.client.acked, ["1-0"])
+        self.assertEqual(self.client.counters, {}, "stale job 은 재시도 카운터를 소모하지 않는다")
+
+    def test_stale_check_failure_does_not_abort_the_job(self) -> None:
+        """Redis 가 잠깐 안 될 때 리뷰를 포기하지 않는다."""
+        self.client.fail_on.add("get")
+        with mock.patch.object(review_worker, "run_review_job", return_value={"status": "completed"}) as run:
+            review_worker.process_message(self.client, "1-0", JOB_FIELDS)
+        run.assert_called_once()
+        self.assertEqual(self.client.acked, ["1-0"])
+
+    def test_attempt_counter_uses_a_single_round_trip(self) -> None:
+        """INCR 직후 장애 시 TTL 없는 키가 남지 않도록 파이프라인으로 묶는다."""
+        with mock.patch.object(review_worker, "run_review_job", return_value={"status": "ok"}):
+            review_worker.process_message(self.client, "1-0", JOB_FIELDS)
+        self.assertEqual(self.client.pipeline_executions, 1)
 
     def test_malformed_job_goes_straight_to_dead_letter(self) -> None:
         with mock.patch.object(review_worker, "run_review_job") as run:
