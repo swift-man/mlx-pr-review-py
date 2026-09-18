@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 from typing import Any
 
 import redis
@@ -56,6 +57,26 @@ def build_redis_client(url: str | None = None) -> redis.Redis:
         socket_timeout=60.0,
         socket_connect_timeout=5.0,
         health_check_interval=30,
+    )
+
+
+def sanitized_redis_url(url: str | None = None) -> str:
+    """로그에 노출할 Redis URL 에서 비밀번호를 제거한다.
+
+    REVIEW_REDIS_URL 은 ``redis://:<password>@host:port/db`` 형태라 그대로 찍으면
+    운영 로그에 비밀번호가 평문으로 남는다. LaunchAgent 로그는 /tmp 에 world-readable
+    로 생성되므로 특히 위험하다.
+    """
+    raw = url or redis_url()
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.password:
+        return raw
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    user = parsed.username or ""
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, f"{user}:***@{host}", parsed.path, "", "")
     )
 
 

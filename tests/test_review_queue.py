@@ -92,6 +92,34 @@ class QueueContractTestCase(unittest.TestCase):
             review_queue.parse_job({**JOB_FIELDS, "pull_number": "not-a-number"})
 
 
+class SanitizedRedisUrlTestCase(unittest.TestCase):
+    """로그에 비밀번호가 새지 않는지 고정한다.
+
+    LaunchAgent 는 /tmp 에 world-readable 로그를 만든다. 기동 로그 한 줄에
+    REVIEW_REDIS_URL 을 그대로 찍으면 비밀번호가 평문으로 남는다.
+    """
+
+    def test_password_is_masked(self) -> None:
+        masked = review_queue.sanitized_redis_url("redis://:s3cr3t@10.10.0.1:6379/0")
+        self.assertNotIn("s3cr3t", masked)
+        self.assertEqual(masked, "redis://:***@10.10.0.1:6379/0")
+
+    def test_username_is_kept_but_password_masked(self) -> None:
+        masked = review_queue.sanitized_redis_url("redis://worker:s3cr3t@h:6379/1")
+        self.assertNotIn("s3cr3t", masked)
+        self.assertIn("worker", masked)
+
+    def test_url_without_password_is_unchanged(self) -> None:
+        url = "redis://127.0.0.1:6379/0"
+        self.assertEqual(review_queue.sanitized_redis_url(url), url)
+
+    def test_query_and_fragment_are_dropped(self) -> None:
+        """query 에 비밀번호를 실어보내는 구성도 있어 함께 제거한다."""
+        masked = review_queue.sanitized_redis_url("redis://:p@h:6379/0?password=p2#frag")
+        self.assertNotIn("p2", masked)
+        self.assertNotIn("frag", masked)
+
+
 class StaleDetectionTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.client = FakeRedis()

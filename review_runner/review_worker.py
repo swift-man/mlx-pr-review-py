@@ -171,7 +171,14 @@ def process_message(client: redis.Redis, message_id: str, fields: dict[str, str]
 def run_forever() -> None:
     consumer = consumer_name()
     client = review_queue.build_redis_client()
-    log("worker_starting", consumer=consumer, stream=review_queue.STREAM_KEY, redis=review_queue.redis_url())
+    log(
+        "worker_starting",
+        consumer=consumer,
+        stream=review_queue.STREAM_KEY,
+        # 비밀번호를 제거한 값만 남긴다. LaunchAgent 로그는 /tmp 에
+        # world-readable 로 생성된다.
+        redis=review_queue.sanitized_redis_url(),
+    )
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)

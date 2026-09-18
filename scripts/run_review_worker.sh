@@ -26,7 +26,10 @@ if [[ -n "${REVIEW_WORKER_NAME:-}" ]]; then
   export REVIEW_WORKER_NAME
 fi
 
-echo "[worker] redis=$REVIEW_REDIS_URL model=${MLX_MODEL:-<default>} backend=${MLX_REVIEW_BACKEND:-local}"
+# 비밀번호를 지운 형태로만 찍는다. 이 스크립트의 stdout 은 LaunchAgent 가
+# /tmp 에 world-readable 로그로 남긴다.
+REDIS_URL_SAFE="$(printf '%s' "$REVIEW_REDIS_URL" | sed -E 's|://[^@/]*@|://***@|')"
+echo "[worker] redis=$REDIS_URL_SAFE model=${MLX_MODEL:-<default>} backend=${MLX_REVIEW_BACKEND:-local}"
 
 cd "$ROOT_DIR"
 exec "$PYTHON_BIN" -m review_runner.review_worker
