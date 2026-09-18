@@ -25,7 +25,7 @@ export GITHUB_APP_PRIVATE_KEY_PATH=/Users/runner/pr-review/mlx-review-bot.2026-0
 
 export GITHUB_WEBHOOK_SECRET=replace-me
 export GITHUB_REPOSITORY=swift-man/review.gorani.me
-export MLX_MODEL="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+export MLX_MODEL="mlx-community/Qwen3-Coder-Next-4bit"
 # Apple Silicon 64GB급 로컬 운영은 품질 우선으로 출력 상한을 넉넉하게 둔다.
 export MLX_MAX_TOKENS=1600
 # PR 리뷰 입력은 diff만 보지 않고 최신 PR HEAD의 변경 파일 full code를 함께 봅니다.
@@ -64,9 +64,10 @@ export MLX_MAX_TOKENS=1600
 # ───────────────────────────────────────────────────────────────────────────
 # 원격 MLX backend (mlx-final-py 의 /v1/generate 와 모델 인스턴스 공유)
 # ───────────────────────────────────────────────────────────────────────────
-# 같은 호스트에서 mlx-final-py (port 8002, ~17GB Qwen3-30B-A3B) 가 이미 모델을
+# 같은 호스트에서 mlx-final-py (port 8002, ~45GB Qwen3-Coder-Next-4bit) 가 이미 모델을
 # 메모리에 들고 있는 환경이면 webhook 프로세스가 별도로 모델을 또 로드하지 않고
-# HTTP 로 위임하도록 한다. 두 프로세스가 한 모델을 공유 → 메모리 17GB 절약.
+# HTTP 로 위임하도록 한다. 두 프로세스가 한 모델을 공유 → 메모리 45GB 절약.
+# 64GB 기기에서 Coder-Next-4bit 은 두 벌 올릴 수 없으므로 remote 공유가 사실상 필수.
 #
 # 비활성화 (in-process 로컬 backend) 가 기본값. 켜려면 아래 두 줄을 주석 해제.
 # export MLX_REVIEW_BACKEND=remote

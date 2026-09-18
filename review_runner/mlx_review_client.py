@@ -17,7 +17,11 @@ from review_runner.mlx_review_parser import (
 from review_runner.mlx_review_prompt import build_messages
 
 
-DEFAULT_MODEL = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+# local backend 가 in-process 로 로드하는 기본 모델. remote backend 에서는
+# 실제 모델을 mlx-final-py 가 들고 있고 MLX_MODEL 은 리뷰 푸터 라벨로만 쓰인다.
+# 64GB 기기에서 이 모델은 약 44.9GB 를 wired 로 점유하므로, 8002 서버가 떠 있는
+# 상태로 local backend 를 같이 돌리면 두 인스턴스가 메모리를 놓고 충돌한다.
+DEFAULT_MODEL = "mlx-community/Qwen3-Coder-Next-4bit"
 DEFAULT_MAX_TOKENS = 1600
 
 _MODEL = None
