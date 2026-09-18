@@ -3,3 +3,4 @@ uvicorn
 mlx-lm
 certifi
 PyJWT[crypto]
+redis
